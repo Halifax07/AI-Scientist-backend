@@ -6,8 +6,8 @@
 | 证据构建 | 文献矩阵、数据画像、真实性状态 | Evidence/Data Agent 检索和分析 | evidence records、dataset card |
 | 空白发现 | 研究空白及其依据 | Gap Agent 比较论文结论和数据特征 | research gaps |
 | 假设竞技场 | 候选假设、反方意见、Elo 排名 | Hypothesis/Skeptic 生成、反驳、演化 | hypothesis versions、debate log |
-| 实验计划 | 因素矩阵、成本、停止条件 | Planner 以信息增益/成本选择实验 | preregistered plan + SHA-256 |
-| 实验树 | 轮次、节点、优先级、GPU 状态、用户单次指导、节省的 run | Guidance Agent 先解释用户建议，Executor 再运行允许队列中的已登记命令 | guidance decision、campaign、round、node、run manifest |
+| 逐创新点实验计划 | 每个创新点的实验组、对照组、指标、最小配对数和实现状态 | Planner 为每个创新点建立独立可证伪契约；没有适配器的创新明确阻塞 | preregistered plan + hypothesis contract + SHA-256 |
+| 逐创新点实验树 | 当前创新点、轮次、节点、优先级、GPU 状态、用户单次指导、节省的 run | 用户选择创新点；Guidance Agent 解释建议；Executor 只运行该创新点允许队列中的已登记命令 | hypothesis-bound campaign、guidance decision、round、node、run manifest |
 | 反馈迭代 | 本轮成对效应、失败、Qwen 决策与下一轮 | Planner 从允许空间选择扩展/复现/诊断/停止 | round summary、feedback proposal、next runs |
 | 结果审查 | 置信区间、失败图像、边界 | Statistics + Qwen-VL 分工分析 | findings、visual observations |
 | 创新审查 | 创新卡、最近工作、证据链 | Meta-review 判断支持/部分支持/证伪 | innovation candidates |
@@ -20,6 +20,9 @@
 - 研究对象、假设、计划、运行、发现和创新卡的数据模型；
 - 从创建项目到报告清单的持久化状态机；
 - 实验前人工审批；
+- “一个创新点、一份实验指导、一个独立 campaign、一组对应结果”的验证队列；
+- 用户必须明确选择要验证的创新点，系统不得用另一个更容易执行的假设替换它；
+- 当前工具链不支持的创新点标记为“需要先实现方法”，实现适配器后才能进入真实执行；
 - 每个真实 run 前的用户指导输入、Qwen/确定性解释、允许队列内重排和完整留痕；
 - Mock 自主发现流程；
 - Qwen/AgentScope 结构化调用适配器；

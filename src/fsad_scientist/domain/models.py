@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from fsad_scientist.domain.enums import (
     EvidenceStatus,
@@ -21,6 +21,26 @@ def utc_now() -> datetime:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def _execution_strategy(value: str) -> str | None:
+    normalized = " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
+    if normalized == "random" or "random" in normalized or "随机" in normalized:
+        return "random"
+    if any(
+        marker in normalized
+        for marker in (
+            "k center",
+            "diversity",
+            "representative",
+            "coverage",
+            "多样性",
+            "代表性",
+            "覆盖",
+        )
+    ):
+        return "k_center"
+    return None
 
 
 class DatasetSpec(BaseModel):
@@ -164,6 +184,42 @@ class Hypothesis(BaseModel):
     status: HypothesisStatus = HypothesisStatus.CANDIDATE
     revision: int = 1
     parent_hypothesis_id: str | None = None
+
+    @computed_field
+    @property
+    def execution_readiness(self) -> Literal["executable", "requires_implementation"]:
+        contract = self.analysis_contract
+        if (
+            contract is not None
+            and contract.kind == "selection_main_effect"
+            and _execution_strategy(contract.treatment) in {"random", "k_center"}
+            and _execution_strategy(contract.control) in {"random", "k_center"}
+            and _execution_strategy(contract.treatment) != _execution_strategy(contract.control)
+        ):
+            return "executable"
+        return "requires_implementation"
+
+    @computed_field
+    @property
+    def experiment_guidance(self) -> list[str]:
+        contract = self.analysis_contract
+        if contract is None:
+            return ["先补充自变量、对照组、主指标和最小样本量，再进入实验。"]
+        if self.execution_readiness == "executable":
+            return [
+                f"围绕“{self.title}”独立建立实验活动，不与其他创新点混用结果。",
+                (
+                    f"实验组为 {contract.treatment}，对照组为 {contract.control}，"
+                    f"主指标为 {contract.metric}。"
+                ),
+                f"至少形成 {contract.minimum_pairs} 组同类别、同 K、同 seed 的成对结果。",
+                "每次真实运行前接受用户指导，但不得改变已批准的对照边界。",
+            ]
+        return [
+            f"该创新需要实现 {contract.treatment} 与 {contract.control} 的可调用算法适配器。",
+            f"实现后以 {contract.metric} 为主指标，至少收集 {contract.minimum_pairs} 组成对结果。",
+            "方法代码、参数和失败日志必须先登记到 Research Ledger，之后才能声明进入验证。",
+        ]
 
 
 class ExperimentPlan(BaseModel):

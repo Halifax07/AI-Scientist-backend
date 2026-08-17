@@ -58,6 +58,9 @@ created
 关键规则：
 
 - `awaiting_experiment_approval` 必须由人批准预注册计划。
+- 每个创新点都携带自己的 `analysis_contract`、`execution_readiness` 和实验指导；实验 campaign 必须通过 `hypothesis_id` 与被验证创新点绑定。
+- 同一研究循环可以依次验证多个已批准创新点；上一个 campaign 完成后进入历史集合，再由用户选择下一个创新点，不需要生成无关替代假设。
+- 没有已注册算法适配器的创新点只能标记为 `requires_implementation`，不得伪装成已经可以执行或静默替换成 random/k-center 假设。
 - 每个真实 run 执行前必须接收一条用户指导；LLM 只能据此在本轮冻结队列中重排，服务端会校验最终 Run ID，原文、解释、处置结果和保护边界全部入账。
 - `experiments_queued` 不能直接进入分析，必须导入真实且终态的 Run。
 - `experiment_campaign` 把执行阶段拆为多轮：`planned → running → ready_for_feedback → completed`。

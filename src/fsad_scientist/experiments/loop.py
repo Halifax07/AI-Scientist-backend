@@ -50,6 +50,7 @@ class AdaptiveExperimentPlanner:
         *,
         audit: DatasetAuditRecord,
         dataset: DatasetManifest,
+        hypothesis_id: str,
         device: str,
         detector: str = "anomalydino",
         max_rounds: int = 3,
@@ -66,7 +67,7 @@ class AdaptiveExperimentPlanner:
                 "；自定义检测器需先生成实现并获批准"
             )
 
-        hypothesis = self._select_hypothesis(project)
+        hypothesis = self._select_hypothesis(project, hypothesis_id=hypothesis_id)
         contract = hypothesis.analysis_contract
         if contract is None:
             raise ValueError("The selected hypothesis has no analysis contract")
@@ -90,9 +91,15 @@ class AdaptiveExperimentPlanner:
         if not shots or not seeds:
             raise ValueError("The experiment plan must contain at least one K and one seed")
 
-        effective_max_runs = min(max_runs, project.spec.budget.max_experiments)
+        historical_campaign_runs = sum(
+            run.round_id is not None and run.plan_id == plan.id for run in project.runs
+        )
+        remaining_run_budget = project.spec.budget.max_experiments - historical_campaign_runs
+        effective_max_runs = min(max_runs, remaining_run_budget)
         if effective_max_runs < 2:
-            raise ValueError("The adaptive campaign requires budget for one paired experiment")
+            raise ValueError(
+                "The remaining project budget cannot fund another paired experiment"
+            )
         initial_k = 2 if 2 in shots else shots[0]
         initial_seeds = seeds[: min(2, effective_max_runs // 2)]
         initial_cells = [
@@ -684,7 +691,12 @@ class AdaptiveExperimentPlanner:
         return contract.treatment in approved and contract.control in approved
 
     @classmethod
-    def _select_hypothesis(cls, project: ResearchProject) -> Hypothesis:
+    def _select_hypothesis(
+        cls,
+        project: ResearchProject,
+        *,
+        hypothesis_id: str,
+    ) -> Hypothesis:
         approved_hypothesis_ids = (
             project.experiment_plan.hypothesis_ids if project.experiment_plan else []
         )
@@ -694,6 +706,7 @@ class AdaptiveExperimentPlanner:
             if hypothesis.analysis_contract is not None
             and cls._contract_is_executable(project, hypothesis.analysis_contract)
             and hypothesis.id in approved_hypothesis_ids
+            and hypothesis.id == hypothesis_id
         ]
         eligible.sort(
             key=lambda item: (
@@ -703,8 +716,8 @@ class AdaptiveExperimentPlanner:
         )
         if not eligible:
             raise ValueError(
-                "The approved plan has no executable paired hypothesis"
-                "（random/k_center 或已批准的自定义策略）"
+                "The selected innovation is not approved or executable by the current toolchain "
+                "(random/k_center or an approved custom strategy)"
             )
         return eligible[0]
 

@@ -16,7 +16,6 @@ from fsad_scientist.domain.enums import (
     RunStatus,
 )
 from fsad_scientist.domain.models import (
-    AnalysisContract,
     ArtifactRecord,
     DatasetAuditRecord,
     EvidenceRecord,
@@ -212,7 +211,7 @@ class ResearchWorkflow:
             )
 
         elif project.stage == ResearchStage.HYPOTHESES_REVIEWED:
-            self._ensure_executable_core_hypothesis(project)
+            self._ensure_executable_hypotheses(project)
             if project.experiment_plan is not None:
                 project.experiment_plan_history.append(
                     project.experiment_plan.model_copy(deep=True)
@@ -1039,6 +1038,7 @@ class ResearchWorkflow:
         project_id: str,
         *,
         dataset: DatasetManifest,
+        hypothesis_id: str,
         device: str = "cuda:0",
         detector: str = "anomalydino",
         max_rounds: int = 3,
@@ -1048,7 +1048,14 @@ class ResearchWorkflow:
         if project.stage != ResearchStage.EXPERIMENTS_QUEUED:
             raise InvalidTransitionError("Approve the preregistered plan before starting a loop")
         if project.experiment_campaign is not None:
-            raise InvalidTransitionError("The project already has an experiment campaign")
+            if project.experiment_campaign.status != "completed":
+                raise InvalidTransitionError(
+                    "The project already has an active experiment campaign"
+                )
+            project.experiment_campaign_history.append(
+                project.experiment_campaign.model_copy(deep=True)
+            )
+            project.experiment_campaign = None
         if project.experiment_plan is None:
             raise InvalidTransitionError("The project has no current experiment plan")
         current_plan_id = project.experiment_plan.id
@@ -1083,6 +1090,7 @@ class ResearchWorkflow:
                 project,
                 audit=audit,
                 dataset=dataset,
+                hypothesis_id=hypothesis_id,
                 device=device,
                 detector=detector,
                 max_rounds=max_rounds,
@@ -1571,8 +1579,8 @@ class ResearchWorkflow:
             )
 
     @staticmethod
-    def _ensure_executable_core_hypothesis(project: ResearchProject) -> None:
-        """Operationalize the team research brief without changing its scientific claim."""
+    def _ensure_executable_hypotheses(project: ResearchProject) -> None:
+        """Normalize every supported innovation without inventing a replacement claim."""
 
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
@@ -1619,71 +1627,17 @@ class ResearchWorkflow:
                         ),
                         payload={"hypothesis_id": hypothesis.id, "original": original},
                     )
-                return
+                continue
 
-        selected_gap = next(
-            (gap for gap in project.gaps if gap.status == "selected"),
-            project.gaps[0] if project.gaps else None,
-        )
-        if selected_gap is None:
+        executable = [
+            hypothesis
+            for hypothesis in project.hypotheses
+            if hypothesis.execution_readiness == "executable"
+        ]
+        if not executable:
             raise InvalidTransitionError(
-                "A research gap is required to operationalize the experiment hypothesis"
+                "当前创新点都需要先实现方法适配器；系统不会替换成无关假设。"
             )
-        core = Hypothesis(
-            gap_id=selected_gap.id,
-            title="正常参考样本的代表性是否比数量更重要",
-            claim=(
-                "在候选正常样本池固定且 K≤8 时，DINOv2 特征空间的 k-center 覆盖选样"
-                "相较随机选样，将提高 AnomalyDINO 的 Image AUROC，并降低跨支持集重采样波动。"
-            ),
-            null_hypothesis=(
-                "在相同类别、K、候选池和随机种子下，k-center 与 random 的 Image AUROC"
-                "成对差异为零，且稳定性没有改善。"
-            ),
-            rationale=(
-                "团队阶段性调研将正常样本代表性确定为主问题；该对照可直接在 MVTec AD"
-                "正常训练图像上实施，不使用测试异常参与选择。"
-            ),
-            independent_variables=["支持集选择策略", "K", "类别", "随机种子"],
-            dependent_variables=[
-                "Image AUROC",
-                "Pixel AUROC",
-                "跨支持集标准差",
-                "特征覆盖半径",
-            ],
-            predicted_direction=(
-                "k-center 的平均成对效应为正，且覆盖半径与性能损失或波动正相关。"
-            ),
-            falsification_conditions=[
-                "达到预注册最小配对数后，Image AUROC 成对效应置信区间仍包含零且效应可忽略",
-                "收益无法跨至少三个 MVTec 类别复现",
-                "覆盖半径改善但检测性能与稳定性不随之改善",
-            ],
-            evidence_ids=[item.id for item in project.evidence],
-            closest_prior_work=[
-                item.title
-                for item in project.evidence
-                if any(name in item.title.casefold() for name in ("patchcore", "anomalydino"))
-            ],
-            analysis_contract=AnalysisContract(
-                kind="selection_main_effect",
-                metric="image_auroc",
-                treatment="k_center",
-                control="random",
-                minimum_pairs=6,
-            ),
-            status=HypothesisStatus.SHORTLISTED,
-        )
-        project.hypotheses.append(core)
-        project.record_event(
-            actor="research_brief_operationalizer",
-            action="register_core_experiment_hypothesis",
-            summary=(
-                "现有候选中没有可由当前真实工具链直接检验的支持集选择主效应；"
-                "系统已把团队调研确定的核心问题注册为可证伪实验假设。"
-            ),
-            payload={"hypothesis_id": core.id},
-        )
 
 
 def _evidence_key(item: EvidenceRecord) -> str:

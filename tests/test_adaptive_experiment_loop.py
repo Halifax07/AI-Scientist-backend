@@ -43,6 +43,14 @@ def dataset_manifest() -> DatasetManifest:
     )
 
 
+def executable_hypothesis_id(project) -> str:
+    return next(
+        hypothesis.id
+        for hypothesis in project.hypotheses
+        if hypothesis.execution_readiness == "executable"
+    )
+
+
 def complete_current_round(workflow: ResearchWorkflow, project_id: str) -> None:
     project = workflow.repository.get(project_id)
     campaign = project.experiment_campaign
@@ -76,6 +84,7 @@ def test_feedback_loop_uses_results_and_respects_run_budget(tmp_path):
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
         max_rounds=3,
         max_runs=6,
     )
@@ -145,6 +154,7 @@ def test_campaign_skips_higher_ranked_unsupported_strategy(tmp_path):
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=supported.id,
         max_rounds=2,
         max_runs=6,
     )
@@ -166,6 +176,7 @@ def test_human_guidance_selects_only_a_registered_queued_run(tmp_path):
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
         max_rounds=2,
         max_runs=8,
     )
@@ -196,6 +207,47 @@ def test_human_guidance_selects_only_a_registered_queued_run(tmp_path):
     assert any(event.action == "interpret_experiment_guidance" for event in updated.events)
 
 
+def test_completed_campaign_can_continue_with_next_innovation(tmp_path):
+    workflow, project = build_approved_project(tmp_path, max_experiments=12)
+    executable_ids = [
+        item.id
+        for item in project.hypotheses
+        if item.execution_readiness == "executable"
+    ]
+    assert len(executable_ids) >= 2
+    dataset = dataset_manifest()
+    project = workflow.attach_dataset_audit(
+        project.id,
+        manifest=dataset,
+        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
+    )
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=executable_ids[0],
+        max_rounds=1,
+        max_runs=4,
+    )
+    first_run_ids = {item.id for item in project.runs}
+    complete_current_round(workflow, project.id)
+    project = run(workflow.review_experiment_round(project.id))
+    assert project.experiment_campaign is not None
+    assert project.experiment_campaign.status == "completed"
+
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=executable_ids[1],
+        max_rounds=1,
+        max_runs=4,
+    )
+
+    assert project.experiment_campaign is not None
+    assert project.experiment_campaign.hypothesis_id == executable_ids[1]
+    assert project.experiment_campaign_history[-1].hypothesis_id == executable_ids[0]
+    assert first_run_ids < {item.id for item in project.runs}
+
+
 def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path):
     workflow, project = build_approved_project(tmp_path, max_experiments=6)
     dataset = dataset_manifest()
@@ -207,6 +259,7 @@ def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path)
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
         max_rounds=2,
         max_runs=6,
     )
@@ -262,6 +315,7 @@ def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path)
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
         max_rounds=2,
         max_runs=6,
     )
@@ -281,6 +335,7 @@ def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
         max_rounds=3,
         max_runs=12,
     )

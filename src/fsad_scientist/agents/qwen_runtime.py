@@ -115,7 +115,11 @@ class QwenScientistRuntime(MockScientistRuntime):
             system_prompt=(
                 "你负责把研究空白转化为可证伪科学假设。每个假设必须包含零假设、"
                 "变量、预测方向和明确的证伪条件；从不同机制提出 3 至 6 个候选，"
-                "不要写成模糊的工程目标。除论文标题和标准技术名词外，"
+                "不要写成模糊的工程目标。至少提出 3 个能够由当前工具链直接验证的创新假设："
+                "analysis_contract.kind 必须为 selection_main_effect，treatment 必须为 k_center，"
+                "control 必须为 random；不同创新点应通过机制主张、主指标、类别边界或 K 敏感性"
+                "形成真正不同的证伪问题。可以补充需要新代码的前瞻候选，但不能把它标成可执行。"
+                "除论文标题和标准技术名词外，"
                 "所有自然语言字段使用简体中文。"
             ),
             payload={
@@ -123,6 +127,15 @@ class QwenScientistRuntime(MockScientistRuntime):
                 "evidence_candidates": [
                     item.model_dump(mode="json") for item in project.evidence
                 ],
+                "execution_capabilities": {
+                    "implemented_intervention": "k_center",
+                    "implemented_control": "random",
+                    "implemented_kind": "selection_main_effect",
+                    "detectors": ["anomalydino", "patchcore", "subspacead"],
+                    "datasets": ["MVTec AD"],
+                    "shots": project.spec.constraints.shots,
+                    "rule": "只有上述干预和对照可以标记为当前可执行",
+                },
                 "required_fields": [
                     "gap_id",
                     "title",
@@ -152,13 +165,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                             "evidence_ids": ["existing evidence id"],
                             "closest_prior_work": ["string"],
                             "analysis_contract": {
-                                "kind": (
-                                    "selection_main_effect|detector_interaction|"
-                                    "query_adaptation"
-                                ),
+                                "kind": "selection_main_effect",
                                 "metric": "string",
-                                "treatment": "string",
-                                "control": "string",
+                                "treatment": "k_center",
+                                "control": "random",
                                 "alpha": 0.05,
                                 "minimum_pairs": 6,
                             },

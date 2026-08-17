@@ -459,6 +459,7 @@ def create_app(
         return workflow.initialize_experiment_campaign(
             project_id,
             dataset=dataset,
+            hypothesis_id=body.hypothesis_id,
             device=body.device,
             detector=body.detector,
             max_rounds=body.max_rounds,
