@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from fsad_scientist import __version__
+from fsad_scientist.agents.agentscope_client import AgentScopeUnavailableError
 from fsad_scientist.agents.contracts import ScientistRuntime
 from fsad_scientist.agents.evidence_runtime import EvidenceEnabledRuntime
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
@@ -111,6 +112,10 @@ def create_app(
     @app.exception_handler(WorkflowError)
     async def workflow_error(_: Request, exc: WorkflowError):
         return _error_response(status.HTTP_409_CONFLICT, str(exc))
+
+    @app.exception_handler(AgentScopeUnavailableError)
+    async def agent_runtime_unavailable(_: Request, exc: AgentScopeUnavailableError):
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:

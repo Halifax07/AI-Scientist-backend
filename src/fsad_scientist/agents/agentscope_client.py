@@ -4,6 +4,8 @@ import json
 import os
 from typing import Any
 
+from openai import APIConnectionError, APIStatusError
+
 
 class AgentScopeUnavailableError(RuntimeError):
     pass
@@ -61,10 +63,32 @@ class AgentScopeJsonClient:
             ),
             toolkit=Toolkit(),
         )
-        reply = await agent.reply(
-            UserMsg(name="workflow", content=json.dumps(payload, ensure_ascii=False))
-        )
+        try:
+            reply = await agent.reply(
+                UserMsg(name="workflow", content=json.dumps(payload, ensure_ascii=False))
+            )
+        except APIStatusError as exc:
+            error_code = _api_error_code(exc)
+            if error_code == "Arrearage":
+                message = "DashScope 账户欠费或余额不足，请充值后重试。"
+            elif exc.status_code in {401, 403}:
+                message = "DashScope API Key 无效或没有当前模型的访问权限。"
+            else:
+                message = f"DashScope 请求失败（HTTP {exc.status_code}）。"
+            raise AgentScopeUnavailableError(message) from exc
+        except APIConnectionError as exc:
+            raise AgentScopeUnavailableError(
+                "无法连接 DashScope，请检查网络和服务地址。"
+            ) from exc
         return _parse_json_object(reply.get_text_content())
+
+
+def _api_error_code(exc: APIStatusError) -> str | None:
+    body = exc.body
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error", body)
+    return str(error.get("code")) if isinstance(error, dict) and error.get("code") else None
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:

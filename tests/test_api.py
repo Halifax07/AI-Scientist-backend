@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
+from fsad_scientist.agents.agentscope_client import AgentScopeUnavailableError
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.api.app import create_app
 from fsad_scientist.config import Settings
@@ -53,6 +54,28 @@ def test_cors_allows_both_loopback_frontend_origins(tmp_path):
 
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == origin
+
+
+def test_agent_runtime_failure_returns_readable_cors_error(tmp_path):
+    class FailingRuntime(MockScientistRuntime):
+        async def formalize_scope(self, project):
+            raise AgentScopeUnavailableError("DashScope 账户欠费或余额不足，请充值后重试。")
+
+    app = create_app(
+        settings=Settings(runtime="mock"),
+        storage_path=tmp_path / "runtime-error-ledger",
+        runtime=FailingRuntime(),
+    )
+    client = TestClient(app)
+    created = client.post("/api/v1/projects/demo").json()
+    response = client.post(
+        f"/api/v1/projects/{created['id']}/advance",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "DashScope 账户欠费或余额不足，请充值后重试。"
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
 def test_next_research_cycle_endpoint_requires_and_records_guidance(tmp_path):
