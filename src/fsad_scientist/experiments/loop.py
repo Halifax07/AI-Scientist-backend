@@ -636,8 +636,8 @@ class AdaptiveExperimentPlanner:
         )
         return experiment_round, nodes, runs
 
-    @staticmethod
-    def _select_hypothesis(project: ResearchProject) -> Hypothesis:
+    @classmethod
+    def _select_hypothesis(cls, project: ResearchProject) -> Hypothesis:
         approved_hypothesis_ids = (
             project.experiment_plan.hypothesis_ids if project.experiment_plan else []
         )
@@ -646,6 +646,8 @@ class AdaptiveExperimentPlanner:
             for hypothesis in project.hypotheses
             if hypothesis.analysis_contract is not None
             and hypothesis.analysis_contract.kind == "selection_main_effect"
+            and hypothesis.analysis_contract.treatment in cls.supported_strategies
+            and hypothesis.analysis_contract.control in cls.supported_strategies
             and hypothesis.id in approved_hypothesis_ids
         ]
         eligible.sort(
@@ -656,7 +658,7 @@ class AdaptiveExperimentPlanner:
         )
         if not eligible:
             raise ValueError(
-                "The approved plan has no selection_main_effect hypothesis for paired execution"
+                "The approved plan has no executable random/k_center paired hypothesis"
             )
         return eligible[0]
 

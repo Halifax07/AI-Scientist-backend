@@ -111,6 +111,50 @@ def test_feedback_loop_uses_results_and_respects_run_budget(tmp_path):
     assert project.stage == ResearchStage.RESULTS_READY
 
 
+def test_campaign_skips_higher_ranked_unsupported_strategy(tmp_path):
+    workflow, project = build_approved_project(tmp_path)
+    supported = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.treatment == "k_center"
+        and hypothesis.analysis_contract.control == "random"
+    )
+    unsupported = supported.model_copy(deep=True)
+    unsupported.id = "hypothesis_unsupported_strategy"
+    unsupported.title = "查询感知动态加权"
+    unsupported.analysis_contract = supported.analysis_contract.model_copy(
+        update={
+            "treatment": "Query-aware Dynamic Weighting",
+            "control": "Static Nearest-Neighbor Aggregation",
+        }
+    )
+    if unsupported.score is not None:
+        unsupported.score.elo = 9999
+    project.hypotheses.insert(0, unsupported)
+    assert project.experiment_plan is not None
+    project.experiment_plan.hypothesis_ids.insert(0, unsupported.id)
+    workflow.repository.save(project)
+
+    dataset = dataset_manifest()
+    project = workflow.attach_dataset_audit(
+        project.id,
+        manifest=dataset,
+        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
+    )
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        max_rounds=2,
+        max_runs=6,
+    )
+
+    assert project.experiment_campaign is not None
+    assert project.experiment_campaign.hypothesis_id == supported.id
+    assert project.experiment_campaign.treatment == "k_center"
+    assert project.experiment_campaign.control == "random"
+
+
 def test_human_guidance_selects_only_a_registered_queued_run(tmp_path):
     workflow, project = build_approved_project(tmp_path, max_experiments=8)
     dataset = dataset_manifest()
