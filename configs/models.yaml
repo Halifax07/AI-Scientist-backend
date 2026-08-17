@@ -1,0 +1,34 @@
+runtime: agentscope
+
+models:
+  reasoning:
+    provider: dashscope
+    model: qwen3.7-plus
+    purpose:
+      - supervisor
+      - gap_discovery
+      - hypothesis_generation
+      - skeptical_review
+      - experiment_planning
+      - scientific_reporting
+  vision:
+    provider: dashscope
+    model: qwen3-vl-plus
+    purpose:
+      - anomaly_map_review
+      - failure_case_comparison
+      - figure_quality_review
+  embedding:
+    provider: dashscope
+    model: text-embedding-v4
+    dimensions: 1024
+  rerank:
+    provider: dashscope
+    model: qwen3-rerank
+
+safety:
+  require_json_schema: true
+  forbid_llm_generated_metrics: true
+  forbid_unverified_citations: true
+  require_human_approval_before_execution: true
+

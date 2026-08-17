@@ -1,0 +1,104 @@
+{
+  "generated_at": "2026-08-09T00:50:00+08:00",
+  "clone_policy": "official repositories only; depth=1; filter=blob:none",
+  "repositories": [
+    {
+      "name": "AI-Scientist-v2",
+      "category": "ai_scientists",
+      "url": "https://github.com/SakanaAI/AI-Scientist-v2.git",
+      "path": "third_party/ai_scientists/ai-scientist-v2",
+      "commit": "96bd51617cfdbb494a9fc283af00fe090edfae48",
+      "license": "AI Scientist Source Code License 1.0"
+    },
+    {
+      "name": "AI-Scientist-v1",
+      "category": "ai_scientists",
+      "url": "https://github.com/SakanaAI/AI-Scientist.git",
+      "path": "third_party/ai_scientists/ai-scientist-v1",
+      "commit": "1de1dbc1f4ee2c5f61e9c94348d55eb51d7fa2eb",
+      "license": "AI Scientist Source Code License 1.0"
+    },
+    {
+      "name": "Robin",
+      "category": "ai_scientists",
+      "url": "https://github.com/Future-House/robin.git",
+      "path": "third_party/ai_scientists/robin",
+      "commit": "4a5cce310f3bc7663a67117db88af43b84733ffe",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "Finch",
+      "category": "ai_scientists",
+      "url": "https://github.com/Future-House/finch.git",
+      "path": "third_party/ai_scientists/finch",
+      "commit": "aea66fdf2dd2be827727de50a73cae60dff59972",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "AgentScope",
+      "category": "frameworks",
+      "url": "https://github.com/agentscope-ai/agentscope.git",
+      "path": "third_party/frameworks/agentscope",
+      "commit": "29b592358c2e983a0d10dd5227316b7a02d8c23a",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "Qwen-Agent",
+      "category": "frameworks",
+      "url": "https://github.com/QwenLM/Qwen-Agent.git",
+      "path": "third_party/frameworks/qwen-agent",
+      "commit": "31a4d36d123688581a9e9744427272b33ce940e0",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "PatchCore",
+      "category": "anomaly_detection",
+      "url": "https://github.com/amazon-science/patchcore-inspection.git",
+      "path": "third_party/anomaly_detection/patchcore-inspection",
+      "commit": "fcaa92f124fb1ad74a7acf56726decd4b27cbcad",
+      "license": "Apache-2.0",
+      "sparse_exclude": ["models"]
+    },
+    {
+      "name": "AnomalyDINO",
+      "category": "anomaly_detection",
+      "url": "https://github.com/dammsi/AnomalyDINO.git",
+      "path": "third_party/anomaly_detection/anomalydino",
+      "commit": "b9d1c2648e3a5247437d4d953d907a8f3d994457",
+      "license": "Apache-2.0"
+    },
+    {
+      "name": "SubspaceAD",
+      "category": "anomaly_detection",
+      "url": "https://github.com/CLendering/SubspaceAD.git",
+      "path": "third_party/anomaly_detection/subspacead",
+      "commit": "3c5356619435b85a5765467709ead6ff8bd733ac",
+      "license": "Apache-2.0"
+    }
+  ],
+  "unavailable_source": [
+    {
+      "name": "Google Co-Scientist",
+      "reason": "The authors state that the full source code is not publicly available.",
+      "paper": "docs/references/papers/google-co-scientist-nature-2026.pdf",
+      "sha256": "b2e0219dd8d0b6d94286b14af109af37233f7c4c94a39e39e1c25e3d24607fdc"
+    },
+    {
+      "name": "FastRef",
+      "reason": "The official GitHub repository exists but has no refs or commits at sync time.",
+      "url": "https://github.com/liyufei25/FastRef.git",
+      "paper": "docs/references/papers/fastref-cvpr-2026.pdf",
+      "sha256": "fe8236e81b752223da635da61aeb16b44e1a5e160174f6fee2d10597a5dda394"
+    }
+  ],
+  "papers": [
+    {
+      "path": "docs/references/papers/ai-scientist-v2-2025.pdf",
+      "sha256": "c902bdf96ff2519189049cacf12114d63e310d58471f61dd156b16d4baa7f2fa"
+    },
+    {
+      "path": "docs/references/papers/robin-nature-2026.pdf",
+      "sha256": "45266b91379b70d7fff5e6819d4b7253e1f95b4ecb7738a4e0ea99fbd96f92b0"
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+detectors:
+  patchcore:
+    role: historical_baseline
+    source: third_party/anomaly_detection/patchcore-inspection
+    adapter: fsad_scientist.experiments.adapters.PatchCoreAdapter
+  anomalydino:
+    role: training_free_patch_baseline
+    source: third_party/anomaly_detection/anomalydino
+    adapter: fsad_scientist.experiments.adapters.AnomalyDinoAdapter
+    integration: single_category_wrapper_without_third_party_modification
+  subspacead:
+    role: training_free_subspace_baseline
+    source: third_party/anomaly_detection/subspacead
+    adapter: fsad_scientist.experiments.adapters.SubspaceAdAdapter
+  fastref:
+    role: query_adaptive_extension
+    source: unavailable_empty_official_repository
+    paper: docs/references/papers/fastref-cvpr-2026.pdf
+    integration_status: waiting_for_official_code
+
+support_selection:
+  strict_k_shot:
+    strategies: [random]
+  pool_compression:
+    strategies: [random, k_center, k_medoids, dpp]
+    implemented_strategies: [random, k_center]
+    required_geometry_metrics: [coverage_radius, mean_coverage_distance, effective_rank]

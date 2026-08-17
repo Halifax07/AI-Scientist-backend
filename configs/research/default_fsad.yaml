@@ -1,0 +1,29 @@
+title: 少样本工业视觉异常检测自主研究
+domain: 少样本工业视觉异常检测
+application_context: 新产品上线时仅能获取极少量正常样本
+objective: 自主发现并验证具有科学价值的可证伪改进方向
+
+datasets:
+  - name: MVTec AD
+    role: primary
+    normal_only_training: true
+  - name: VisA
+    role: validation
+    normal_only_training: true
+
+constraints:
+  shots: [1, 2, 4, 8]
+  no_real_anomalies_for_adaptation: true
+  require_image_level_score: true
+  require_pixel_localization: true
+  training_free_preferred: true
+  strict_k_shot_protocol: true
+  pool_compression_protocol: true
+  candidate_pool_size: 30
+
+budget:
+  gpu_hours: 12
+  max_parallel_runs: 2
+  max_llm_calls: 300
+  max_experiments: 240
+

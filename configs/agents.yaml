@@ -1,0 +1,50 @@
+agents:
+  supervisor:
+    responsibility: 管理科研状态机、预算、上下文和下一实验选择
+    may_call:
+      - all_read_only_tools
+      - submit_experiment_after_human_approval
+    output: workflow decision
+
+  evidence_agent:
+    responsibility: 文献检索、事实抽取、最近工作比较和引用校验
+    may_call:
+      - search_papers
+      - verify_reference
+    output: verified evidence records
+
+  data_scientist_agent:
+    responsibility: 数据画像、特征几何分析、泄漏检查和候选池定义
+    may_call:
+      - profile_dataset
+      - build_candidate_pool
+    output: dataset card and feature manifest
+
+  hypothesis_agent:
+    responsibility: 从研究空白生成创新候选、零假设和证伪条件
+    may_call:
+      - read_evidence
+      - read_dataset_card
+    output: falsifiable hypotheses
+
+  skeptic_meta_reviewer:
+    responsibility: 反驳、去重、两两排名、Elo 更新和假设演化
+    may_call:
+      - verify_reference
+      - estimate_experiment_cost
+    output: ranked hypotheses and objections
+
+  experiment_planner:
+    responsibility: 生成预注册的对照、复现、消融和跨数据集实验
+    may_call:
+      - select_support_set
+      - estimate_experiment_cost
+    output: immutable experiment plan digest
+
+  result_innovation_agent:
+    responsibility: 基于确定性统计结果和视觉观察判定假设及创新候选
+    may_call:
+      - analyze_statistics
+      - review_visual_failures
+    output: verdict, boundary conditions, innovation card
+

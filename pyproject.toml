@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fsad-scientist"
+version = "0.1.0"
+description = "Autonomous scientific-discovery workbench for few-shot industrial visual anomaly detection."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Proprietary - competition project" }
+authors = [{ name = "FSAD Scientist Team" }]
+dependencies = [
+  "fastapi==0.135.3",
+  "httpx>=0.28,<1",
+  "openai>=1.60,<3",
+  "pypdf>=5,<7",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "pyyaml>=6.0,<7",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+agent = [
+  "agentscope>=2.0,<3",
+]
+experiment = [
+  "mlflow>=3.0,<4",
+  "numpy>=1.26,<2",
+  "pandas>=2.2,<4",
+  "scikit-learn>=1.6,<2",
+]
+vision = [
+  "numpy>=1.26,<2",
+  "pillow>=11,<13",
+  "torch==2.9.1",
+  "torchvision==0.24.1",
+  "transformers>=4.53,<5",
+]
+detectors = [
+  "click>=8.1,<9",
+  "faiss-cpu>=1.9,<2",
+  "kornia>=0.8,<1",
+  "matplotlib>=3.9,<4",
+  "opencv-python>=4.10,<5",
+  "pandas>=2.2,<4",
+  "pretrainedmodels>=0.7,<1",
+  "scikit-image>=0.24,<1",
+  "scikit-learn>=1.6,<2",
+  "scipy>=1.14,<2",
+  "tifffile>=2024,<2027",
+  "tqdm>=4.66,<5",
+]
+dev = [
+  "numpy>=1.26,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+fsad-scientist = "fsad_scientist.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fsad_scientist"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
