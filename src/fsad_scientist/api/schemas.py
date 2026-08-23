@@ -19,6 +19,16 @@ class ApprovalRequest(BaseModel):
     approved_by: str = Field(min_length=1, max_length=120)
 
 
+class GenerateMethodRequest(BaseModel):
+    hypothesis_id: str = Field(min_length=1)
+
+
+class GenerateDetectorRequest(BaseModel):
+    hypothesis_id: str = Field(min_length=1)
+    name_stem: str = Field(min_length=1, max_length=120)
+    reference_description: str | None = None
+
+
 class StartNextResearchCycleRequest(BaseModel):
     user_guidance: str = Field(min_length=2, max_length=3000)
 
@@ -74,7 +84,7 @@ class ProjectDatasetAuditRequest(DatasetScanRequest):
 
 class InitializeExperimentCampaignRequest(BaseModel):
     dataset_manifest_path: str = Field(min_length=1)
-    detector: Literal["anomalydino", "patchcore", "subspacead"] = "anomalydino"
+    detector: str = Field(default="anomalydino", min_length=1, max_length=120)
     device: str = Field(default="cuda:0", pattern=r"^(cpu|cuda(?::\d+)?)$")
     max_rounds: int = Field(default=3, ge=1, le=10)
     max_runs: int = Field(default=24, ge=2, le=240)

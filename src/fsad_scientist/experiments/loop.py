@@ -19,6 +19,7 @@ from fsad_scientist.domain.models import (
     new_id,
     utc_now,
 )
+from fsad_scientist.experiments.code_safety import BUILTIN_DETECTORS, BUILTIN_STRATEGIES
 from fsad_scientist.science.experiment_tree import ExperimentNode, ExperimentPhase
 
 ExperimentPhaseName = Literal[
@@ -40,8 +41,8 @@ class AdaptiveExperimentPlanner:
     arbitrary command or leak test labels into support-set selection.
     """
 
-    supported_detectors = {"anomalydino", "patchcore", "subspacead"}
-    supported_strategies = {"random", "k_center"}
+    supported_detectors = BUILTIN_DETECTORS
+    supported_strategies = BUILTIN_STRATEGIES
 
     def initialize(
         self,
@@ -59,17 +60,27 @@ class AdaptiveExperimentPlanner:
             raise ValueError("The preregistered experiment plan must be approved first")
         if not audit.verified or audit.digest != dataset.digest:
             raise ValueError("A verified dataset audit matching the manifest is required")
-        if detector not in self.supported_detectors or detector not in plan.detectors:
-            raise ValueError(f"Detector is not approved and executable: {detector}")
+        if detector not in self._approved_detectors(project) or detector not in plan.detectors:
+            raise ValueError(
+                f"Detector is not approved and executable: {detector}"
+                "；自定义检测器需先生成实现并获批准"
+            )
 
         hypothesis = self._select_hypothesis(project)
         contract = hypothesis.analysis_contract
         if contract is None:
             raise ValueError("The selected hypothesis has no analysis contract")
-        if contract.treatment not in self.supported_strategies:
-            raise ValueError(f"Unsupported treatment strategy: {contract.treatment}")
-        if contract.control not in self.supported_strategies:
-            raise ValueError(f"Unsupported control strategy: {contract.control}")
+        approved_strategies = self._approved_strategies(project)
+        if contract.treatment not in approved_strategies:
+            raise ValueError(
+                f"Unsupported treatment strategy: {contract.treatment}"
+                "；自定义策略需先生成实现并获批准"
+            )
+        if contract.control not in approved_strategies:
+            raise ValueError(
+                f"Unsupported control strategy: {contract.control}"
+                "；自定义策略需先生成实现并获批准"
+            )
 
         categories = self._approved_categories(project, dataset)
         if not categories:
@@ -636,6 +647,29 @@ class AdaptiveExperimentPlanner:
         )
         return experiment_round, nodes, runs
 
+    @staticmethod
+    def _approved_strategies(project: ResearchProject) -> set[str]:
+        return BUILTIN_STRATEGIES | {
+            item.name
+            for item in project.method_implementations
+            if item.kind == "selection_strategy" and item.status == "approved"
+        }
+
+    @staticmethod
+    def _approved_detectors(project: ResearchProject) -> set[str]:
+        return BUILTIN_DETECTORS | {
+            item.name
+            for item in project.method_implementations
+            if item.kind == "detector" and item.status == "approved"
+        }
+
+    @classmethod
+    def _contract_is_executable(cls, project: ResearchProject, contract) -> bool:
+        if contract.kind not in {"selection_main_effect", "query_adaptation"}:
+            return False
+        approved = cls._approved_strategies(project)
+        return contract.treatment in approved and contract.control in approved
+
     @classmethod
     def _select_hypothesis(cls, project: ResearchProject) -> Hypothesis:
         approved_hypothesis_ids = (
@@ -645,9 +679,7 @@ class AdaptiveExperimentPlanner:
             hypothesis
             for hypothesis in project.hypotheses
             if hypothesis.analysis_contract is not None
-            and hypothesis.analysis_contract.kind == "selection_main_effect"
-            and hypothesis.analysis_contract.treatment in cls.supported_strategies
-            and hypothesis.analysis_contract.control in cls.supported_strategies
+            and cls._contract_is_executable(project, hypothesis.analysis_contract)
             and hypothesis.id in approved_hypothesis_ids
         ]
         eligible.sort(
@@ -658,7 +690,8 @@ class AdaptiveExperimentPlanner:
         )
         if not eligible:
             raise ValueError(
-                "The approved plan has no executable random/k_center paired hypothesis"
+                "The approved plan has no executable paired hypothesis"
+                "（random/k_center 或已批准的自定义策略）"
             )
         return eligible[0]
 

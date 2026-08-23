@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from fsad_scientist.datasets.models import DatasetManifest
 from fsad_scientist.datasets.view import DatasetViewBuilder
-from fsad_scientist.domain.models import ExperimentRun
+from fsad_scientist.domain.models import ExperimentRun, MethodImplementation
 from fsad_scientist.experiments.models import PreparedRunArtifacts
+from fsad_scientist.experiments.strategy_runner import GeneratedStrategyRunner
 from fsad_scientist.experiments.support_selection import plan_support_set
 from fsad_scientist.features.dinov2 import DinoEmbeddingManifest
 
@@ -25,6 +27,8 @@ class ExperimentPreparationService:
         dataset_manifest_path: Path,
         embeddings: DinoEmbeddingManifest | None = None,
         candidate_pool_size: int = 30,
+        custom_strategies: Mapping[str, MethodImplementation] | None = None,
+        strategy_runner: GeneratedStrategyRunner | None = None,
     ) -> PreparedRunArtifacts:
         if dataset.dataset.casefold() != run.dataset.casefold():
             raise ValueError("dataset manifest does not match the queued run")
@@ -47,6 +51,8 @@ class ExperimentPreparationService:
             candidate_pool_size=candidate_pool_size,
             embeddings=embedding_values,
             feature_extractor=feature_extractor,
+            custom_strategies=custom_strategies,
+            strategy_runner=strategy_runner,
         )
         support_path = self.artifact_root / "support_sets" / f"{support.digest}.json"
         _write_json(support_path, support.model_dump_json(indent=2))

@@ -7,7 +7,10 @@ import random
 from collections.abc import Mapping, Sequence
 
 from fsad_scientist.datasets.models import DatasetManifest
+from fsad_scientist.domain.models import MethodImplementation
+from fsad_scientist.experiments.code_safety import BUILTIN_STRATEGIES
 from fsad_scientist.experiments.models import SupportSetManifest
+from fsad_scientist.experiments.strategy_runner import GeneratedStrategyRunner
 
 
 def random_select(file_ids: Sequence[str], *, shots: int, seed: int) -> list[str]:
@@ -97,6 +100,8 @@ def plan_support_set(
     candidate_pool_size: int = 30,
     embeddings: Mapping[str, Sequence[float]] | None = None,
     feature_extractor: str = "none",
+    custom_strategies: Mapping[str, MethodImplementation] | None = None,
+    strategy_runner: GeneratedStrategyRunner | None = None,
 ) -> SupportSetManifest:
     """Freeze a support set while preserving strict-K and pool-compression semantics."""
 
@@ -113,17 +118,36 @@ def plan_support_set(
             raise ValueError("candidate_pool_size cannot be smaller than shots")
         pool_size = min(candidate_pool_size, len(all_normal))
         pool = random_select(all_normal, shots=pool_size, seed=seed)
-        if strategy == "random":
-            selected = random_select(pool, shots=shots, seed=_selection_seed(seed))
-        elif strategy == "k_center":
+        if strategy in BUILTIN_STRATEGIES:
+            if strategy == "random":
+                selected = random_select(pool, shots=shots, seed=_selection_seed(seed))
+            else:
+                if embeddings is None:
+                    raise ValueError("k_center requires precomputed normal-image embeddings")
+                missing = sorted(set(pool) - set(embeddings))
+                if missing:
+                    raise ValueError(f"embeddings are missing {len(missing)} candidate files")
+                selected = k_center_select(
+                    {file_id: embeddings[file_id] for file_id in pool},
+                    shots=shots,
+                )
+        elif custom_strategies is not None and strategy in custom_strategies:
+            implementation = custom_strategies[strategy]
+            if implementation.status != "approved":
+                raise ValueError(f"strategy {strategy} is not approved for execution")
+            if strategy_runner is None:
+                raise ValueError("a custom strategy runner is required")
             if embeddings is None:
-                raise ValueError("k_center requires precomputed normal-image embeddings")
+                raise ValueError("custom strategies require precomputed normal-image embeddings")
             missing = sorted(set(pool) - set(embeddings))
             if missing:
                 raise ValueError(f"embeddings are missing {len(missing)} candidate files")
-            selected = k_center_select(
-                {file_id: embeddings[file_id] for file_id in pool},
-                shots=shots,
+            selected = strategy_runner.run(
+                implementation,
+                pool=pool,
+                embeddings={file_id: embeddings[file_id] for file_id in pool},
+                k=shots,
+                seed=_selection_seed(seed),
             )
         else:
             raise ValueError(f"unsupported selection strategy: {strategy}")

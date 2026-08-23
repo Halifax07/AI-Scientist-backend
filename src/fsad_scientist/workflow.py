@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 from itertools import product
+from pathlib import Path
 from typing import Any, Literal
 
 from fsad_scientist.agents.contracts import ScientistRuntime
+from fsad_scientist.config import PROJECT_ROOT
 from fsad_scientist.datasets.models import DatasetManifest
 from fsad_scientist.domain.enums import (
     HypothesisStatus,
@@ -13,6 +16,7 @@ from fsad_scientist.domain.enums import (
 )
 from fsad_scientist.domain.models import (
     AnalysisContract,
+    ArtifactRecord,
     DatasetAuditRecord,
     EvidenceRecord,
     ExperimentGuidanceDecision,
@@ -20,10 +24,26 @@ from fsad_scientist.domain.models import (
     Hypothesis,
     ProjectSpec,
     ResearchProject,
+    StaticValidationReport,
     UserGuidanceRecord,
     utc_now,
 )
+from fsad_scientist.experiments.code_safety import (
+    BUILTIN_DETECTORS,
+    BUILTIN_STRATEGIES,
+    validate_detector_source,
+    validate_strategy_source,
+)
+from fsad_scientist.experiments.detector_runner import (
+    assemble_detector_file,
+    run_detector_smoke,
+)
 from fsad_scientist.experiments.loop import AdaptiveExperimentPlanner
+from fsad_scientist.experiments.strategy_runner import (
+    GeneratedStrategyRunner,
+    assemble_strategy_file,
+    run_strategy_smoke,
+)
 from fsad_scientist.repository import JsonProjectRepository
 
 
@@ -51,9 +71,11 @@ class ResearchWorkflow:
         *,
         repository: JsonProjectRepository,
         runtime: ScientistRuntime,
+        artifact_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.runtime = runtime
+        self.artifact_root = (artifact_root or PROJECT_ROOT / "artifacts").resolve()
         self.experiment_planner = AdaptiveExperimentPlanner()
 
     def create_project(self, spec: ProjectSpec) -> ResearchProject:
@@ -353,6 +375,7 @@ class ResearchWorkflow:
         if project.experiment_plan is None:
             raise InvalidTransitionError("Project has no experiment plan")
 
+        self._enforce_method_implementation_gate(project)
         project.experiment_plan.approved = True
         project.experiment_plan.approved_by = approved_by
         project.experiment_plan.approved_at = utc_now()
@@ -373,6 +396,288 @@ class ResearchWorkflow:
                 "approved_by": approved_by,
                 "queued_runs": len(new_runs),
                 "total_runs": len(project.runs),
+            },
+        )
+        return self.repository.save(project)
+
+    async def implement_experiment_method(
+        self,
+        project_id: str,
+        *,
+        hypothesis_id: str,
+    ) -> ResearchProject:
+        """Generate, statically validate, smoke-test and register one custom strategy.
+
+        Approved implementations are immutable; validated ones are reused without a
+        new LLM call; draft/rejected ones are regenerated. Only implementations that
+        pass static validation and the behavioral smoke test reach ``validated``
+        status, and only ``approved`` implementations may enter a campaign.
+        """
+
+        project = self.repository.get(project_id)
+        hypothesis = next(
+            (item for item in project.hypotheses if item.id == hypothesis_id),
+            None,
+        )
+        if hypothesis is None:
+            raise InvalidTransitionError(f"Unknown hypothesis id: {hypothesis_id}")
+        contract = hypothesis.analysis_contract
+        if contract is None:
+            raise InvalidTransitionError("The hypothesis has no analysis contract")
+        non_builtin = [
+            name
+            for name in (contract.treatment, contract.control)
+            if name not in BUILTIN_STRATEGIES
+        ]
+        if not non_builtin:
+            raise InvalidTransitionError("The hypothesis only uses built-in strategies")
+        if len(non_builtin) > 1:
+            raise InvalidTransitionError(
+                f"Treatment and control are both non-builtin strategies: {non_builtin}"
+            )
+        strategy_name = non_builtin[0]
+        control_name = (
+            contract.control if contract.treatment == strategy_name else contract.treatment
+        )
+
+        existing = next(
+            (
+                item
+                for item in project.method_implementations
+                if item.hypothesis_id == hypothesis.id and item.kind == "selection_strategy"
+            ),
+            None,
+        )
+        if existing is not None and existing.status in {"approved", "validated"}:
+            project.record_event(
+                actor="method_registry",
+                action="implement_experiment_method",
+                summary=f"复用已有 {existing.status} 实现 {existing.name}，未发起新的生成。",
+                payload={"code_digest": existing.code_digest, "status": existing.status},
+            )
+            return self.repository.save(project)
+
+        implementation = await self.runtime.implement_selection_strategy(
+            project,
+            hypothesis=hypothesis,
+            strategy_name=strategy_name,
+            control_name=control_name,
+        )
+        project.method_implementations = [
+            item
+            for item in project.method_implementations
+            if not (item.hypothesis_id == hypothesis.id and item.kind == "selection_strategy")
+        ]
+        project.method_implementations.append(implementation)
+
+        validation = validate_strategy_source(implementation.source_code)
+        implementation.static_validation = StaticValidationReport(
+            passed=validation.passed,
+            issues=validation.issues,
+        )
+        if not validation.passed:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="code_safety_validator",
+                action="implement_experiment_method",
+                summary=f"生成的策略 {implementation.name} 未通过静态校验，已拒绝。",
+                payload={"issues": validation.issues},
+            )
+            return self.repository.save(project)
+
+        assembled = assemble_strategy_file(implementation.source_code)
+        digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+        if digest != implementation.code_digest:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="code_safety_validator",
+                action="implement_experiment_method",
+                summary=f"策略 {implementation.name} 的注册摘要与源码不一致，已拒绝。",
+                payload={"expected": implementation.code_digest, "actual": digest},
+            )
+            return self.repository.save(project)
+
+        strategy_path = self.artifact_root / "generated_methods" / digest / "strategy.py"
+        strategy_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = strategy_path.with_suffix(".py.tmp")
+        temporary.write_text(assembled, encoding="utf-8")
+        temporary.replace(strategy_path)
+        implementation.artifact_path = str(strategy_path.resolve())
+        project.artifacts.append(
+            ArtifactRecord(
+                kind="generated_strategy",
+                title=f"生成选样策略 {implementation.name}",
+                path=str(strategy_path.resolve()),
+                payload={
+                    "name": implementation.name,
+                    "code_digest": implementation.code_digest,
+                    "hypothesis_id": hypothesis.id,
+                },
+                provenance=[self.runtime.name, "code_safety_validator"],
+                verified=False,
+            )
+        )
+
+        smoke = run_strategy_smoke(
+            implementation,
+            GeneratedStrategyRunner(self.artifact_root),
+        )
+        implementation.smoke_result = smoke
+        if not smoke.passed:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="strategy_smoke_runner",
+                action="implement_experiment_method",
+                summary=f"策略 {implementation.name} 冒烟测试未通过，已拒绝。",
+                payload={"smoke_summary": smoke.summary},
+            )
+            return self.repository.save(project)
+
+        implementation.status = "validated"
+        project.record_event(
+            actor=self.runtime.name,
+            action="implement_experiment_method",
+            summary=(
+                f"策略 {implementation.name} 已生成并通过静态校验与冒烟测试，"
+                "等待计划批准后注册执行。"
+            ),
+            payload={
+                "name": implementation.name,
+                "code_digest": implementation.code_digest,
+                "strategy_name": strategy_name,
+                "control_name": control_name,
+            },
+        )
+        return self.repository.save(project)
+
+    async def implement_experiment_detector(
+        self,
+        project_id: str,
+        *,
+        name_stem: str,
+        hypothesis_id: str,
+        reference_description: str | None = None,
+    ) -> ResearchProject:
+        """Generate, statically validate, smoke-test and register one detector.
+
+        Mirrors ``implement_experiment_method``: approved implementations are
+        immutable, validated ones are reused, draft/rejected are regenerated,
+        and only validated implementations may be approved for campaigns.
+        """
+
+        project = self.repository.get(project_id)
+        hypothesis = next(
+            (item for item in project.hypotheses if item.id == hypothesis_id),
+            None,
+        )
+        if hypothesis is None:
+            raise InvalidTransitionError(f"Unknown hypothesis id: {hypothesis_id}")
+        if not name_stem.strip():
+            raise InvalidTransitionError("Detector name stem is required")
+
+        existing = next(
+            (
+                item
+                for item in project.method_implementations
+                if item.hypothesis_id == hypothesis.id and item.kind == "detector"
+            ),
+            None,
+        )
+        if existing is not None and existing.status in {"approved", "validated"}:
+            project.record_event(
+                actor="method_registry",
+                action="implement_experiment_detector",
+                summary=f"复用已有 {existing.status} 检测器实现 {existing.name}，未发起新的生成。",
+                payload={"code_digest": existing.code_digest, "status": existing.status},
+            )
+            return self.repository.save(project)
+
+        implementation = await self.runtime.implement_detector(
+            project,
+            hypothesis=hypothesis,
+            name_stem=name_stem,
+            reference_description=reference_description,
+        )
+        project.method_implementations = [
+            item
+            for item in project.method_implementations
+            if not (item.hypothesis_id == hypothesis.id and item.kind == "detector")
+        ]
+        project.method_implementations.append(implementation)
+
+        validation = validate_detector_source(implementation.source_code)
+        implementation.static_validation = StaticValidationReport(
+            passed=validation.passed,
+            issues=validation.issues,
+        )
+        if not validation.passed:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="code_safety_validator",
+                action="implement_experiment_detector",
+                summary=f"生成的检测器 {implementation.name} 未通过静态校验，已拒绝。",
+                payload={"issues": validation.issues},
+            )
+            return self.repository.save(project)
+
+        assembled = assemble_detector_file(implementation.source_code)
+        digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+        if digest != implementation.code_digest:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="code_safety_validator",
+                action="implement_experiment_detector",
+                summary=f"检测器 {implementation.name} 的注册摘要与源码不一致，已拒绝。",
+                payload={"expected": implementation.code_digest, "actual": digest},
+            )
+            return self.repository.save(project)
+
+        detector_path = self.artifact_root / "generated_methods" / digest / "detector.py"
+        detector_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = detector_path.with_suffix(".py.tmp")
+        temporary.write_text(assembled, encoding="utf-8")
+        temporary.replace(detector_path)
+        implementation.artifact_path = str(detector_path.resolve())
+        project.artifacts.append(
+            ArtifactRecord(
+                kind="generated_detector",
+                title=f"生成检测器 {implementation.name}",
+                path=str(detector_path.resolve()),
+                payload={
+                    "name": implementation.name,
+                    "code_digest": implementation.code_digest,
+                    "hypothesis_id": hypothesis.id,
+                    "reference_description": reference_description,
+                },
+                provenance=[self.runtime.name, "code_safety_validator"],
+                verified=False,
+            )
+        )
+
+        smoke = await run_detector_smoke(implementation, self.artifact_root)
+        implementation.smoke_result = smoke
+        if not smoke.passed:
+            implementation.status = "rejected"
+            project.record_event(
+                actor="detector_smoke_runner",
+                action="implement_experiment_detector",
+                summary=f"检测器 {implementation.name} 冒烟测试未通过，已拒绝。",
+                payload={"smoke_summary": smoke.summary},
+            )
+            return self.repository.save(project)
+
+        implementation.status = "validated"
+        project.record_event(
+            actor=self.runtime.name,
+            action="implement_experiment_detector",
+            summary=(
+                f"检测器 {implementation.name} 已生成并通过静态校验与冒烟测试，"
+                "等待计划批准后注册执行。"
+            ),
+            payload={
+                "name": implementation.name,
+                "code_digest": implementation.code_digest,
+                "name_stem": name_stem,
             },
         )
         return self.repository.save(project)
@@ -820,8 +1125,120 @@ class ResearchWorkflow:
         )
 
     @staticmethod
+    def _enforce_method_implementation_gate(project: ResearchProject) -> None:
+        """Block approval of plans referencing custom strategies without validated code."""
+
+        if project.experiment_plan is None:
+            return
+        plan = project.experiment_plan
+        strategy_names: set[tuple[str, str]] = set()
+        for hypothesis_id in plan.hypothesis_ids:
+            hypothesis = next(
+                (item for item in project.hypotheses if item.id == hypothesis_id),
+                None,
+            )
+            if hypothesis is None or hypothesis.analysis_contract is None:
+                continue
+            contract = hypothesis.analysis_contract
+            if contract.kind not in {"selection_main_effect", "query_adaptation"}:
+                continue
+            for name in (contract.treatment, contract.control):
+                if name not in BUILTIN_STRATEGIES:
+                    strategy_names.add((hypothesis_id, name))
+        approved_digests: dict[str, str] = {}
+        for hypothesis_id, name in sorted(strategy_names):
+            implementation = next(
+                (
+                    item
+                    for item in project.method_implementations
+                    if item.kind == "selection_strategy"
+                    and item.name == name
+                    and item.hypothesis_id == hypothesis_id
+                ),
+                None,
+            )
+            if implementation is None:
+                raise InvalidTransitionError(
+                    f"策略 {name} 没有已注册实现；请先调用实验方法生成端点"
+                )
+            static_ok = implementation.static_validation.passed
+            smoke_ok = (
+                implementation.smoke_result is not None
+                and implementation.smoke_result.passed
+            )
+            if not (static_ok and smoke_ok):
+                raise InvalidTransitionError(
+                    f"策略 {name} 未通过静态校验或冒烟测试，不能批准"
+                )
+            preregistered = plan.method_implementation_digests.get(name)
+            if preregistered is not None and preregistered != implementation.code_digest:
+                raise InvalidTransitionError(
+                    f"策略 {name} 在预注册后发生变化，请重新生成并更新预注册摘要"
+                )
+            implementation.status = "approved"
+            approved_digests[name] = implementation.code_digest
+        for name in plan.detectors:
+            if name.casefold() in BUILTIN_DETECTORS:
+                continue
+            implementation = next(
+                (
+                    item
+                    for item in project.method_implementations
+                    if item.kind == "detector" and item.name == name
+                ),
+                None,
+            )
+            if implementation is None:
+                raise InvalidTransitionError(
+                    f"检测器 {name} 没有已注册实现；请先调用检测器生成端点"
+                )
+            static_ok = implementation.static_validation.passed
+            smoke_ok = (
+                implementation.smoke_result is not None
+                and implementation.smoke_result.passed
+            )
+            if not (static_ok and smoke_ok):
+                raise InvalidTransitionError(
+                    f"检测器 {name} 未通过静态校验或冒烟测试，不能批准"
+                )
+            preregistered = plan.method_implementation_digests.get(name)
+            if preregistered is not None and preregistered != implementation.code_digest:
+                raise InvalidTransitionError(
+                    f"检测器 {name} 在预注册后发生变化，请重新生成并更新预注册摘要"
+                )
+            implementation.status = "approved"
+            approved_digests[name] = implementation.code_digest
+        if approved_digests:
+            project.record_event(
+                actor="human_and_method_registry",
+                action="approve_experiment_plan",
+                summary="计划批准已把通过校验的自定义实现（策略或检测器）注册为可执行。",
+                payload={"approved_method_digests": approved_digests},
+            )
+
+    @staticmethod
     def _ensure_executable_core_hypothesis(project: ResearchProject) -> None:
         """Operationalize the team research brief without changing its scientific claim."""
+
+        for hypothesis in project.hypotheses:
+            contract = hypothesis.analysis_contract
+            if contract is None or contract.kind != "query_adaptation":
+                continue
+            control = _strategy_alias(contract.control)
+            if control == "random" and contract.control != "random":
+                original = contract.control
+                hypothesis.analysis_contract = contract.model_copy(
+                    update={"control": "random"}
+                )
+                project.record_event(
+                    actor="research_brief_operationalizer",
+                    action="operationalize_hypothesis",
+                    summary=(
+                        "已将查询自适应假设的对照条件归一为 random 基线；"
+                        "treatment 保持自定义策略名，等待实现生成与注册。"
+                    ),
+                    payload={"hypothesis_id": hypothesis.id, "original_control": original},
+                )
 
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
@@ -925,7 +1342,14 @@ def _evidence_key(item: EvidenceRecord) -> str:
 
 def _strategy_alias(value: str) -> str | None:
     normalized = " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
-    if normalized == "random" or "random" in normalized or "随机" in normalized:
+    if (
+        normalized == "random"
+        or "random" in normalized
+        or "随机" in normalized
+        or normalized == "none"
+        or "no adaptation" in normalized
+        or "无适配" in normalized
+    ):
         return "random"
     diversity_markers = (
         "k center",

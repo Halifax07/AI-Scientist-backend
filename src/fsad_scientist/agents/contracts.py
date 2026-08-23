@@ -13,6 +13,7 @@ from fsad_scientist.domain.models import (
     ExperimentRun,
     Hypothesis,
     InnovationCandidate,
+    MethodImplementation,
     ResearchGap,
     ResearchProject,
 )
@@ -65,5 +66,23 @@ class ScientistRuntime(Protocol):
     async def review_innovations(
         self, project: ResearchProject
     ) -> list[InnovationCandidate]: ...
+
+    async def implement_selection_strategy(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        strategy_name: str,
+        control_name: str,
+    ) -> MethodImplementation: ...
+
+    async def implement_detector(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        name_stem: str,
+        reference_description: str | None,
+    ) -> MethodImplementation: ...
 
     async def build_report_manifest(self, project: ResearchProject) -> ArtifactRecord: ...

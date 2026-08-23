@@ -2,7 +2,7 @@ import asyncio
 
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.datasets.models import DatasetManifest
-from fsad_scientist.domain.enums import ResearchStage, RunStatus
+from fsad_scientist.domain.enums import HypothesisStatus, ResearchStage, RunStatus
 from fsad_scientist.domain.models import (
     ComputeBudget,
     ExperimentCell,
@@ -241,6 +241,23 @@ def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path)
 
     while project.stage != ResearchStage.AWAITING_EXPERIMENT_APPROVAL:
         project = run(workflow.advance(project.id))
+    query_hypothesis = next(
+        (
+            item
+            for item in project.hypotheses
+            if item.analysis_contract is not None
+            and item.analysis_contract.kind == "query_adaptation"
+            and item.status == HypothesisStatus.SHORTLISTED
+        ),
+        None,
+    )
+    if query_hypothesis is not None:
+        project = run(
+            workflow.implement_experiment_method(
+                project.id,
+                hypothesis_id=query_hypothesis.id,
+            )
+        )
     project = workflow.approve_experiment_plan(project.id, approved_by="cycle-2-reviewer")
     project = workflow.initialize_experiment_campaign(
         project.id,

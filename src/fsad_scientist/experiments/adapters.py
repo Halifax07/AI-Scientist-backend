@@ -4,7 +4,8 @@ import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from fsad_scientist.domain.models import ExperimentRun
+from fsad_scientist.domain.models import ExperimentRun, MethodImplementation, ResearchProject
+from fsad_scientist.experiments.code_safety import GENERATED_DETECTOR_PREFIX
 from fsad_scientist.experiments.models import CommandSpec
 
 
@@ -218,6 +219,92 @@ class MethodRegistry:
 
     def names(self) -> list[str]:
         return sorted(self._adapters)
+
+
+def build_generated_detector_command(
+    run: ExperimentRun,
+    implementation: MethodImplementation,
+    *,
+    dataset_view: Path,
+    output_dir: Path,
+    device: str,
+) -> CommandSpec:
+    """CommandSpec for an approved generated detector (offline, argv-only)."""
+
+    if implementation.artifact_path is None:
+        raise ValueError(f"检测器 {implementation.name} 没有已写入的代码文件")
+    detector_path = Path(implementation.artifact_path)
+    if not detector_path.is_file():
+        raise ValueError(f"检测器代码文件不存在：{detector_path}")
+    return CommandSpec(
+        method=run.detector,
+        executable="python",
+        cwd=output_dir,
+        args=[
+            str(detector_path),
+            "--data_root",
+            str(dataset_view),
+            "--category",
+            run.category,
+            "--shots",
+            str(run.shots),
+            "--seed",
+            str(run.seed),
+            "--output",
+            str(output_dir),
+            "--device",
+            device,
+        ],
+        environment={
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "CUDA_VISIBLE_DEVICES": _device_index(device),
+        },
+        expected_outputs=["metrics.json"],
+        notes=[
+            "生成检测器以 argv-only 子进程运行；模型权重仅允许从本地缓存离线加载。",
+            "输出契约：输出目录下恰好一个 metrics.json，image_auroc 必填且位于 [0, 1]。",
+        ],
+    )
+
+
+def resolve_detector_command(
+    project: ResearchProject,
+    run: ExperimentRun,
+    registry: MethodRegistry,
+    *,
+    dataset_view: Path,
+    output_dir: Path,
+    device: str,
+) -> CommandSpec:
+    """Single resolution path: builtin adapters or approved generated detectors."""
+
+    if run.detector.casefold().startswith(GENERATED_DETECTOR_PREFIX):
+        implementation = next(
+            (
+                item
+                for item in project.method_implementations
+                if item.kind == "detector"
+                and item.name == run.detector
+                and item.status == "approved"
+            ),
+            None,
+        )
+        if implementation is None:
+            raise ValueError(f"检测器 {run.detector} 没有已批准的实现")
+        return build_generated_detector_command(
+            run,
+            implementation,
+            dataset_view=dataset_view,
+            output_dir=output_dir,
+            device=device,
+        )
+    return registry.get(run.detector).build_command(
+        run,
+        dataset_view=dataset_view,
+        output_dir=output_dir,
+        device=device,
+    )
 
 
 def _device_index(device: str) -> str:

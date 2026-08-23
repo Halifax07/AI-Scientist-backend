@@ -27,6 +27,8 @@ from fsad_scientist.api.schemas import (
     ExecuteNextExperimentResponse,
     ExecuteRunRequest,
     FullTextRequest,
+    GenerateDetectorRequest,
+    GenerateMethodRequest,
     HealthResponse,
     InitializeExperimentCampaignRequest,
     PrepareRunRequest,
@@ -39,11 +41,16 @@ from fsad_scientist.config import Settings, get_settings
 from fsad_scientist.datasets.models import DatasetManifest, DatasetViewManifest
 from fsad_scientist.datasets.scanner import MvtecDatasetScanner
 from fsad_scientist.datasets.view import DatasetViewBuilder
-from fsad_scientist.domain.models import EvidenceRecord, ProjectSpec, ResearchProject
+from fsad_scientist.domain.models import (
+    EvidenceRecord,
+    MethodImplementation,
+    ProjectSpec,
+    ResearchProject,
+)
 from fsad_scientist.evidence.claims import QwenClaimVerifier
 from fsad_scientist.evidence.fulltext import ArxivFullTextService, FullTextDocument
 from fsad_scientist.evidence.search import LiteratureSearchResult, LiteratureSearchService
-from fsad_scientist.experiments.adapters import MethodRegistry
+from fsad_scientist.experiments.adapters import MethodRegistry, resolve_detector_command
 from fsad_scientist.experiments.models import (
     ExecutionRecord,
     PreparedRunArtifacts,
@@ -51,6 +58,7 @@ from fsad_scientist.experiments.models import (
 )
 from fsad_scientist.experiments.preparation import ExperimentPreparationService
 from fsad_scientist.experiments.runner import ExperimentRunner
+from fsad_scientist.experiments.strategy_runner import GeneratedStrategyRunner
 from fsad_scientist.experiments.support_selection import plan_support_set
 from fsad_scientist.features.dinov2 import DinoEmbeddingManifest, DinoV2Embedder
 from fsad_scientist.repository import JsonProjectRepository, ProjectNotFoundError
@@ -81,7 +89,11 @@ def create_app(
     evidence_service = LiteratureSearchService(mailto=settings.evidence_mailto)
     runtime = runtime or _build_runtime(settings, evidence_service=evidence_service)
     repository = JsonProjectRepository(storage_path or settings.storage_path)
-    workflow = ResearchWorkflow(repository=repository, runtime=runtime)
+    workflow = ResearchWorkflow(
+        repository=repository,
+        runtime=runtime,
+        artifact_root=settings.artifact_path,
+    )
     settings.artifact_path.mkdir(parents=True, exist_ok=True)
 
     app = FastAPI(
@@ -389,6 +401,36 @@ def create_app(
         return workflow.approve_experiment_plan(project_id, approved_by=body.approved_by)
 
     @app.post(
+        "/api/v1/projects/{project_id}/experiment-methods/generate",
+        response_model=ResearchProject,
+    )
+    async def generate_experiment_method(
+        project_id: str,
+        body: GenerateMethodRequest,
+        workflow: WorkflowDependency,
+    ) -> ResearchProject:
+        return await workflow.implement_experiment_method(
+            project_id,
+            hypothesis_id=body.hypothesis_id,
+        )
+
+    @app.post(
+        "/api/v1/projects/{project_id}/experiment-methods/generate-detector",
+        response_model=ResearchProject,
+    )
+    async def generate_experiment_detector(
+        project_id: str,
+        body: GenerateDetectorRequest,
+        workflow: WorkflowDependency,
+    ) -> ResearchProject:
+        return await workflow.implement_experiment_detector(
+            project_id,
+            name_stem=body.name_stem,
+            hypothesis_id=body.hypothesis_id,
+            reference_description=body.reference_description,
+        )
+
+    @app.post(
         "/api/v1/projects/{project_id}/experiment-campaign/initialize",
         response_model=ResearchProject,
     )
@@ -467,6 +509,7 @@ def create_app(
                 category=run.category,
                 force=body.force_embeddings,
             )
+            custom_strategies, strategy_runner = _custom_strategy_context(project, settings)
             prepared = await asyncio.to_thread(
                 ExperimentPreparationService(settings.artifact_path).prepare,
                 project_id=project_id,
@@ -475,6 +518,8 @@ def create_app(
                 dataset_manifest_path=dataset_path,
                 embeddings=embeddings,
                 candidate_pool_size=campaign.candidate_pool_size,
+                custom_strategies=custom_strategies,
+                strategy_runner=strategy_runner,
             )
             view = _load_artifact_model(
                 prepared.dataset_view_manifest_path,
@@ -487,13 +532,17 @@ def create_app(
                 SupportSetManifest,
             )
             output_dir = settings.artifact_path / "runs" / project_id / run.id
-            adapter = MethodRegistry(settings.artifact_path.parents[0]).get(run.detector)
-            command = adapter.build_command(
-                run,
-                dataset_view=Path(view.view_root),
-                output_dir=output_dir,
-                device=campaign.device,
-            )
+            try:
+                command = resolve_detector_command(
+                    project,
+                    run,
+                    MethodRegistry(settings.artifact_path.parents[0]),
+                    dataset_view=Path(view.view_root),
+                    output_dir=output_dir,
+                    device=campaign.device,
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
             workflow.mark_run_running(project_id, run_id=run.id)
             record = await ExperimentRunner(
                 project_root=settings.artifact_path.parents[0],
@@ -611,13 +660,17 @@ def create_app(
             support,
         )
         output_dir = settings.artifact_path / "runs" / project_id / run_id
-        adapter = MethodRegistry(settings.artifact_path.parents[0]).get(run.detector)
-        command = adapter.build_command(
-            run,
-            dataset_view=Path(view.view_root),
-            output_dir=output_dir,
-            device=body.device,
-        )
+        try:
+            command = resolve_detector_command(
+                project,
+                run,
+                MethodRegistry(settings.artifact_path.parents[0]),
+                dataset_view=Path(view.view_root),
+                output_dir=output_dir,
+                device=body.device,
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
         workflow.mark_run_running(project_id, run_id=run_id)
         record = await ExperimentRunner(
             project_root=settings.artifact_path.parents[0],
@@ -681,6 +734,7 @@ def create_app(
                 settings.artifact_path,
                 DinoEmbeddingManifest,
             )
+        custom_strategies, strategy_runner = _custom_strategy_context(project, settings)
         return await asyncio.to_thread(
             ExperimentPreparationService(settings.artifact_path).prepare,
             project_id=project_id,
@@ -689,6 +743,8 @@ def create_app(
             dataset_manifest_path=dataset_path,
             embeddings=embeddings,
             candidate_pool_size=body.candidate_pool_size,
+            custom_strategies=custom_strategies,
+            strategy_runner=strategy_runner,
         )
 
     @app.post("/api/v1/projects/{project_id}/results/finalize", response_model=ResearchProject)
@@ -749,6 +805,18 @@ def _resolve_artifact_path(value: str, artifact_root: Path) -> Path:
     except ValueError as exc:
         raise HTTPException(400, "manifest path must be inside the artifact root") from exc
     return path
+
+
+def _custom_strategy_context(
+    project: ResearchProject,
+    settings: Settings,
+) -> tuple[dict[str, MethodImplementation], GeneratedStrategyRunner]:
+    approved = {
+        item.name: item
+        for item in project.method_implementations
+        if item.kind == "selection_strategy" and item.status == "approved"
+    }
+    return approved, GeneratedStrategyRunner(settings.artifact_path)
 
 
 def _write_model(path: Path, model: object) -> None:

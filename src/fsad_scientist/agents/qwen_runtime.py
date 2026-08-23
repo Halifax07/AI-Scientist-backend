@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fsad_scientist.agents.agentscope_client import AgentScopeJsonClient
@@ -13,10 +14,19 @@ from fsad_scientist.domain.models import (
     ExperimentRun,
     Hypothesis,
     HypothesisScore,
+    MethodImplementation,
     ResearchGap,
     ResearchProject,
     new_id,
 )
+from fsad_scientist.experiments.code_safety import (
+    extract_detector_source,
+    extract_select_function,
+    implementation_detector_name,
+    sanitize_strategy_name,
+)
+from fsad_scientist.experiments.detector_runner import assemble_detector_file
+from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
 
 
 class QwenScientistRuntime(MockScientistRuntime):
@@ -393,6 +403,155 @@ class QwenScientistRuntime(MockScientistRuntime):
             )
             fallback.advisor = f"{self.name}:deterministic-fallback"
             fallback.rationale += f" Qwen 解释回退：{type(exc).__name__}。"
+            return fallback
+
+    async def implement_selection_strategy(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        strategy_name: str,
+        control_name: str,
+    ) -> MethodImplementation:
+        """Ask Qwen for a pure selection function; deterministic fallback on failure."""
+
+        try:
+            response = await self.client.complete(
+                role_name="MethodImplementerAgent",
+                system_prompt=(
+                    "你是少样本异常检测的支持集选样策略实现专家。"
+                    f"为策略 {strategy_name}（对照 {control_name}）编写实现。"
+                    "只返回一个纯 Python 函数，函数体不得包含 import 语句"
+                    "（运行模板已导入 math、random、numpy 等允许模块），"
+                    "不得读写文件、联网、启动子进程或调用 eval/exec；"
+                    "固定 seed 时必须确定性输出。函数只依赖候选正常样本的特征向量，"
+                    "不得接触任何测试/异常数据。除代码外所有自然语言使用简体中文。"
+                ),
+                payload={
+                    "hypothesis": hypothesis.model_dump(mode="json"),
+                    "strategy_name": strategy_name,
+                    "control_name": control_name,
+                    "function_contract": {
+                        "signature": (
+                            "def select(candidate_ids: list[str], "
+                            "embeddings: dict[str, list[float]], k: int, seed: int) "
+                            "-> list[str]"
+                        ),
+                        "semantics": (
+                            "从 candidate_ids 中选出恰好 k 个不重复样本，"
+                            "返回其文件 id 列表；只能基于 embeddings 与 seed。"
+                        ),
+                        "scale": "candidate_ids 不超过 30 个；向量维度不超过 384。",
+                        "forbidden": [
+                            "import 语句",
+                            "文件/网络/子进程/eval/exec",
+                            "非确定性随机源（必须用 random.Random(seed) 或纯计算）",
+                            "接触测试或异常标签",
+                        ],
+                    },
+                    "output_schema": {
+                        "source_code": "完整 def select 函数源码",
+                        "explanation": "策略机制的一句话说明（简体中文）",
+                    },
+                    "return": {"source_code": "string"},
+                },
+            )
+            source = extract_select_function(str(response.get("source_code", "")))
+            assembled = assemble_strategy_file(source)
+            digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+            return MethodImplementation(
+                kind="selection_strategy",
+                name=sanitize_strategy_name(strategy_name),
+                hypothesis_id=hypothesis.id,
+                source_code=source,
+                code_digest=digest,
+                provenance=[self.name, "static_contract:accepted"],
+                status="draft",
+            )
+        except Exception as exc:
+            fallback = await super().implement_selection_strategy(
+                project,
+                hypothesis=hypothesis,
+                strategy_name=strategy_name,
+                control_name=control_name,
+            )
+            fallback.provenance.append(
+                f"{self.name}:deterministic-fallback:{type(exc).__name__}"
+            )
+            return fallback
+
+    async def implement_detector(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        name_stem: str,
+        reference_description: str | None,
+    ) -> MethodImplementation:
+        """Ask Qwen for an anomaly-score core function; deterministic fallback on failure."""
+
+        try:
+            response = await self.client.complete(
+                role_name="DetectorImplementerAgent",
+                system_prompt=(
+                    "你是工业异常检测方法实现专家。为以下假设实现一个新检测器的核心打分"
+                    "逻辑。只允许模块级 import（白名单：math/random/numpy/scipy/sklearn/"
+                    "PIL/cv2/torch/torchvision/transformers/timm）与顶层函数；必须恰好"
+                    "包含一个函数 def anomaly_score(image, support_images, seed) -> float，"
+                    "分数越高表示越异常。禁止读写文件、联网、启动子进程、eval/exec、"
+                    "torch.hub.load/hub.load 下载；预训练模型只能用 from_pretrained 且环境"
+                    "已强制离线（未缓存即失败）。固定 seed 必须确定性输出；torch 设备必须"
+                    "用 torch.device('cuda' if torch.cuda.is_available() else 'cpu')。"
+                    "数据读取、标签推导、AUROC 计算与输出由系统模板负责，不要重复实现。"
+                    "除代码外所有自然语言使用简体中文。"
+                ),
+                payload={
+                    "hypothesis": hypothesis.model_dump(mode="json"),
+                    "name_stem": name_stem,
+                    "reference_description": reference_description,
+                    "function_contract": {
+                        "signature": (
+                            "def anomaly_score(image, support_images, seed) -> float"
+                        ),
+                        "image": "numpy HxWx3 uint8 RGB 数组（单张测试图）",
+                        "support_images": "numpy 数组列表（预注册的 K 张正常参考图）",
+                        "semantics": "返回异常分数，分数越高越异常",
+                        "template_provides": [
+                            "数据视图读取",
+                            "ground_truth 掩码标签推导",
+                            "image_auroc/image_ap 计算",
+                            "metrics.json 输出",
+                        ],
+                    },
+                    "output_schema": {
+                        "source_code": "模块级 import + 辅助函数 + anomaly_score 的完整源码",
+                        "explanation": "方法机制的一句话说明（简体中文）",
+                    },
+                    "return": {"source_code": "string"},
+                },
+            )
+            source = extract_detector_source(str(response.get("source_code", "")))
+            assembled = assemble_detector_file(source)
+            digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+            return MethodImplementation(
+                kind="detector",
+                name=implementation_detector_name(name_stem, digest),
+                hypothesis_id=hypothesis.id,
+                source_code=source,
+                code_digest=digest,
+                provenance=[self.name, "static_contract:accepted"],
+                status="draft",
+            )
+        except Exception as exc:
+            fallback = await super().implement_detector(
+                project,
+                hypothesis=hypothesis,
+                name_stem=name_stem,
+                reference_description=reference_description,
+            )
+            fallback.provenance.append(
+                f"{self.name}:deterministic-fallback:{type(exc).__name__}"
+            )
             return fallback
 
     async def revise_hypotheses(self, project: ResearchProject) -> list[Hypothesis]:

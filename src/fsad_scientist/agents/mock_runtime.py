@@ -19,11 +19,47 @@ from fsad_scientist.domain.models import (
     Hypothesis,
     HypothesisScore,
     InnovationCandidate,
+    MethodImplementation,
     ResearchGap,
     ResearchProject,
     new_id,
 )
+from fsad_scientist.experiments.code_safety import (
+    implementation_detector_name,
+    sanitize_strategy_name,
+)
+from fsad_scientist.experiments.detector_runner import assemble_detector_file
+from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
 from fsad_scientist.science.statistics import compare_paired_runs
+
+MOCK_DETECTOR_SOURCE = (
+    "import numpy as np\n"
+    "\n"
+    "\n"
+    "def anomaly_score(image, support_images, seed):\n"
+    "    differences = [\n"
+    "        image.astype(np.float32) - support.astype(np.float32)\n"
+    "        for support in support_images\n"
+    "    ]\n"
+    "    distances = [\n"
+    "        float(np.mean(difference ** 2))\n"
+    "        for difference in differences\n"
+    "    ]\n"
+    "    return min(distances)\n"
+)
+
+MOCK_STRATEGY_SOURCE = (
+    "def select(candidate_ids, embeddings, k, seed):\n"
+    "    norms = {\n"
+    "        file_id: sum(value * value for value in embeddings[file_id])\n"
+    "        for file_id in candidate_ids\n"
+    "    }\n"
+    "    return sorted(\n"
+    "        candidate_ids,\n"
+    "        key=lambda file_id: (norms[file_id], file_id),\n"
+    "        reverse=True,\n"
+    "    )[:k]\n"
+)
 
 
 class MockScientistRuntime:
@@ -289,6 +325,11 @@ class MockScientistRuntime:
         )
 
     async def design_experiments(self, project: ResearchProject) -> ExperimentPlan:
+        registered = [
+            item
+            for item in project.method_implementations
+            if item.status in {"validated", "approved"}
+        ]
         payload = {
             "hypothesis_ids": [
                 item.id
@@ -296,8 +337,20 @@ class MockScientistRuntime:
                 if item.status == HypothesisStatus.SHORTLISTED
             ],
             "protocols": ["strict_k_shot", "pool_compression_m30"],
-            "detectors": ["patchcore", "anomalydino", "subspacead"],
-            "selection_strategies": ["random", "k_center", "k_medoids", "dpp"],
+            "detectors": [
+                "patchcore",
+                "anomalydino",
+                "subspacead",
+                *[item.name for item in registered if item.kind == "detector"],
+            ],
+            "selection_strategies": [
+                "random",
+                "k_center",
+                *[item.name for item in registered if item.kind == "selection_strategy"],
+            ],
+            "method_implementation_digests": {
+                item.name: item.code_digest for item in registered
+            },
             "datasets": ["MVTec AD", "VisA"],
             "categories": ["bottle", "carpet", "capsule", "cable", "transistor"],
             "shots": project.spec.constraints.shots,
@@ -497,6 +550,61 @@ class MockScientistRuntime:
             ],
         )
 
+    async def implement_selection_strategy(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        strategy_name: str,
+        control_name: str,
+    ) -> MethodImplementation:
+        """Deterministic stub: a valid, distinct-from-builtin coverage strategy.
+
+        The registered name equals the sanitized contract strategy name so the
+        plan approval gate can match implementations to hypothesis contracts.
+        """
+
+        assembled = assemble_strategy_file(MOCK_STRATEGY_SOURCE)
+        digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+        return MethodImplementation(
+            kind="selection_strategy",
+            name=sanitize_strategy_name(strategy_name),
+            hypothesis_id=hypothesis.id,
+            source_code=MOCK_STRATEGY_SOURCE,
+            code_digest=digest,
+            provenance=[
+                self.name,
+                f"deterministic-stub-for:{strategy_name}",
+                f"control:{control_name}",
+            ],
+            status="draft",
+        )
+
+    async def implement_detector(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        name_stem: str,
+        reference_description: str | None,
+    ) -> MethodImplementation:
+        """Deterministic stub: a real numpy nearest-pixel-distance detector."""
+
+        assembled = assemble_detector_file(MOCK_DETECTOR_SOURCE)
+        digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+        provenance = [self.name, f"deterministic-stub-for:{name_stem}"]
+        if reference_description:
+            provenance.append(f"reference:{reference_description}")
+        return MethodImplementation(
+            kind="detector",
+            name=implementation_detector_name(name_stem, digest),
+            hypothesis_id=hypothesis.id,
+            source_code=MOCK_DETECTOR_SOURCE,
+            code_digest=digest,
+            provenance=provenance,
+            status="draft",
+        )
+
     async def analyze_results(self, project: ResearchProject) -> list[AnalysisFinding]:
         runs = [run for run in project.runs if run.status == RunStatus.SUCCEEDED and run.verified]
         if not runs:
@@ -505,7 +613,10 @@ class MockScientistRuntime:
         findings: list[AnalysisFinding] = []
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
-            if contract is None or contract.kind != "selection_main_effect":
+            if contract is None or contract.kind not in {
+                "selection_main_effect",
+                "query_adaptation",
+            }:
                 findings.append(
                     AnalysisFinding(
                         hypothesis_id=hypothesis.id,

@@ -185,6 +185,7 @@ class ExperimentPlan(BaseModel):
     approved: bool = False
     approved_by: str | None = None
     approved_at: datetime | None = None
+    method_implementation_digests: dict[str, str] = Field(default_factory=dict)
 
 
 class ExperimentRun(BaseModel):
@@ -439,6 +440,35 @@ class ArtifactRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class StaticValidationReport(BaseModel):
+    passed: bool = False
+    issues: list[str] = Field(default_factory=list)
+
+
+class MethodSmokeResult(BaseModel):
+    passed: bool = False
+    summary: str = ""
+    selected: list[str] | None = None
+    deterministic: bool | None = None
+
+
+class MethodImplementation(BaseModel):
+    """AI-generated experiment code registered for one hypothesis strategy."""
+
+    id: str = Field(default_factory=lambda: new_id("method"))
+    kind: Literal["selection_strategy", "detector"] = "selection_strategy"
+    name: str
+    hypothesis_id: str
+    source_code: str
+    code_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    static_validation: StaticValidationReport = Field(default_factory=StaticValidationReport)
+    smoke_result: MethodSmokeResult | None = None
+    status: Literal["draft", "validated", "approved", "rejected"] = "draft"
+    artifact_path: str | None = None
+    provenance: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class ResearchProject(BaseModel):
     id: str = Field(default_factory=lambda: new_id("project"))
     spec: ProjectSpec
@@ -459,6 +489,7 @@ class ResearchProject(BaseModel):
     finding_history: list[AnalysisFinding] = Field(default_factory=list)
     innovations: list[InnovationCandidate] = Field(default_factory=list)
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
+    method_implementations: list[MethodImplementation] = Field(default_factory=list)
     events: list[WorkflowEvent] = Field(default_factory=list)
     next_action: str = "formalize_scope"
     research_cycle: int = 1

@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 
+from fsad_scientist.experiments.code_safety import GENERATED_DETECTOR_PREFIX
 from fsad_scientist.experiments.models import NormalizedExperimentResult
 
 
@@ -16,18 +17,42 @@ class ResultNormalizer:
     """Normalize pinned detector outputs to one metric vocabulary."""
 
     def parse(self, method: str, output_dir: Path, *, category: str) -> NormalizedExperimentResult:
-        parsers = {
-            "patchcore": self._parse_patchcore,
-            "anomalydino": self._parse_anomalydino,
-            "subspacead": self._parse_subspacead,
-        }
-        try:
-            parser = parsers[method.casefold()]
-        except KeyError as exc:
-            raise ResultParseError(f"No result parser for method {method}") from exc
-        result = parser(output_dir, category=category)
+        if method.casefold().startswith(GENERATED_DETECTOR_PREFIX):
+            result = self._parse_generated_detector(output_dir, category=category)
+        else:
+            parsers = {
+                "patchcore": self._parse_patchcore,
+                "anomalydino": self._parse_anomalydino,
+                "subspacead": self._parse_subspacead,
+            }
+            try:
+                parser = parsers[method.casefold()]
+            except KeyError as exc:
+                raise ResultParseError(f"No result parser for method {method}") from exc
+            result = parser(output_dir, category=category)
         _validate_metrics(result.metrics)
         return result
+
+    @staticmethod
+    def _parse_generated_detector(
+        output_dir: Path, *, category: str
+    ) -> NormalizedExperimentResult:
+        source = _one_result_file(output_dir, "metrics.json")
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ResultParseError("Generated detector metrics.json must be a JSON object")
+        metrics: dict[str, float] = {}
+        for name, value in payload.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            metrics[name] = float(value)
+        if "image_auroc" not in metrics:
+            raise ResultParseError("Generated detector output is missing required image_auroc")
+        return NormalizedExperimentResult(
+            parser="generated-detector-metrics-json-v1",
+            metrics=metrics,
+            source_files=[str(source.resolve())],
+        )
 
     @staticmethod
     def _parse_patchcore(output_dir: Path, *, category: str) -> NormalizedExperimentResult:

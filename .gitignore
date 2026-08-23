@@ -44,3 +44,5 @@ docs/references/papers/*.pdf
 .vscode/
 .DS_Store
 Thumbs.db
+
+.omc/
