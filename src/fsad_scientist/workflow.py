@@ -1633,6 +1633,12 @@ class ResearchWorkflow:
             hypothesis
             for hypothesis in project.hypotheses
             if hypothesis.execution_readiness == "executable"
+            or any(
+                implementation.hypothesis_id == hypothesis.id
+                and implementation.kind == "selection_strategy"
+                and implementation.status in {"validated", "approved"}
+                for implementation in project.method_implementations
+            )
         ]
         if not executable:
             raise InvalidTransitionError(

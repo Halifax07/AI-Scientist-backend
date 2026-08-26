@@ -308,6 +308,27 @@ class MockScientistRuntime:
                     minimum_pairs=6,
                 ),
             ),
+            Hypothesis(
+                gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
+                title="查询自适应原型降低初始支持集敏感度",
+                claim=(
+                    "测试时原型修正对随机或低覆盖参考集的收益高于对高覆盖参考集的收益。"
+                ),
+                null_hypothesis="原型修正收益与初始参考集覆盖质量无关。",
+                rationale="查询中的正常区域可以补足初始参考原型未覆盖的外观变化。",
+                independent_variables=["原型修正", "参考集覆盖质量", "K"],
+                dependent_variables=["AUROC", "AUPRO", "方差"],
+                predicted_direction="低覆盖参考集获得更大的修正收益。",
+                falsification_conditions=["修正收益不随参考集覆盖质量变化"],
+                evidence_ids=evidence_ids,
+                analysis_contract=AnalysisContract(
+                    kind="query_adaptation",
+                    metric="image_auroc",
+                    treatment="query_adaptive",
+                    control="no_adaptation",
+                    minimum_pairs=6,
+                ),
+            ),
         ]
 
     async def review_hypotheses(self, project: ResearchProject) -> list[Hypothesis]:
@@ -354,7 +375,14 @@ class MockScientistRuntime:
             "hypothesis_ids": [
                 item.id
                 for item in project.hypotheses
-                if item.execution_readiness == "executable"
+                if (
+                    item.execution_readiness == "executable"
+                    or any(
+                        implementation.hypothesis_id == item.id
+                        and implementation.kind == "selection_strategy"
+                        for implementation in registered
+                    )
+                )
                 and item.status
                 in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
             ],
