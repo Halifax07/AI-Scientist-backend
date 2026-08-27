@@ -51,18 +51,28 @@ MOCK_DETECTOR_SOURCE = (
     "    return min(distances)\n"
 )
 
-MOCK_STRATEGY_SOURCE = (
-    "def select(candidate_ids, embeddings, k, seed):\n"
-    "    norms = {\n"
-    "        file_id: sum(value * value for value in embeddings[file_id])\n"
-    "        for file_id in candidate_ids\n"
-    "    }\n"
-    "    return sorted(\n"
-    "        candidate_ids,\n"
-    "        key=lambda file_id: (norms[file_id], file_id),\n"
-    "        reverse=True,\n"
-    "    )[:k]\n"
-)
+def _mock_strategy_source(strategy_name: str) -> str:
+    normalized = sanitize_strategy_name(strategy_name)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    prefer_high_norm = not any(
+        marker in normalized for marker in ("unconstrained", "fastref", "baseline")
+    )
+    rotation = int(digest[:8], 16)
+    return (
+        "def select(candidate_ids, embeddings, k, seed):\n"
+        "    norms = {\n"
+        "        file_id: sum(value * value for value in embeddings[file_id])\n"
+        "        for file_id in candidate_ids\n"
+        "    }\n"
+        "    ranked = sorted(\n"
+        "        candidate_ids,\n"
+        "        key=lambda file_id: (norms[file_id], file_id),\n"
+        f"        reverse={prefer_high_norm!r},\n"
+        "    )\n"
+        f"    offset = {rotation} % len(ranked)\n"
+        "    rotated = ranked[offset:] + ranked[:offset]\n"
+        "    return rotated[:k]\n"
+    )
 
 
 class MockScientistRuntime:
@@ -333,12 +343,19 @@ class MockScientistRuntime:
             for item in project.method_implementations
             if item.status in {"validated", "approved"}
         ]
+        hypothesis_contracts = {
+            item.id: item.analysis_contract.model_dump(mode="json")
+            for item in project.hypotheses
+            if item.status == HypothesisStatus.SHORTLISTED
+            and item.analysis_contract is not None
+        }
         payload = {
             "hypothesis_ids": [
                 item.id
                 for item in project.hypotheses
                 if item.status == HypothesisStatus.SHORTLISTED
             ],
+            "hypothesis_contracts": hypothesis_contracts,
             "protocols": ["strict_k_shot", "pool_compression_m30"],
             "detectors": [
                 "patchcore",
@@ -667,13 +684,14 @@ class MockScientistRuntime:
         plan approval gate can match implementations to hypothesis contracts.
         """
 
-        assembled = assemble_strategy_file(MOCK_STRATEGY_SOURCE)
+        source_code = _mock_strategy_source(strategy_name)
+        assembled = assemble_strategy_file(source_code)
         digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
         return MethodImplementation(
             kind="selection_strategy",
             name=sanitize_strategy_name(strategy_name),
             hypothesis_id=hypothesis.id,
-            source_code=MOCK_STRATEGY_SOURCE,
+            source_code=source_code,
             code_digest=digest,
             provenance=[
                 self.name,

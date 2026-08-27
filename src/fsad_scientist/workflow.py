@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from itertools import product
 from pathlib import Path
 from typing import Any, Literal
@@ -22,6 +23,7 @@ from fsad_scientist.domain.models import (
     ExperimentGuidanceDecision,
     ExperimentRun,
     Hypothesis,
+    MethodImplementation,
     ProjectSpec,
     ResearchProject,
     StaticValidationReport,
@@ -31,6 +33,7 @@ from fsad_scientist.domain.models import (
 from fsad_scientist.experiments.code_safety import (
     BUILTIN_DETECTORS,
     BUILTIN_STRATEGIES,
+    sanitize_strategy_name,
     validate_detector_source,
     validate_strategy_source,
 )
@@ -191,6 +194,7 @@ class ResearchWorkflow:
 
         elif project.stage == ResearchStage.HYPOTHESES_PROPOSED:
             project.hypotheses = await self.runtime.review_hypotheses(project)
+            self._ensure_executable_core_hypothesis(project)
             self._move(
                 project,
                 stage=ResearchStage.HYPOTHESES_REVIEWED,
@@ -214,6 +218,7 @@ class ResearchWorkflow:
                     project.experiment_plan.model_copy(deep=True)
                 )
             project.experiment_plan = await self.runtime.design_experiments(project)
+            self._scope_experiment_plan_to_primary_hypothesis(project)
             self._move(
                 project,
                 stage=ResearchStage.AWAITING_EXPERIMENT_APPROVAL,
@@ -375,6 +380,15 @@ class ResearchWorkflow:
         if project.experiment_plan is None:
             raise InvalidTransitionError("Project has no experiment plan")
 
+        excluded_hypothesis_ids = self._scope_experiment_plan_to_primary_hypothesis(
+            project
+        )
+        if excluded_hypothesis_ids:
+            self.repository.save(project)
+            raise InvalidTransitionError(
+                "预注册计划已收敛为单一可执行主假设；请刷新页面复核后再次批准"
+            )
+
         self._enforce_method_implementation_gate(project)
         project.experiment_plan.approved = True
         project.experiment_plan.approved_by = approved_by
@@ -424,38 +438,121 @@ class ResearchWorkflow:
         contract = hypothesis.analysis_contract
         if contract is None:
             raise InvalidTransitionError("The hypothesis has no analysis contract")
-        non_builtin = [
-            name
-            for name in (contract.treatment, contract.control)
-            if name not in BUILTIN_STRATEGIES
-        ]
-        if not non_builtin:
-            raise InvalidTransitionError("The hypothesis only uses built-in strategies")
-        if len(non_builtin) > 1:
-            raise InvalidTransitionError(
-                f"Treatment and control are both non-builtin strategies: {non_builtin}"
-            )
-        strategy_name = non_builtin[0]
-        control_name = (
-            contract.control if contract.treatment == strategy_name else contract.treatment
-        )
+        canonical_treatment = _strategy_alias(contract.treatment) or contract.treatment
+        canonical_control = _strategy_alias(contract.control) or contract.control
+        replacement_names = {
+            "treatment": canonical_treatment,
+            "control": canonical_control,
+        }
+        generation_targets: list[tuple[str, str]] = []
+        used_names: set[str] = set()
+        for slot, original_name, canonical_name in (
+            ("treatment", contract.treatment, canonical_treatment),
+            ("control", contract.control, canonical_control),
+        ):
+            if canonical_name in BUILTIN_STRATEGIES:
+                continue
+            strategy_name = sanitize_strategy_name(original_name)
+            if strategy_name in used_names:
+                strategy_name = sanitize_strategy_name(f"{strategy_name}_{slot}")
+            used_names.add(strategy_name)
+            replacement_names[slot] = strategy_name
+            generation_targets.append((slot, strategy_name))
 
+        if not generation_targets:
+            strategy_name = sanitize_strategy_name(f"ai_strategy_{hypothesis.id}")
+            replacement_names["treatment"] = strategy_name
+            replacement_names["control"] = (
+                canonical_control
+                if canonical_treatment == "k_center"
+                else canonical_treatment
+            )
+            generation_targets.append(("treatment", strategy_name))
+
+        implementation_digests: dict[str, str] = {}
+        for slot, strategy_name in generation_targets:
+            peer_slot = "control" if slot == "treatment" else "treatment"
+            implementation = await self._implement_selection_strategy(
+                project,
+                hypothesis=hypothesis,
+                strategy_name=strategy_name,
+                control_name=replacement_names[peer_slot],
+                reserved_digests=set(implementation_digests.values()),
+            )
+            if implementation.status not in {"approved", "validated"}:
+                return self.repository.save(project)
+            if implementation.code_digest in implementation_digests.values():
+                implementation.status = "rejected"
+                project.record_event(
+                    actor="method_registry",
+                    action="implement_experiment_method",
+                    summary=(
+                        f"策略 {implementation.name} 与另一实验臂实现完全相同，已拒绝。"
+                    ),
+                    payload={"code_digest": implementation.code_digest},
+                )
+                return self.repository.save(project)
+            implementation_digests[strategy_name] = implementation.code_digest
+
+        self._sync_generated_strategy_references(
+            project,
+            hypothesis=hypothesis,
+            contract=contract,
+            treatment_name=replacement_names["treatment"],
+            control_name=replacement_names["control"],
+            implementation_digests=implementation_digests,
+        )
+        return self.repository.save(project)
+
+    async def _implement_selection_strategy(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        strategy_name: str,
+        control_name: str,
+        reserved_digests: set[str],
+    ) -> MethodImplementation:
         existing = next(
             (
                 item
                 for item in project.method_implementations
-                if item.hypothesis_id == hypothesis.id and item.kind == "selection_strategy"
+                if item.hypothesis_id == hypothesis.id
+                and item.kind == "selection_strategy"
+                and item.name == strategy_name
+                and item.status in {"approved", "validated"}
+                and item.code_digest not in reserved_digests
             ),
             None,
         )
-        if existing is not None and existing.status in {"approved", "validated"}:
+        if existing is not None:
+            if existing.name in BUILTIN_STRATEGIES:
+                raise InvalidTransitionError(
+                    f"Generated strategy {existing.name} cannot use a built-in name"
+                )
             project.record_event(
                 actor="method_registry",
                 action="implement_experiment_method",
                 summary=f"复用已有 {existing.status} 实现 {existing.name}，未发起新的生成。",
                 payload={"code_digest": existing.code_digest, "status": existing.status},
             )
-            return self.repository.save(project)
+            return existing
+
+        approved_conflict = next(
+            (
+                item
+                for item in project.method_implementations
+                if item.hypothesis_id == hypothesis.id
+                and item.kind == "selection_strategy"
+                and item.name == strategy_name
+                and item.status == "approved"
+            ),
+            None,
+        )
+        if approved_conflict is not None:
+            raise InvalidTransitionError(
+                f"Approved strategy {strategy_name} is immutable and conflicts with another arm"
+            )
 
         implementation = await self.runtime.implement_selection_strategy(
             project,
@@ -463,10 +560,15 @@ class ResearchWorkflow:
             strategy_name=strategy_name,
             control_name=control_name,
         )
+        implementation.name = strategy_name
         project.method_implementations = [
             item
             for item in project.method_implementations
-            if not (item.hypothesis_id == hypothesis.id and item.kind == "selection_strategy")
+            if not (
+                item.hypothesis_id == hypothesis.id
+                and item.kind == "selection_strategy"
+                and item.name == strategy_name
+            )
         ]
         project.method_implementations.append(implementation)
 
@@ -483,7 +585,7 @@ class ResearchWorkflow:
                 summary=f"生成的策略 {implementation.name} 未通过静态校验，已拒绝。",
                 payload={"issues": validation.issues},
             )
-            return self.repository.save(project)
+            return implementation
 
         assembled = assemble_strategy_file(implementation.source_code)
         digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
@@ -495,7 +597,7 @@ class ResearchWorkflow:
                 summary=f"策略 {implementation.name} 的注册摘要与源码不一致，已拒绝。",
                 payload={"expected": implementation.code_digest, "actual": digest},
             )
-            return self.repository.save(project)
+            return implementation
 
         strategy_path = self.artifact_root / "generated_methods" / digest / "strategy.py"
         strategy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,7 +633,7 @@ class ResearchWorkflow:
                 summary=f"策略 {implementation.name} 冒烟测试未通过，已拒绝。",
                 payload={"smoke_summary": smoke.summary},
             )
-            return self.repository.save(project)
+            return implementation
 
         implementation.status = "validated"
         project.record_event(
@@ -548,7 +650,196 @@ class ResearchWorkflow:
                 "control_name": control_name,
             },
         )
-        return self.repository.save(project)
+        return implementation
+
+    @staticmethod
+    def _plan_preregistration_digest(plan) -> str:
+        payload = plan.model_dump(
+            mode="json",
+            exclude={
+                "id",
+                "preregistration_digest",
+                "approved",
+                "approved_by",
+                "approved_at",
+            },
+        )
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _scope_experiment_plan_to_primary_hypothesis(
+        self,
+        project: ResearchProject,
+    ) -> list[str]:
+        plan = project.experiment_plan
+        if plan is None:
+            return []
+
+        hypotheses = {item.id: item for item in project.hypotheses}
+        supported_hypothesis_ids = [
+            hypothesis_id
+            for hypothesis_id in plan.hypothesis_ids
+            if hypothesis_id in hypotheses
+            and self._contract_is_supported_primary(
+                hypotheses[hypothesis_id].analysis_contract
+            )
+        ]
+        primary_hypothesis_id = min(
+            supported_hypothesis_ids,
+            key=lambda hypothesis_id: (
+                self._primary_hypothesis_priority(
+                    project, hypotheses[hypothesis_id]
+                ),
+                plan.hypothesis_ids.index(hypothesis_id),
+            ),
+            default=None,
+        )
+        if primary_hypothesis_id is None:
+            raise InvalidTransitionError(
+                "预注册计划没有当前执行器可支持的主假设，请重新设计实验计划"
+            )
+        if plan.hypothesis_ids == [primary_hypothesis_id] and set(
+            plan.hypothesis_contracts
+        ) == {primary_hypothesis_id}:
+            return []
+
+        excluded_hypothesis_ids = [
+            hypothesis_id
+            for hypothesis_id in plan.hypothesis_ids
+            if hypothesis_id != primary_hypothesis_id
+        ]
+        primary_contract = plan.hypothesis_contracts.get(primary_hypothesis_id)
+        if primary_contract is None:
+            primary_contract = hypotheses[primary_hypothesis_id].analysis_contract
+        if primary_contract is None:
+            raise InvalidTransitionError("主假设缺少分析契约")
+
+        plan.hypothesis_ids = [primary_hypothesis_id]
+        plan.hypothesis_contracts = {
+            primary_hypothesis_id: primary_contract.model_copy(deep=True)
+        }
+        plan.preregistration_digest = self._plan_preregistration_digest(plan)
+        project.record_event(
+            actor="experiment_plan_scope_guard",
+            action="scope_experiment_plan",
+            summary="预注册计划已限定为单一可执行主假设，与实际实验队列保持一致。",
+            payload={
+                "primary_hypothesis_id": primary_hypothesis_id,
+                "excluded_hypothesis_ids": excluded_hypothesis_ids,
+            },
+        )
+        return excluded_hypothesis_ids
+
+    @staticmethod
+    def _contract_is_supported_primary(contract: AnalysisContract | None) -> bool:
+        if contract is None or contract.kind not in {
+            "selection_main_effect",
+            "query_adaptation",
+        }:
+            return False
+        protocol_markers = (
+            "compression ratio",
+            "compression rate",
+            "pool size",
+            "candidate pool",
+            "压缩率",
+            "候选池",
+            "池大小",
+        )
+        names = (contract.treatment.casefold(), contract.control.casefold())
+        return not any(
+            marker in name for name in names for marker in protocol_markers
+        )
+
+    @staticmethod
+    def _primary_hypothesis_priority(
+        project: ResearchProject,
+        hypothesis: Hypothesis,
+    ) -> int:
+        """Prefer executable custom hypotheses, then contracts using built-ins.
+
+        The planner may return a natural-language custom strategy before its
+        implementation endpoint has been called. Such a candidate must not hide
+        an executable built-in core hypothesis during plan scoping. Once the user
+        has generated and validated the custom implementation, it remains the
+        preferred candidate even when a built-in candidate is also present.
+        """
+
+        contract = hypothesis.analysis_contract
+        if contract is None:
+            return 2
+        custom_names = [
+            name
+            for name in (contract.treatment, contract.control)
+            if name not in BUILTIN_STRATEGIES
+        ]
+        if not custom_names:
+            return 1
+        for name in custom_names:
+            implementation = next(
+                (
+                    item
+                    for item in project.method_implementations
+                    if item.kind == "selection_strategy"
+                    and item.hypothesis_id == hypothesis.id
+                    and item.name == name
+                ),
+                None,
+            )
+            if implementation is None or implementation.status not in {
+                "validated",
+                "approved",
+            }:
+                return 2
+            if not implementation.static_validation.passed or not (
+                implementation.smoke_result is not None
+                and implementation.smoke_result.passed
+            ):
+                return 2
+        return 0
+
+    def _sync_generated_strategy_references(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis: Hypothesis,
+        contract: AnalysisContract,
+        treatment_name: str,
+        control_name: str,
+        implementation_digests: dict[str, str],
+    ) -> None:
+        generated_names = set(implementation_digests)
+        invalid_names = generated_names & BUILTIN_STRATEGIES
+        if invalid_names:
+            raise InvalidTransitionError(
+                f"Generated strategies cannot use built-in names: {sorted(invalid_names)}"
+            )
+        replacement = contract.model_copy(
+            update={"treatment": treatment_name, "control": control_name}
+        )
+        hypothesis.analysis_contract = replacement
+        plan = project.experiment_plan
+        if plan is None or hypothesis.id not in plan.hypothesis_ids:
+            return
+        plan.hypothesis_contracts[hypothesis.id] = replacement.model_copy(deep=True)
+        replacements = {
+            contract.treatment: treatment_name,
+            contract.control: control_name,
+        }
+        plan.selection_strategies = list(
+            dict.fromkeys(
+                replacements.get(name, name) for name in plan.selection_strategies
+            )
+        )
+        for name in (treatment_name, control_name):
+            if name not in plan.selection_strategies:
+                plan.selection_strategies.append(name)
+        for original_name, replacement_name in replacements.items():
+            if original_name != replacement_name:
+                plan.method_implementation_digests.pop(original_name, None)
+        plan.method_implementation_digests.update(implementation_digests)
+        plan.preregistration_digest = self._plan_preregistration_digest(plan)
 
     async def implement_experiment_detector(
         self,
@@ -1068,7 +1359,9 @@ class ResearchWorkflow:
         if plan is None:
             return []
 
-        hypothesis_ids = plan.hypothesis_ids[:1]
+        if len(plan.hypothesis_ids) != 1:
+            raise InvalidTransitionError("实验计划必须且只能绑定一个主假设")
+        hypothesis_ids = plan.hypothesis_ids
         datasets = plan.datasets[:1]
         categories = plan.categories[:3]
         detectors = plan.detectors
@@ -1081,8 +1374,29 @@ class ResearchWorkflow:
             "strict_k_shot": ["random"],
             "pool_compression_m30": ["random", "k_center"],
         }
+        hypothesis = (
+            next(
+                (item for item in project.hypotheses if item.id == hypothesis_ids[0]),
+                None,
+            )
+            if hypothesis_ids
+            else None
+        )
+        contract = hypothesis.analysis_contract if hypothesis is not None else None
+        custom_pair = (
+            [contract.control, contract.treatment]
+            if contract is not None
+            and contract.kind in {"selection_main_effect", "query_adaptation"}
+            and (
+                contract.treatment not in BUILTIN_STRATEGIES
+                or contract.control not in BUILTIN_STRATEGIES
+            )
+            else None
+        )
         for protocol in plan.protocols:
-            strategies = protocol_strategies.get(protocol, plan.selection_strategies[:2])
+            strategies = custom_pair or protocol_strategies.get(
+                protocol, plan.selection_strategies[:2]
+            )
             combinations = product(
                 hypothesis_ids,
                 datasets,
@@ -1140,12 +1454,52 @@ class ResearchWorkflow:
             if hypothesis is None or hypothesis.analysis_contract is None:
                 continue
             contract = hypothesis.analysis_contract
+            planned_contract = plan.hypothesis_contracts.get(hypothesis_id)
+            if planned_contract is not None and planned_contract != contract:
+                raise InvalidTransitionError(
+                    f"假设 {hypothesis_id} 的分析契约已偏离预注册计划，请重新生成实验计划"
+                )
             if contract.kind not in {"selection_main_effect", "query_adaptation"}:
                 continue
             for name in (contract.treatment, contract.control):
                 if name not in BUILTIN_STRATEGIES:
                     strategy_names.add((hypothesis_id, name))
         approved_digests: dict[str, str] = {}
+        for hypothesis_id in plan.hypothesis_ids:
+            hypothesis = next(
+                (item for item in project.hypotheses if item.id == hypothesis_id),
+                None,
+            )
+            if hypothesis is None or hypothesis.analysis_contract is None:
+                continue
+            contract = hypothesis.analysis_contract
+            custom_names = [
+                name
+                for name in (contract.treatment, contract.control)
+                if name not in BUILTIN_STRATEGIES
+            ]
+            if len(custom_names) != 2:
+                continue
+            implementations = [
+                next(
+                    (
+                        item
+                        for item in project.method_implementations
+                        if item.kind == "selection_strategy"
+                        and item.name == name
+                        and item.hypothesis_id == hypothesis_id
+                    ),
+                    None,
+                )
+                for name in custom_names
+            ]
+            if (
+                all(item is not None for item in implementations)
+                and implementations[0].code_digest == implementations[1].code_digest
+            ):
+                raise InvalidTransitionError(
+                    f"假设 {hypothesis_id} 的 treatment/control 使用了相同策略实现，不能批准"
+                )
         for hypothesis_id, name in sorted(strategy_names):
             implementation = next(
                 (
@@ -1350,6 +1704,22 @@ def _strategy_alias(value: str) -> str | None:
         or "no adaptation" in normalized
         or "无适配" in normalized
     ):
+        return "random"
+    baseline_markers = (
+        "static single sample",
+        "single sample prototype",
+        "static prototype",
+        "fixed prototype",
+        "no refinement",
+        "without refinement",
+        "静态单样本",
+        "单样本原型",
+        "静态原型",
+        "固定原型",
+        "无校准",
+        "无修正",
+    )
+    if any(marker in normalized for marker in baseline_markers):
         return "random"
     diversity_markers = (
         "k center",

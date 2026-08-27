@@ -4,11 +4,17 @@ import hashlib
 import json
 import os
 import shutil
+import stat
+import time
+from contextlib import suppress
 from pathlib import Path
 from uuid import uuid4
 
 from fsad_scientist.datasets.models import DatasetManifest, DatasetViewManifest
 from fsad_scientist.experiments.models import SupportSetManifest
+
+_PUBLISH_RETRY_ATTEMPTS = 3
+_PUBLISH_RETRY_DELAY_SECONDS = 0.05
 
 
 class DatasetViewBuilder:
@@ -105,11 +111,32 @@ class DatasetViewBuilder:
                 encoding="utf-8",
             )
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary.replace(target)
-            return view
+            for attempt in range(_PUBLISH_RETRY_ATTEMPTS):
+                try:
+                    temporary.replace(target)
+                except PermissionError:
+                    # Another request may have published the same immutable
+                    # view between the initial existence check and this
+                    # rename. Windows reports that directory replacement as
+                    # PermissionError.
+                    if target.is_dir():
+                        try:
+                            existing = self._load_existing(
+                                manifest_path, dataset, support
+                            )
+                        except (FileExistsError, ValueError):
+                            pass
+                        else:
+                            _cleanup_temporary(temporary)
+                            return existing
+                    if target.exists() or attempt == _PUBLISH_RETRY_ATTEMPTS - 1:
+                        raise
+                    time.sleep(_PUBLISH_RETRY_DELAY_SECONDS * (2**attempt))
+                else:
+                    return view
+            raise AssertionError("unreachable publish retry state")
         except BaseException:
-            if temporary.exists():
-                shutil.rmtree(temporary)
+            _cleanup_temporary(temporary)
             raise
 
     @staticmethod
@@ -134,12 +161,42 @@ class DatasetViewBuilder:
 
 
 def _materialize_file(source: Path, destination: Path) -> str:
+    # A hardlink shares the source inode. On Windows, the cleanup retry may
+    # clear a read-only bit on that inode and unexpectedly mutate the dataset.
+    try:
+        if not (source.stat().st_mode & stat.S_IWRITE):
+            shutil.copyfile(source, destination)
+            return "copy"
+    except OSError:
+        pass
     try:
         os.link(source, destination)
         return "hardlink"
     except OSError:
         shutil.copy2(source, destination)
         return "copy"
+
+
+def _cleanup_temporary(path: Path) -> None:
+    """Best-effort cleanup that cannot hide the operation's original error."""
+
+    if not path.exists():
+        return
+    try:
+        shutil.rmtree(path, onerror=_retry_readonly_removal)
+    except OSError:
+        # A process holding a file handle can outlive the failed build on
+        # Windows. The hidden orphan is harmless; never mask the root error.
+        return
+
+
+def _retry_readonly_removal(function, path: str, _exc_info) -> None:
+    """Retry rmtree operations after clearing Windows read-only attributes."""
+
+    with suppress(OSError):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    with suppress(OSError):
+        function(path)
 
 
 def _ensure_within(path: Path, parent: Path) -> None:

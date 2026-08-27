@@ -87,6 +87,27 @@ class _FakeClient:
         return self._response
 
 
+class _SequenceClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def complete(self, *, role_name, system_prompt, payload):
+        self.calls.append(
+            {
+                "role_name": role_name,
+                "system_prompt": system_prompt,
+                "payload": payload,
+            }
+        )
+        if not self._responses:
+            raise AssertionError("unexpected extra client call")
+        response = self._responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
 def test_qwen_implement_selection_strategy_uses_client() -> None:
     project, hypothesis = _build_project_and_hypothesis()
     runtime = QwenScientistRuntime()
@@ -131,6 +152,76 @@ def test_qwen_implement_selection_strategy_falls_back_to_mock() -> None:
     )
     assert any("deterministic-fallback" in item for item in implementation.provenance)
     assert validate_strategy_source(implementation.source_code).passed is True
+
+
+def test_qwen_implement_selection_strategy_repairs_invalid_source() -> None:
+    project, hypothesis = _build_project_and_hypothesis()
+    runtime = QwenScientistRuntime()
+    runtime.client = _SequenceClient(
+        [
+            {
+                "source_code": (
+                    "def select(candidate_ids, embeddings, k, seed):\n"
+                    "    import random\n"
+                    "    def helper():\n"
+                    "        return 1\n"
+                    "    return candidate_ids[:k]\n"
+                )
+            },
+            {
+                "source_code": (
+                    "def select(candidate_ids, embeddings, k, seed):\n"
+                    "    return sorted(candidate_ids)[:k]\n"
+                )
+            },
+        ]
+    )  # type: ignore[assignment]
+
+    implementation = asyncio.run(
+        runtime.implement_selection_strategy(
+            project,
+            hypothesis=hypothesis,
+            strategy_name="query_adaptive",
+            control_name="random",
+        )
+    )
+
+    assert len(runtime.client.calls) == 2
+    repair_payload = runtime.client.calls[1]["payload"]
+    assert repair_payload["previous_source_code"].startswith("def select")
+    assert repair_payload["validation_issues"]
+    assert validate_strategy_source(implementation.source_code).passed is True
+    assert any("validation-repair" in item for item in implementation.provenance)
+    assert not any("fallback" in item for item in implementation.provenance)
+
+
+def test_qwen_implement_selection_strategy_falls_back_after_invalid_repair() -> None:
+    project, hypothesis = _build_project_and_hypothesis()
+    runtime = QwenScientistRuntime()
+    invalid_source = (
+        "def select(candidate_ids, embeddings, k, seed):\n"
+        "    import random\n"
+        "    def helper():\n"
+        "        return 1\n"
+        "    return candidate_ids[:k]\n"
+    )
+    runtime.client = _SequenceClient(
+        [{"source_code": invalid_source}, {"source_code": invalid_source}]
+    )  # type: ignore[assignment]
+
+    implementation = asyncio.run(
+        runtime.implement_selection_strategy(
+            project,
+            hypothesis=hypothesis,
+            strategy_name="query_adaptive",
+            control_name="random",
+        )
+    )
+
+    assert len(runtime.client.calls) == 2
+    assert validate_strategy_source(implementation.source_code).passed is True
+    assert any("validation-fallback" in item for item in implementation.provenance)
+    assert any("deterministic-fallback" in item for item in implementation.provenance)
 
 
 def test_mock_implement_detector_returns_valid_draft() -> None:
@@ -194,3 +285,74 @@ def test_qwen_implement_detector_falls_back_to_mock() -> None:
     )
     assert any("deterministic-fallback" in item for item in implementation.provenance)
     assert validate_detector_source(implementation.source_code).passed is True
+
+
+def test_qwen_implement_detector_repairs_invalid_source() -> None:
+    project, hypothesis = _build_project_and_hypothesis()
+    runtime = QwenScientistRuntime()
+    runtime.client = _SequenceClient(
+        [
+            {
+                "source_code": (
+                    "import torch.nn.functional as F\n"
+                    "def _helper(image):\n"
+                    "    return 1\n"
+                    "def anomaly_score(image, support_images, seed):\n"
+                    "    return 1.0\n"
+                )
+            },
+            {
+                "source_code": (
+                    "import numpy as np\n"
+                    "def anomaly_score(image, support_images, seed):\n"
+                    "    return float(np.mean(image))\n"
+                )
+            },
+        ]
+    )  # type: ignore[assignment]
+
+    implementation = asyncio.run(
+        runtime.implement_detector(
+            project,
+            hypothesis=hypothesis,
+            name_stem="nearest_prototype",
+            reference_description=None,
+        )
+    )
+
+    assert len(runtime.client.calls) == 2
+    repair_payload = runtime.client.calls[1]["payload"]
+    assert repair_payload["previous_source_code"].startswith("import")
+    assert repair_payload["validation_issues"]
+    assert validate_detector_source(implementation.source_code).passed is True
+    assert any("validation-repair" in item for item in implementation.provenance)
+    assert not any("fallback" in item for item in implementation.provenance)
+
+
+def test_qwen_implement_detector_falls_back_after_invalid_repair() -> None:
+    project, hypothesis = _build_project_and_hypothesis()
+    runtime = QwenScientistRuntime()
+    invalid_source = (
+        "import torch.nn.functional as F\n"
+        "def _helper(image):\n"
+        "    return 1\n"
+        "def anomaly_score(image, support_images, seed):\n"
+        "    return 1.0\n"
+    )
+    runtime.client = _SequenceClient(
+        [{"source_code": invalid_source}, {"source_code": invalid_source}]
+    )  # type: ignore[assignment]
+
+    implementation = asyncio.run(
+        runtime.implement_detector(
+            project,
+            hypothesis=hypothesis,
+            name_stem="nearest_prototype",
+            reference_description=None,
+        )
+    )
+
+    assert len(runtime.client.calls) == 2
+    assert validate_detector_source(implementation.source_code).passed is True
+    assert any("validation-fallback" in item for item in implementation.provenance)
+    assert any("deterministic-fallback" in item for item in implementation.provenance)

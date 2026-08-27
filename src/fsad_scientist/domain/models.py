@@ -169,6 +169,7 @@ class Hypothesis(BaseModel):
 class ExperimentPlan(BaseModel):
     id: str = Field(default_factory=lambda: new_id("plan"))
     hypothesis_ids: list[str]
+    hypothesis_contracts: dict[str, AnalysisContract] = Field(default_factory=dict)
     protocols: list[str]
     detectors: list[str]
     selection_strategies: list[str]

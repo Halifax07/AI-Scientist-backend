@@ -123,7 +123,8 @@ class AdaptiveExperimentPlanner:
             phase="feasibility",
             objective="验证真实数据、特征、支持集选择和检测器链路，并获得首批成对效应。",
             rationale=(
-                "先在 bottle、K=2 和两个随机种子上比较 random 与 k-center；"
+                f"先在 bottle、K=2 和两个随机种子上比较 {contract.control} 与 "
+                f"{contract.treatment}，并使用 {detector} 执行检测；"
                 "用四次真实运行换取端到端可行性和初始效应信息。"
             ),
             cells=initial_cells,
@@ -379,6 +380,7 @@ class AdaptiveExperimentPlanner:
         )
         should_stop = proposal.stop and enough_evidence
         target_cells = min(2, remaining_pairs)
+        accepted_recommendation_count = len(selected)
         if not should_stop and not exhausted and len(selected) < target_cells:
             selected_keys = {
                 (item.category, item.shots, item.seed) for item in selected
@@ -428,13 +430,24 @@ class AdaptiveExperimentPlanner:
         phase = self._validated_next_phase(proposal.next_phase)
         parent_id = current.node_ids[0] if current.node_ids else None
         next_index = campaign.current_round + 1
+        selected_summary = "；".join(
+            f"{cell.category}，K={cell.shots}，seed={cell.seed}" for cell in selected
+        )
+        scheduling_note = (
+            "原建议中的可执行单元不足，系统按预注册边界回退；实际排期："
+            if accepted_recommendation_count < len(selected)
+            else "实际排期："
+        )
+        next_round_rationale = (
+            f"{proposal.rationale} {scheduling_note}{selected_summary}。"
+        )
         next_round, nodes, runs = self._build_round(
             project,
             campaign=campaign,
             index=next_index,
             phase=phase,
             objective=self._objective_for(proposal.decision, campaign.metric),
-            rationale=proposal.rationale,
+            rationale=next_round_rationale,
             cells=selected,
             information_gain=proposal.expected_information_gain,
             falsification_value=0.90 if proposal.decision == "diagnose" else 0.75,

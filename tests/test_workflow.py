@@ -3,10 +3,14 @@ import asyncio
 import pytest
 
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
-from fsad_scientist.domain.enums import ResearchStage
+from fsad_scientist.domain.enums import HypothesisStatus, ResearchStage
 from fsad_scientist.domain.models import ComputeBudget, ProjectSpec
 from fsad_scientist.repository import JsonProjectRepository
-from fsad_scientist.workflow import ApprovalRequiredError, ResearchWorkflow
+from fsad_scientist.workflow import (
+    ApprovalRequiredError,
+    InvalidTransitionError,
+    ResearchWorkflow,
+)
 
 
 def run(coro):
@@ -27,6 +31,23 @@ def advance_to_approval(workflow: ResearchWorkflow):
     return project
 
 
+def test_review_registers_an_image_metric_core_before_method_generation(tmp_path):
+    workflow = ResearchWorkflow(
+        repository=JsonProjectRepository(tmp_path / "ledger"),
+        runtime=MockScientistRuntime(),
+    )
+    project = workflow.create_project(ProjectSpec())
+    while project.stage != ResearchStage.HYPOTHESES_REVIEWED:
+        project = run(workflow.advance(project.id))
+
+    assert any(
+        hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.kind == "selection_main_effect"
+        and hypothesis.analysis_contract.metric == "image_auroc"
+        for hypothesis in project.hypotheses
+    )
+
+
 def test_autonomous_discovery_reaches_human_gate(tmp_path):
     workflow = build_workflow(tmp_path)
     project = advance_to_approval(workflow)
@@ -34,6 +55,10 @@ def test_autonomous_discovery_reaches_human_gate(tmp_path):
     assert project.gaps
     assert project.hypotheses
     assert project.experiment_plan is not None
+    assert len(project.experiment_plan.hypothesis_ids) == 1
+    assert set(project.experiment_plan.hypothesis_contracts) == set(
+        project.experiment_plan.hypothesis_ids
+    )
     assert project.experiment_plan.approved is False
     assert project.next_action == "human_approve_preregistered_plan"
     assert any(hypothesis.null_hypothesis for hypothesis in project.hypotheses)
@@ -54,6 +79,9 @@ def test_approval_queues_a_bounded_feasibility_batch(tmp_path):
 
     assert approved.stage == ResearchStage.EXPERIMENTS_QUEUED
     assert 0 < len(approved.runs) <= 200
+    assert {run.hypothesis_id for run in approved.runs} == set(
+        approved.experiment_plan.hypothesis_ids
+    )
     assert all(
         run.selection_strategy == "random"
         for run in approved.runs
@@ -66,6 +94,149 @@ def test_approval_queues_a_bounded_feasibility_batch(tmp_path):
         "random",
         "k_center",
     }
+
+
+def test_legacy_multi_hypothesis_plan_requires_review_after_scoping(tmp_path):
+    workflow = build_workflow(tmp_path)
+    project = advance_to_approval(workflow)
+    assert project.experiment_plan is not None
+    primary_hypothesis_id = project.experiment_plan.hypothesis_ids[0]
+    secondary = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.id != primary_hypothesis_id
+        and hypothesis.analysis_contract is not None
+    )
+    secondary.status = HypothesisStatus.SHORTLISTED
+    secondary.analysis_contract = secondary.analysis_contract.model_copy(
+        update={
+            "kind": "selection_main_effect",
+            "treatment": "High Compression Ratio (Pool Size < 50)",
+            "control": "Low Compression Ratio (Pool Size > 200)",
+        }
+    )
+    project.experiment_plan.hypothesis_ids.append(secondary.id)
+    project.experiment_plan.hypothesis_contracts[secondary.id] = (
+        secondary.analysis_contract.model_copy(deep=True)
+    )
+    workflow.repository.save(project)
+
+    with pytest.raises(InvalidTransitionError, match="单一可执行主假设"):
+        workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
+
+    migrated = workflow.repository.get(project.id)
+    assert migrated.stage == ResearchStage.AWAITING_EXPERIMENT_APPROVAL
+    assert migrated.experiment_plan is not None
+    assert migrated.experiment_plan.hypothesis_ids == [primary_hypothesis_id]
+    assert set(migrated.experiment_plan.hypothesis_contracts) == {
+        primary_hypothesis_id
+    }
+    assert not migrated.runs
+
+
+def test_scoping_skips_unregistered_dynamic_strategy_for_builtin_core(tmp_path):
+    workflow = build_workflow(tmp_path)
+    project = workflow.create_project(ProjectSpec())
+    while project.stage != ResearchStage.HYPOTHESES_REVIEWED:
+        project = run(workflow.advance(project.id))
+
+    query = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.kind == "query_adaptation"
+    )
+    core = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.kind == "selection_main_effect"
+    )
+    assert query.analysis_contract is not None
+    query.analysis_contract = query.analysis_contract.model_copy(
+        update={
+            "treatment": "Dynamic Density-based Denoising",
+            "control": "random",
+        }
+    )
+    query.status = HypothesisStatus.SHORTLISTED
+    core.status = HypothesisStatus.SHORTLISTED
+    project.hypotheses = [
+        query,
+        core,
+        *[
+            hypothesis
+            for hypothesis in project.hypotheses
+            if hypothesis.id not in {query.id, core.id}
+        ],
+    ]
+    workflow.repository.save(project)
+
+    preregistered = run(workflow.advance(project.id))
+    assert preregistered.experiment_plan is not None
+    assert preregistered.experiment_plan.hypothesis_ids == [core.id]
+
+    approved = workflow.approve_experiment_plan(
+        project.id, approved_by="test-reviewer"
+    )
+    assert {run.hypothesis_id for run in approved.runs} == {core.id}
+
+
+def test_scoping_prefers_generated_dynamic_strategy_over_builtin_core(tmp_path):
+    workflow = build_workflow(tmp_path)
+    project = workflow.create_project(ProjectSpec())
+    while project.stage != ResearchStage.HYPOTHESES_REVIEWED:
+        project = run(workflow.advance(project.id))
+
+    query = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.kind == "query_adaptation"
+    )
+    core = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.kind == "selection_main_effect"
+    )
+    assert query.analysis_contract is not None
+    query.analysis_contract = query.analysis_contract.model_copy(
+        update={
+            "treatment": "Dynamic Density-based Denoising",
+            "control": "random",
+        }
+    )
+    query.status = HypothesisStatus.SHORTLISTED
+    core.status = HypothesisStatus.SHORTLISTED
+    project.hypotheses = [
+        query,
+        core,
+        *[
+            hypothesis
+            for hypothesis in project.hypotheses
+            if hypothesis.id not in {query.id, core.id}
+        ],
+    ]
+    workflow.repository.save(project)
+
+    generated = run(
+        workflow.implement_experiment_method(project.id, hypothesis_id=query.id)
+    )
+    implementation = next(
+        item
+        for item in generated.method_implementations
+        if item.hypothesis_id == query.id and item.kind == "selection_strategy"
+    )
+    assert implementation.name == "dynamic_density_based_denoising"
+    preregistered = run(workflow.advance(project.id))
+    assert preregistered.experiment_plan is not None
+    assert preregistered.experiment_plan.hypothesis_ids == [query.id]
+
+    approved = workflow.approve_experiment_plan(
+        project.id, approved_by="test-reviewer"
+    )
+    assert {run.hypothesis_id for run in approved.runs} == {query.id}
 
 
 def test_inconclusive_real_cycle_revises_hypothesis_without_losing_history(tmp_path):

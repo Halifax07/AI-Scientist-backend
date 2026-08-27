@@ -36,7 +36,12 @@ def main() -> None:
         return original_imread(filename, flags)
 
     cv2.imread = unicode_safe_imread
+    from fsad_scientist.integrations.anomalydino_pixel_metrics import (
+        install_post_eval_overrides,
+    )
     from src import detection, post_eval, utils  # type: ignore[import-not-found]
+
+    install_post_eval_overrides(post_eval)
 
     original_read_tiff = post_eval.read_tiff
 
@@ -78,14 +83,10 @@ def main() -> None:
             raise ValueError("An audited dataset view path is required")
         test_root = audited_data_root / arguments.category / "test"
         observed_anomalies = sorted(
-            child.name
-            for child in test_root.iterdir()
-            if child.is_dir() and child.name != "good"
+            child.name for child in test_root.iterdir() if child.is_dir() and child.name != "good"
         )
         if not observed_anomalies:
-            raise ValueError(
-                f"No anomaly directories were found in audited test view: {test_root}"
-            )
+            raise ValueError(f"No anomaly directories were found in audited test view: {test_root}")
         return (
             [arguments.category],
             {arguments.category: observed_anomalies},

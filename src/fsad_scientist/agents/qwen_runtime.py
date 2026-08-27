@@ -27,6 +27,8 @@ from fsad_scientist.experiments.code_safety import (
     extract_select_function,
     implementation_detector_name,
     sanitize_strategy_name,
+    validate_detector_source,
+    validate_strategy_source,
 )
 from fsad_scientist.experiments.detector_runner import assemble_detector_file
 from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
@@ -461,57 +463,90 @@ class QwenScientistRuntime(MockScientistRuntime):
     ) -> MethodImplementation:
         """Ask Qwen for a pure selection function; deterministic fallback on failure."""
 
+        validation_issues: list[str] = []
         try:
+            system_prompt = (
+                "你是少样本异常检测的支持集选样策略实现专家。"
+                f"为策略 {strategy_name}（对照 {control_name}）编写实现。"
+                "只返回一个纯 Python 函数，必须恰好是一个模块级 def select；"
+                "函数体不得包含 import 语句，不得定义嵌套函数或类（运行模板已导入"
+                "math、random、numpy 等允许模块）。"
+                "不得读写文件、联网、启动子进程或调用 eval/exec；"
+                "固定 seed 时必须确定性输出。函数只依赖候选正常样本的特征向量，"
+                "不得接触任何测试/异常数据。除代码外所有自然语言使用简体中文。"
+            )
+            request_payload = {
+                "hypothesis": hypothesis.model_dump(mode="json"),
+                "strategy_name": strategy_name,
+                "control_name": control_name,
+                "function_contract": {
+                    "signature": (
+                        "def select(candidate_ids: list[str], "
+                        "embeddings: dict[str, list[float]], k: int, seed: int) "
+                        "-> list[str]"
+                    ),
+                    "semantics": (
+                        "从 candidate_ids 中选出恰好 k 个不重复样本，"
+                        "返回其文件 id 列表；只能基于 embeddings 与 seed。"
+                    ),
+                    "scale": "candidate_ids 不超过 30 个；向量维度不超过 384。",
+                    "forbidden": [
+                        "import 语句",
+                        "嵌套函数或类定义",
+                        "文件/网络/子进程/eval/exec",
+                        "非确定性随机源（必须用 random.Random(seed) 或纯计算）",
+                        "接触测试或异常标签",
+                    ],
+                },
+                "output_schema": {
+                    "source_code": "完整 def select 函数源码",
+                    "explanation": "策略机制的一句话说明（简体中文）",
+                },
+                "return": {"source_code": "string"},
+            }
             response = await self.client.complete(
                 role_name="MethodImplementerAgent",
-                system_prompt=(
-                    "你是少样本异常检测的支持集选样策略实现专家。"
-                    f"为策略 {strategy_name}（对照 {control_name}）编写实现。"
-                    "只返回一个纯 Python 函数，函数体不得包含 import 语句"
-                    "（运行模板已导入 math、random、numpy 等允许模块），"
-                    "不得读写文件、联网、启动子进程或调用 eval/exec；"
-                    "固定 seed 时必须确定性输出。函数只依赖候选正常样本的特征向量，"
-                    "不得接触任何测试/异常数据。除代码外所有自然语言使用简体中文。"
-                ),
-                payload={
-                    "hypothesis": hypothesis.model_dump(mode="json"),
-                    "strategy_name": strategy_name,
-                    "control_name": control_name,
-                    "function_contract": {
-                        "signature": (
-                            "def select(candidate_ids: list[str], "
-                            "embeddings: dict[str, list[float]], k: int, seed: int) "
-                            "-> list[str]"
-                        ),
-                        "semantics": (
-                            "从 candidate_ids 中选出恰好 k 个不重复样本，"
-                            "返回其文件 id 列表；只能基于 embeddings 与 seed。"
-                        ),
-                        "scale": "candidate_ids 不超过 30 个；向量维度不超过 384。",
-                        "forbidden": [
-                            "import 语句",
-                            "文件/网络/子进程/eval/exec",
-                            "非确定性随机源（必须用 random.Random(seed) 或纯计算）",
-                            "接触测试或异常标签",
-                        ],
-                    },
-                    "output_schema": {
-                        "source_code": "完整 def select 函数源码",
-                        "explanation": "策略机制的一句话说明（简体中文）",
-                    },
-                    "return": {"source_code": "string"},
-                },
+                system_prompt=system_prompt,
+                payload=request_payload,
             )
             source = extract_select_function(str(response.get("source_code", "")))
+            validation = validate_strategy_source(source)
+            if not validation.passed:
+                validation_issues = validation.issues
+                response = await self.client.complete(
+                    role_name="MethodImplementerAgent",
+                    system_prompt=(
+                        system_prompt
+                        + "上一版源码未通过静态校验。请只修复下列问题，保持策略语义不变；"
+                        "仍然只返回完整的 def select 函数源码，不要返回解释或 Markdown。"
+                    ),
+                    payload={
+                        **request_payload,
+                        "previous_source_code": source,
+                        "validation_issues": validation.issues,
+                        "repair_instruction": "修复上一版源码的全部静态校验问题。",
+                    },
+                )
+                source = extract_select_function(str(response.get("source_code", "")))
+                validation = validate_strategy_source(source)
+                if not validation.passed:
+                    validation_issues = validation.issues
+                    raise ValueError(
+                        "定向修复后的选样策略仍未通过静态校验："
+                        + "；".join(validation.issues)
+                    )
             assembled = assemble_strategy_file(source)
             digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+            provenance = [self.name, "static_contract:accepted"]
+            if validation_issues:
+                provenance.append(f"{self.name}:validation-repair")
             return MethodImplementation(
                 kind="selection_strategy",
                 name=sanitize_strategy_name(strategy_name),
                 hypothesis_id=hypothesis.id,
                 source_code=source,
                 code_digest=digest,
-                provenance=[self.name, "static_contract:accepted"],
+                provenance=provenance,
                 status="draft",
             )
         except Exception as exc:
@@ -524,6 +559,10 @@ class QwenScientistRuntime(MockScientistRuntime):
             fallback.provenance.append(
                 f"{self.name}:deterministic-fallback:{type(exc).__name__}"
             )
+            if validation_issues:
+                fallback.provenance.append(
+                    f"{self.name}:validation-fallback:{'; '.join(validation_issues)}"
+                )
             return fallback
 
     async def implement_detector(
@@ -536,56 +575,88 @@ class QwenScientistRuntime(MockScientistRuntime):
     ) -> MethodImplementation:
         """Ask Qwen for an anomaly-score core function; deterministic fallback on failure."""
 
+        validation_issues: list[str] = []
         try:
+            system_prompt = (
+                "你是工业异常检测方法实现专家。为以下假设实现一个新检测器的核心打分"
+                "逻辑。优先使用 numpy、math、statistics 等轻量纯计算；不要构造或加载"
+                "任何运行时模型、预训练权重或网络资源，不要调用 torchvision/transformers"
+                "模型，也不要下载。只允许模块级 import（白名单：math/random/numpy/"
+                "scipy/sklearn/PIL/cv2/torch/torchvision/transformers/timm）与顶层普通函数；"
+                "辅助函数名不得以下划线开头，不得定义嵌套函数或类；必须恰好包含一个函数"
+                "def anomaly_score(image, support_images, seed) -> float，单图调用必须轻量。"
+                "分数越高表示越异常。禁止读写文件、联网、启动子进程、eval/exec、"
+                "torch.hub.load/hub.load 下载。固定 seed 必须确定性输出；数据读取、标签"
+                "推导、AUROC 计算与输出由系统模板负责，不要重复实现。除代码外所有自然语言"
+                "使用简体中文。"
+            )
+            request_payload = {
+                "hypothesis": hypothesis.model_dump(mode="json"),
+                "name_stem": name_stem,
+                "reference_description": reference_description,
+                "function_contract": {
+                    "signature": (
+                        "def anomaly_score(image, support_images, seed) -> float"
+                    ),
+                    "image": "numpy HxWx3 uint8 RGB 数组（单张测试图）",
+                    "support_images": "numpy 数组列表（预注册的 K 张正常参考图）",
+                    "semantics": "返回异常分数，分数越高越异常",
+                    "template_provides": [
+                        "数据视图读取",
+                        "ground_truth 掩码标签推导",
+                        "image_auroc/image_ap 计算",
+                        "metrics.json 输出",
+                    ],
+                },
+                "output_schema": {
+                    "source_code": "模块级 import + 顶层辅助函数 + anomaly_score 的完整源码",
+                    "explanation": "方法机制的一句话说明（简体中文）",
+                },
+                "return": {"source_code": "string"},
+            }
             response = await self.client.complete(
                 role_name="DetectorImplementerAgent",
-                system_prompt=(
-                    "你是工业异常检测方法实现专家。为以下假设实现一个新检测器的核心打分"
-                    "逻辑。只允许模块级 import（白名单：math/random/numpy/scipy/sklearn/"
-                    "PIL/cv2/torch/torchvision/transformers/timm）与顶层函数；必须恰好"
-                    "包含一个函数 def anomaly_score(image, support_images, seed) -> float，"
-                    "分数越高表示越异常。禁止读写文件、联网、启动子进程、eval/exec、"
-                    "torch.hub.load/hub.load 下载；预训练模型只能用 from_pretrained 且环境"
-                    "已强制离线（未缓存即失败）。固定 seed 必须确定性输出；torch 设备必须"
-                    "用 torch.device('cuda' if torch.cuda.is_available() else 'cpu')。"
-                    "数据读取、标签推导、AUROC 计算与输出由系统模板负责，不要重复实现。"
-                    "除代码外所有自然语言使用简体中文。"
-                ),
-                payload={
-                    "hypothesis": hypothesis.model_dump(mode="json"),
-                    "name_stem": name_stem,
-                    "reference_description": reference_description,
-                    "function_contract": {
-                        "signature": (
-                            "def anomaly_score(image, support_images, seed) -> float"
-                        ),
-                        "image": "numpy HxWx3 uint8 RGB 数组（单张测试图）",
-                        "support_images": "numpy 数组列表（预注册的 K 张正常参考图）",
-                        "semantics": "返回异常分数，分数越高越异常",
-                        "template_provides": [
-                            "数据视图读取",
-                            "ground_truth 掩码标签推导",
-                            "image_auroc/image_ap 计算",
-                            "metrics.json 输出",
-                        ],
-                    },
-                    "output_schema": {
-                        "source_code": "模块级 import + 辅助函数 + anomaly_score 的完整源码",
-                        "explanation": "方法机制的一句话说明（简体中文）",
-                    },
-                    "return": {"source_code": "string"},
-                },
+                system_prompt=system_prompt,
+                payload=request_payload,
             )
             source = extract_detector_source(str(response.get("source_code", "")))
+            validation = validate_detector_source(source)
+            if not validation.passed:
+                validation_issues = validation.issues
+                response = await self.client.complete(
+                    role_name="DetectorImplementerAgent",
+                    system_prompt=(
+                        system_prompt
+                        + "上一版源码未通过静态校验。请只修复下列问题，保持检测器语义不变；"
+                        "仍然只返回完整源码，不要返回解释或 Markdown。"
+                    ),
+                    payload={
+                        **request_payload,
+                        "previous_source_code": source,
+                        "validation_issues": validation.issues,
+                        "repair_instruction": "修复上一版源码的全部静态校验问题。",
+                    },
+                )
+                source = extract_detector_source(str(response.get("source_code", "")))
+                validation = validate_detector_source(source)
+                if not validation.passed:
+                    validation_issues = validation.issues
+                    raise ValueError(
+                        "定向修复后的检测器仍未通过静态校验："
+                        + "；".join(validation.issues)
+                    )
             assembled = assemble_detector_file(source)
             digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
+            provenance = [self.name, "static_contract:accepted"]
+            if validation_issues:
+                provenance.append(f"{self.name}:validation-repair")
             return MethodImplementation(
                 kind="detector",
                 name=implementation_detector_name(name_stem, digest),
                 hypothesis_id=hypothesis.id,
                 source_code=source,
                 code_digest=digest,
-                provenance=[self.name, "static_contract:accepted"],
+                provenance=provenance,
                 status="draft",
             )
         except Exception as exc:
@@ -598,6 +669,10 @@ class QwenScientistRuntime(MockScientistRuntime):
             fallback.provenance.append(
                 f"{self.name}:deterministic-fallback:{type(exc).__name__}"
             )
+            if validation_issues:
+                fallback.provenance.append(
+                    f"{self.name}:validation-fallback:{'; '.join(validation_issues)}"
+                )
             return fallback
 
     async def revise_hypotheses(self, project: ResearchProject) -> list[Hypothesis]:

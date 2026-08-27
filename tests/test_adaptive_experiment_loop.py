@@ -314,3 +314,13 @@ def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):
     assert len(new_runs) == 4
     assert all(run.category in dataset.categories for run in new_runs)
     assert all(run.shots in project.experiment_plan.shots for run in new_runs)
+    next_round = project.experiment_campaign.rounds[-1]
+    scheduled_cells = {
+        (run.category, run.shots, run.seed)
+        for run in new_runs
+    }
+    assert "按预注册边界回退" in next_round.rationale
+    assert all(
+        f"{category}，K={shots}，seed={seed}" in next_round.rationale
+        for category, shots, seed in scheduled_cells
+    )
