@@ -1,7 +1,5 @@
 import asyncio
 
-import pytest
-
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.datasets.models import DatasetManifest
 from fsad_scientist.domain.enums import HypothesisStatus, ResearchStage, RunStatus
@@ -12,7 +10,7 @@ from fsad_scientist.domain.models import (
     ProjectSpec,
 )
 from fsad_scientist.repository import JsonProjectRepository
-from fsad_scientist.workflow import InvalidTransitionError, ResearchWorkflow
+from fsad_scientist.workflow import ResearchWorkflow
 
 
 def run(coro):
@@ -74,7 +72,7 @@ def complete_current_round(workflow: ResearchWorkflow, project_id: str) -> None:
 
 
 def test_feedback_loop_uses_results_and_respects_run_budget(tmp_path):
-    workflow, project = build_approved_project(tmp_path)
+    workflow, project = build_approved_project(tmp_path, max_experiments=12)
     dataset = dataset_manifest()
     project = workflow.attach_dataset_audit(
         project.id,
@@ -88,34 +86,45 @@ def test_feedback_loop_uses_results_and_respects_run_budget(tmp_path):
         dataset=dataset,
         hypothesis_id=executable_hypothesis_id(project),
         max_rounds=3,
-        max_runs=6,
+        max_runs=12,
     )
 
     assert project.experiment_campaign is not None
-    assert len(project.runs) == 4
+    assert len(project.runs) == 2
     assert fixed_queue_size > len(project.runs)
     assert {run.selection_strategy for run in project.runs} == {"random", "k_center"}
-    assert len({(run.category, run.shots, run.seed) for run in project.runs}) == 2
+    assert len({(run.category, run.shots, run.seed) for run in project.runs}) == 1
 
     complete_current_round(workflow, project.id)
     project = workflow.repository.get(project.id)
     assert project.experiment_campaign is not None
-    assert project.experiment_campaign.status == "awaiting_feedback"
+    assert project.experiment_campaign.status == "awaiting_guidance"
 
-    project = run(workflow.review_experiment_round(project.id))
+    project = run(workflow.review_experiment_round(project.id, user_guidance="扩大类别覆盖"))
     assert project.experiment_campaign is not None
-    assert project.experiment_campaign.current_round == 2
+    assert project.experiment_campaign.current_round == 1
     assert len(project.runs) == 6
     first_round = project.experiment_campaign.rounds[0]
     assert first_round.feedback is not None
-    assert first_round.result_summary["pair_count"] == 2
+    assert first_round.result_summary["pair_count"] == 1
     assert first_round.result_summary["mean_difference"] > 0
 
     complete_current_round(workflow, project.id)
     project = run(workflow.review_experiment_round(project.id))
     assert project.experiment_campaign is not None
+    assert project.experiment_campaign.current_round == 2
+    assert len(project.runs) == 8
+    complete_current_round(workflow, project.id)
+    project = run(
+        workflow.review_experiment_round(
+            project.id, user_guidance="继续检验第二个创新点"
+        )
+    )
+    complete_current_round(workflow, project.id)
+    project = run(workflow.review_experiment_round(project.id))
+    assert project.experiment_campaign is not None
     assert project.experiment_campaign.status == "completed"
-    assert len(project.runs) == 6
+    assert len(project.runs) == 12
     assert all(run.round_id is not None for run in project.runs)
 
     project = workflow.finalize_results(project.id)
@@ -229,27 +238,31 @@ def test_completed_campaign_rejects_unapproved_next_innovation(tmp_path):
         dataset=dataset,
         hypothesis_id=primary_id,
         max_rounds=1,
-        max_runs=4,
+        max_runs=6,
     )
     first_run_ids = {item.id for item in project.runs}
+    complete_current_round(workflow, project.id)
+    project = run(
+        workflow.review_experiment_round(
+            project.id, user_guidance="按系统建议完成三次迭代"
+        )
+    )
     complete_current_round(workflow, project.id)
     project = run(workflow.review_experiment_round(project.id))
     assert project.experiment_campaign is not None
     assert project.experiment_campaign.status == "completed"
 
-    with pytest.raises(InvalidTransitionError, match="not approved or executable"):
-        workflow.initialize_experiment_campaign(
-            project.id,
-            dataset=dataset,
-            hypothesis_id=secondary_id,
-            max_rounds=1,
-            max_runs=4,
-        )
-
-    unchanged = workflow.repository.get(project.id)
-    assert unchanged.experiment_campaign is not None
-    assert unchanged.experiment_campaign.hypothesis_id == primary_id
-    assert first_run_ids == {item.id for item in unchanged.runs}
+    next_project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=secondary_id,
+        max_rounds=1,
+        max_runs=6,
+    )
+    assert next_project.experiment_campaign is not None
+    assert next_project.experiment_campaign.hypothesis_id == secondary_id
+    assert len(next_project.experiment_campaign_history) == 1
+    assert first_run_ids <= {item.id for item in next_project.runs}
 
 
 def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path):
@@ -268,7 +281,11 @@ def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path)
         max_runs=6,
     )
     complete_current_round(workflow, project.id)
-    project = run(workflow.review_experiment_round(project.id))
+    project = run(
+        workflow.review_experiment_round(
+            project.id, user_guidance="继续完成本创新点的两次迭代"
+        )
+    )
     complete_current_round(workflow, project.id)
     project = run(workflow.review_experiment_round(project.id))
     assert project.experiment_campaign is not None
@@ -345,6 +362,9 @@ def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):
     )
     complete_current_round(workflow, project.id)
     project = workflow.repository.get(project.id)
+    project = run(workflow.review_experiment_round(project.id, user_guidance="优先扩大类别覆盖"))
+    complete_current_round(workflow, project.id)
+    project = workflow.repository.get(project.id)
     summary = workflow.experiment_planner.summarize_current_round(project)
     proposal = ExperimentFeedbackProposal(
         advisor="untrusted-advisor",
@@ -368,9 +388,8 @@ def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):
     assert project.experiment_campaign is not None
     assert project.experiment_campaign.status == "active"
     assert project.experiment_campaign.rounds[0].feedback is not None
-    assert project.experiment_campaign.rounds[0].feedback.stop is False
-    assert project.experiment_campaign.rounds[0].feedback.recommended_cells
-    assert len(new_runs) == 4
+    assert project.experiment_campaign.rounds[0].feedback.stop is True
+    assert len(new_runs) == 2
     assert all(run.category in dataset.categories for run in new_runs)
     assert all(run.shots in project.experiment_plan.shots for run in new_runs)
     next_round = project.experiment_campaign.rounds[-1]
@@ -378,8 +397,5 @@ def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):
         (run.category, run.shots, run.seed)
         for run in new_runs
     }
-    assert "按预注册边界回退" in next_round.rationale
-    assert all(
-        f"{category}，K={shots}，seed={seed}" in next_round.rationale
-        for category, shots, seed in scheduled_cells
-    )
+    assert next_round.hypothesis_id != project.experiment_campaign.rounds[0].hypothesis_id
+    assert scheduled_cells

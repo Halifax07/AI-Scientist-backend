@@ -15,7 +15,7 @@
 2. 整个实验进行到哪个阶段、哪一轮、哪个实验单元和哪个 Run？
 3. 当前正在处理什么数据，数据规模、类别、K-shot、seed 和支持集策略是什么？
 4. 已完成多少、还剩多少、预计还需多久，是否受预算或停止条件限制？
-5. 当前结果说明了什么，证据是否足够，系统为什么扩展、复现、诊断或停止？
+5. 当前结果说明了什么，证据是否足够，系统为什么调整本 Round 后两次迭代或切换到下一个创新点？
 6. 如果失败，失败发生在哪一步，日志、错误和可复现产物在哪里？
 
 前端展示应优先使用后端已经持久化的真实状态，不得用定时动画或虚构百分比模拟进度。
@@ -28,7 +28,7 @@
 2. **总体进度与预算**：已完成/失败/排队/运行 Run 数，`max_runs`、`max_rounds`、有效配对数、`minimum_pairs`、穷举运行数与节省运行数。
 3. **当前 Run 卡片**：phase、category、detector、selection strategy、K-shot、seed、状态、开始时间、耗时、指标、错误。
 4. **执行流水线**：数据审计、DINOv2 特征、支持集选择、数据视图、检测器执行、结果解析、结果入账、成对统计、反馈规划。
-5. **轮次与实验树**：round objective/rationale、节点优先级、信息增益、证伪价值、预计成本、父子关系和节点内配对 Run。
+5. **轮次与实验树**：Round 绑定的创新点、三次内部迭代进度、objective/rationale、节点优先级、信息增益、证伪价值、预计成本、父子关系和节点内配对 Run。
 6. **结果解释**：treatment/control 原始值、成对差值、累计效应、置信区间、p 值、样本量、是否达到最小证据门槛。
 7. **反馈决策**：advisor、decision、rationale、observed patterns、expected information gain、推荐实验单元和受保护约束。
 8. **数据与产物**：数据审计计数、支持集样本/几何指标、artifact paths、stdout/stderr、execution record、环境摘要和代码版本。
@@ -41,7 +41,7 @@
 - `ExperimentNodeRecord` 的 `information_gain`、`falsification_value`、`estimated_cost`、`novelty`、`config` 和 `result_summary` 应作为解释实验优先级的核心数据。
 - `ExperimentRound.result_summary` 与 `efficiency` 不应长期保持 `Record<string, unknown>`；新增展示前优先定义稳定、明确的后端模型与 TypeScript 类型。
 - 若要显示单个 Run 内部的实时子步骤、百分比、GPU/显存、当前 epoch/batch 或 ETA，后端必须先增加可持久化的结构化进度事件或查询接口；不要从日志文本猜测关键状态。
-- 状态标签要提供中文解释，并明确区分 `planned`、`queued`、`running`、`succeeded`、`failed`、`ready_for_feedback`、`completed` 和 `verified`，避免只展示内部英文枚举。
+- 状态标签要提供中文解释，并明确区分 `planned`、`queued`、`running`、`awaiting_guidance`、`succeeded`、`failed`、`ready_for_feedback`、`completed` 和 `verified`，避免只展示内部英文枚举。
 
 ## 实现原则
 

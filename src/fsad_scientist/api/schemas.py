@@ -95,11 +95,13 @@ class ExecuteNextExperimentRequest(BaseModel):
     candidate_pool_size: int = Field(default=30, ge=2, le=1000)
     timeout_seconds: float = Field(default=3600.0, gt=0, le=86400)
     force_embeddings: bool = False
-    user_guidance: str = Field(
-        default="按预注册约束和系统优先级执行，不做额外调整。",
-        min_length=1,
-        max_length=3000,
-    )
+    user_guidance: str | None = Field(default=None, min_length=2, max_length=3000)
+
+
+class ReviewExperimentRoundRequest(BaseModel):
+    """One human decision gate between iteration 1 and iterations 2–3."""
+
+    user_guidance: str | None = Field(default=None, min_length=2, max_length=3000)
 
 
 class ExecuteNextExperimentResponse(BaseModel):

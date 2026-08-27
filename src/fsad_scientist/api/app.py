@@ -33,6 +33,7 @@ from fsad_scientist.api.schemas import (
     InitializeExperimentCampaignRequest,
     PrepareRunRequest,
     ProjectDatasetAuditRequest,
+    ReviewExperimentRoundRequest,
     RunResultRequest,
     StartNextResearchCycleRequest,
     SupportPlanRequest,
@@ -638,8 +639,12 @@ def create_app(
     async def review_experiment_campaign_round(
         project_id: str,
         workflow: WorkflowDependency,
+        body: ReviewExperimentRoundRequest | None = None,
     ) -> ResearchProject:
-        return await workflow.review_experiment_round(project_id)
+        return await workflow.review_experiment_round(
+            project_id,
+            user_guidance=body.user_guidance if body else None,
+        )
 
     @app.post(
         "/api/v1/projects/{project_id}/runs/{run_id}/result",

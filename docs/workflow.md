@@ -7,8 +7,8 @@
 | 空白发现 | 研究空白及其依据 | Gap Agent 比较论文结论和数据特征 | research gaps |
 | 假设竞技场 | 候选假设、反方意见、Elo 排名 | Hypothesis/Skeptic 生成、反驳、演化 | hypothesis versions、debate log |
 | 逐创新点实验计划 | 每个创新点的实验组、对照组、指标、最小配对数和实现状态 | Planner 为每个创新点建立独立可证伪契约；没有适配器的创新明确阻塞 | preregistered plan + hypothesis contract + SHA-256 |
-| 逐创新点实验树 | 当前创新点、轮次、节点、优先级、GPU 状态、用户单次指导、节省的 run | 用户选择创新点；Guidance Agent 解释建议；Executor 只运行该创新点允许队列中的已登记命令 | hypothesis-bound campaign、guidance decision、round、node、run manifest |
-| 反馈迭代 | 本轮成对效应、失败、Qwen 决策与下一轮 | Planner 从允许空间选择扩展/复现/诊断/停止 | round summary、feedback proposal、next runs |
+| 逐创新点实验树 | 一个 Campaign 按顺序覆盖多个创新点；每个 Round 绑定一个创新点，固定 3 次内部迭代 | 第 1 次迭代完成后暂停一次；Guidance Agent 解释用户指导并规划第 2、3 次；Executor 自动执行剩余迭代 | innovation-bound rounds、one midpoint guidance、iteration/run manifests |
+| 反馈迭代 | 当前 Round 三次成对效应、失败、Qwen 决策与下一个创新点 | Planner 只在同一 Round 内调整后两次迭代；完成后自动汇总并切换下一创新点 | round summary、feedback proposal、next-round seed |
 | 结果审查 | 置信区间、失败图像、边界 | Statistics + Qwen-VL 分工分析 | findings、visual observations |
 | 创新审查 | 创新卡、最近工作、证据链 | Meta-review 判断支持/部分支持/证伪 | innovation candidates |
 | 报告导出 | 赛题研究计划与复现命令 | Reporter 只引用已登记产物 | PDF、JSON、代码与环境摘要 |
@@ -20,16 +20,16 @@
 - 研究对象、假设、计划、运行、发现和创新卡的数据模型；
 - 从创建项目到报告清单的持久化状态机；
 - 实验前人工审批；
-- “一个创新点、一份实验指导、一个独立 campaign、一组对应结果”的验证队列；
-- 用户必须明确选择要验证的创新点，系统不得用另一个更容易执行的假设替换它；
+- “一个 Campaign、多创新点、每个创新点一个 Round、每个 Round 三次内部迭代”的验证队列；
+- Round 只绑定当前创新点，创新点切换发生在当前 Round 三次迭代汇总之后；
 - 当前工具链不支持的创新点标记为“需要先实现方法”，实现适配器后才能进入真实执行；
-- 每个真实 run 前的用户指导输入、Qwen/确定性解释、允许队列内重排和完整留痕；
+- 每个 Round 第 1 次迭代后的单次用户指导输入、Qwen/确定性解释、后两次迭代自动排程和完整留痕；
 - Mock 自主发现流程；
 - Qwen/AgentScope 结构化调用适配器；
 - 可复用的假设 Elo 锦标赛和假设演化请求模型；
-- 按信息增益、证伪价值和成本选择节点的渐进实验树；
+- 按信息增益、证伪价值和成本选择节点的渐进实验树；每个 Round 的迭代目标固定为 3；
 - 持久化 `ExperimentCampaign → ExperimentRound → ExperimentNode → ExperimentRun` 层级；
-- 结果驱动的 Qwen 重规划、允许动作校验、最多两单元/轮和 24-run 默认预算；
+- 结果驱动的 Qwen 中途指导规划、允许动作校验、三迭代 Round 和 24-run 默认预算；
 - arXiv/Crossref 在线检索、书目身份复核和部分失败降级；
 - arXiv PDF 下载、逐页文本提取、Qwen 声明判断及逐字锚定拒绝器；
 - MVTec AD 内容哈希清单、掩码完整性和 train/test 重复泄漏检查；
