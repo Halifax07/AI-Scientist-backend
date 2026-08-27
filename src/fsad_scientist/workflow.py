@@ -16,6 +16,7 @@ from fsad_scientist.domain.enums import (
     RunStatus,
 )
 from fsad_scientist.domain.models import (
+    AnalysisContract,
     ArtifactRecord,
     DatasetAuditRecord,
     EvidenceRecord,
@@ -193,7 +194,7 @@ class ResearchWorkflow:
 
         elif project.stage == ResearchStage.HYPOTHESES_PROPOSED:
             project.hypotheses = await self.runtime.review_hypotheses(project)
-            self._ensure_executable_core_hypothesis(project)
+            self._ensure_executable_hypotheses(project)
             self._move(
                 project,
                 stage=ResearchStage.HYPOTHESES_REVIEWED,

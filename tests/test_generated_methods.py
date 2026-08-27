@@ -182,6 +182,7 @@ def test_generate_replaces_builtin_strategy_and_syncs_plan(tmp_path: Path) -> No
     campaign_project = workflow.initialize_experiment_campaign(
         approved.id,
         dataset=dataset,
+        hypothesis_id=hypothesis.id,
         max_rounds=3,
         max_runs=6,
     )

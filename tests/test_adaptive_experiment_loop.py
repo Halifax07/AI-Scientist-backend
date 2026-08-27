@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.datasets.models import DatasetManifest
 from fsad_scientist.domain.enums import HypothesisStatus, ResearchStage, RunStatus
@@ -10,7 +12,7 @@ from fsad_scientist.domain.models import (
     ProjectSpec,
 )
 from fsad_scientist.repository import JsonProjectRepository
-from fsad_scientist.workflow import ResearchWorkflow
+from fsad_scientist.workflow import InvalidTransitionError, ResearchWorkflow
 
 
 def run(coro):
@@ -207,14 +209,15 @@ def test_human_guidance_selects_only_a_registered_queued_run(tmp_path):
     assert any(event.action == "interpret_experiment_guidance" for event in updated.events)
 
 
-def test_completed_campaign_can_continue_with_next_innovation(tmp_path):
+def test_completed_campaign_rejects_unapproved_next_innovation(tmp_path):
     workflow, project = build_approved_project(tmp_path, max_experiments=12)
-    executable_ids = [
+    assert project.experiment_plan is not None
+    primary_id = project.experiment_plan.hypothesis_ids[0]
+    secondary_id = next(
         item.id
         for item in project.hypotheses
-        if item.execution_readiness == "executable"
-    ]
-    assert len(executable_ids) >= 2
+        if item.execution_readiness == "executable" and item.id != primary_id
+    )
     dataset = dataset_manifest()
     project = workflow.attach_dataset_audit(
         project.id,
@@ -224,7 +227,7 @@ def test_completed_campaign_can_continue_with_next_innovation(tmp_path):
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
-        hypothesis_id=executable_ids[0],
+        hypothesis_id=primary_id,
         max_rounds=1,
         max_runs=4,
     )
@@ -234,18 +237,19 @@ def test_completed_campaign_can_continue_with_next_innovation(tmp_path):
     assert project.experiment_campaign is not None
     assert project.experiment_campaign.status == "completed"
 
-    project = workflow.initialize_experiment_campaign(
-        project.id,
-        dataset=dataset,
-        hypothesis_id=executable_ids[1],
-        max_rounds=1,
-        max_runs=4,
-    )
+    with pytest.raises(InvalidTransitionError, match="not approved or executable"):
+        workflow.initialize_experiment_campaign(
+            project.id,
+            dataset=dataset,
+            hypothesis_id=secondary_id,
+            max_rounds=1,
+            max_runs=4,
+        )
 
-    assert project.experiment_campaign is not None
-    assert project.experiment_campaign.hypothesis_id == executable_ids[1]
-    assert project.experiment_campaign_history[-1].hypothesis_id == executable_ids[0]
-    assert first_run_ids < {item.id for item in project.runs}
+    unchanged = workflow.repository.get(project.id)
+    assert unchanged.experiment_campaign is not None
+    assert unchanged.experiment_campaign.hypothesis_id == primary_id
+    assert first_run_ids == {item.id for item in unchanged.runs}
 
 
 def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path):

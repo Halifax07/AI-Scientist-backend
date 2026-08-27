@@ -18,9 +18,6 @@ from fsad_scientist.domain.models import (
     ResearchGap,
     ResearchProject,
     new_id,
-    ReasoningStep,
-    AlternativeDecision,
-    ExpectedImprovement,
 )
 from fsad_scientist.experiments.code_safety import (
     extract_detector_source,
@@ -302,8 +299,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                     "   - confidence: 对该结论的置信度（高/中/低）\n"
                     "2. 在 alternative_decisions 中说明你考虑过但未选择的方案及其原因\n"
                     "3. 在 expected_improvement 中说明预期的改进方向和幅度\n"
-                    "4. pair_count/cumulative_pair_count 是全活动累计配对数，round_pair_count 是本轮新增数\n"
-                    "5. mean_difference/positive_pair_fraction 仅描述本轮；跨轮总体方向必须读取 cumulative_primary_summary\n"
+                    "4. pair_count/cumulative_pair_count 是全活动累计配对数，"
+                    "round_pair_count 是本轮新增数\n"
+                    "5. mean_difference/positive_pair_fraction 仅描述本轮；"
+                    "跨轮总体方向必须读取 cumulative_primary_summary\n"
                     "6. 只有达到 minimum_pairs 后才能建议 stop\n"
                     "7. 所有自然语言字段使用简体中文"
                 ),
