@@ -104,7 +104,7 @@ class ExecuteNextExperimentRequest(BaseModel):
 class ExecuteNextExperimentResponse(BaseModel):
     run_id: str
     guidance_decision: ExperimentGuidanceDecision
-    prepared: PreparedRunArtifacts
+    prepared: PreparedRunArtifacts | None = None
     execution: ExecutionRecord
     project: ResearchProject
 

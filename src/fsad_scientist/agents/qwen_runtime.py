@@ -18,6 +18,9 @@ from fsad_scientist.domain.models import (
     ResearchGap,
     ResearchProject,
     new_id,
+    ReasoningStep,
+    AlternativeDecision,
+    ExpectedImprovement,
 )
 from fsad_scientist.experiments.code_safety import (
     extract_detector_source,
@@ -264,17 +267,33 @@ class QwenScientistRuntime(MockScientistRuntime):
                 role_name="AdaptiveExperimentPlanner",
                 system_prompt=(
                     "你是少样本工业视觉异常检测的自适应实验规划智能体。"
-                    "只根据真实运行摘要决定下一轮最有信息量的实验，不得虚构指标。"
-                    "你只能从 allowed_cells 中选择最多两个单元；每个单元会由系统强制生成 "
-                    "random 与 k_center 成对运行。优先证伪价值、跨类别复现、K 敏感性与失败诊断，"
-                    "并减少无效穷举。paired_metric_summaries 只用于解释机制和边界，不能悄悄替换"
-                    "预注册主指标；如果 primary_metric_saturated=true，应优先选择更难类别。"
-                    "pair_count/cumulative_pair_count 是全活动累计配对数，"
-                    "round_pair_count 是本轮新增数。"
-                    "mean_difference/positive_pair_fraction 仅描述本轮；"
-                    "跨轮总体方向必须读取 cumulative_primary_summary。"
-                    "只有达到 minimum_pairs 后才能建议 stop。"
-                    "所有自然语言字段使用简体中文。"
+                    "你的输出必须包含完整的推理过程，让非专业用户也能理解决策逻辑。\n\n"
+                    "【决策类型】你可以给出以下决策：\n"
+                    "1. expand: 扩展到新类别，检验效应跨类别泛化能力\n"
+                    "2. replicate: 增加随机种子，提高统计可信度\n"
+                    "3. diagnose: 诊断异常结果或失败原因\n"
+                    "4. stop: 收集足够证据后停止实验\n"
+                    "5. adapt_k: 根据当前 K 值敏感性分析结果，调整 K 值\n"
+                    "6. focus_category: 聚焦效应最显著的类别进行深入分析\n"
+                    "7. ablate: 消融实验，移除或修改某个组件\n"
+                    "8. early_stop: 效应已显著强于基线，可以提前停止\n\n"
+                    "【决策依据】应综合考虑：\n"
+                    "- 当前配对数是否达到最小要求（minimum_pairs）\n"
+                    "- 效应量是否足够显著\n"
+                    "- 正向配对比例是否稳定\n"
+                    "- 各类别效应是否一致\n"
+                    "- 置信区间宽度\n\n"
+                    "【输出要求】\n"
+                    "1. 在 reasoning_chain 中列出你的完整推理步骤，格式为：\n"
+                    "   - observation: 观察到的具体事实（数字或现象）\n"
+                    "   - conclusion: 从这个事实得出的结论\n"
+                    "   - confidence: 对该结论的置信度（高/中/低）\n"
+                    "2. 在 alternative_decisions 中说明你考虑过但未选择的方案及其原因\n"
+                    "3. 在 expected_improvement 中说明预期的改进方向和幅度\n"
+                    "4. pair_count/cumulative_pair_count 是全活动累计配对数，round_pair_count 是本轮新增数\n"
+                    "5. mean_difference/positive_pair_fraction 仅描述本轮；跨轮总体方向必须读取 cumulative_primary_summary\n"
+                    "6. 只有达到 minimum_pairs 后才能建议 stop\n"
+                    "7. 所有自然语言字段使用简体中文"
                 ),
                 payload={
                     "hypothesis": next(
@@ -296,8 +315,30 @@ class QwenScientistRuntime(MockScientistRuntime):
                     ],
                     "output_schema": {
                         "advisor": self.name,
-                        "decision": "expand|replicate|diagnose|stop",
+                        "decision": (
+                            "expand|replicate|diagnose|stop|adapt_k|focus_category|ablate|early_stop"
+                        ),
                         "rationale": "string",
+                        "reasoning_chain": [
+                            {
+                                "step": "integer (starting from 1)",
+                                "observation": "观察到的具体事实",
+                                "conclusion": "从这个事实得出的结论",
+                                "confidence": "高|中|低"
+                            }
+                        ],
+                        "alternative_decisions": [
+                            {
+                                "decision": "考虑过的方案名称",
+                                "rejected_reason": "为什么没有选择该方案"
+                            }
+                        ],
+                        "expected_improvement": {
+                            "metric": "指标名称",
+                            "direction": "increase|decrease",
+                            "estimated_delta": "number",
+                            "confidence": "高|中|低"
+                        },
                         "observed_patterns": ["string"],
                         "next_phase": (
                             "sensitivity|main_study|replication|ablation|"
@@ -306,6 +347,11 @@ class QwenScientistRuntime(MockScientistRuntime):
                         "recommended_cells": [
                             {"category": "string", "shots": "integer", "seed": "integer"}
                         ],
+                        "strategy_adjustment": {
+                            "focus_on_k": "integer or null (建议聚焦的 K 值)",
+                            "priority_category": "string or null (优先测试的类别)",
+                            "ablation_target": "string or null (消融目标)"
+                        },
                         "expected_information_gain": "0..1",
                         "stop": "boolean",
                     },

@@ -280,10 +280,53 @@ class ExperimentCell(BaseModel):
     seed: int = Field(ge=0)
 
 
+class ReasoningStep(BaseModel):
+    """AI 推理链中的单个步骤"""
+    step: int = Field(ge=1, description="步骤编号")
+    observation: str = Field(description="观察到的具体事实")
+    conclusion: str = Field(description="从这个事实得出的结论")
+    confidence: Literal["高", "中", "低"] = "中"
+
+
+class AlternativeDecision(BaseModel):
+    """考虑过但未选择的备选方案"""
+    decision: str = Field(description="考虑过的方案名称")
+    rejected_reason: str = Field(description="为什么没有选择该方案")
+
+
+class ExpectedImprovement(BaseModel):
+    """预期改进指标"""
+    metric: str = Field(description="预期改进的指标名")
+    direction: Literal["increase", "decrease"] = Field(description="改进方向")
+    estimated_delta: float = Field(description="预估变化量")
+    confidence: Literal["高", "中", "低"] = "中"
+
+
 class ExperimentFeedbackProposal(BaseModel):
     advisor: str
-    decision: Literal["expand", "replicate", "diagnose", "stop"]
+    decision: Literal[
+        "expand",
+        "replicate",
+        "diagnose",
+        "stop",
+        "adapt_k",
+        "focus_category",
+        "ablate",
+        "early_stop",
+    ] = "expand"
     rationale: str
+    reasoning_chain: list[ReasoningStep] = Field(
+        default_factory=list,
+        description="AI 推理步骤列表，每个元素是一个推理步骤"
+    )
+    alternative_decisions: list[AlternativeDecision] = Field(
+        default_factory=list,
+        description="考虑过但未选择的方案及原因"
+    )
+    expected_improvement: ExpectedImprovement | None = Field(
+        default=None,
+        description="预期改进指标"
+    )
     observed_patterns: list[str] = Field(default_factory=list)
     next_phase: Literal[
         "sensitivity",
@@ -292,8 +335,12 @@ class ExperimentFeedbackProposal(BaseModel):
         "ablation",
         "cross_dataset",
         "complete",
-    ]
+    ] = "sensitivity"
     recommended_cells: list[ExperimentCell] = Field(default_factory=list)
+    strategy_adjustment: dict[str, Any] = Field(
+        default_factory=dict,
+        description="针对当前策略的具体调整建议"
+    )
     expected_information_gain: float = Field(default=0.0, ge=0, le=1)
     stop: bool = False
 

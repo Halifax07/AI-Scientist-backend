@@ -7,6 +7,7 @@ from typing import Any
 
 from fsad_scientist.domain.enums import EvidenceStatus, HypothesisStatus, RunStatus
 from fsad_scientist.domain.models import (
+    AlternativeDecision,
     AnalysisContract,
     AnalysisFinding,
     ArtifactRecord,
@@ -16,10 +17,12 @@ from fsad_scientist.domain.models import (
     ExperimentGuidanceDecision,
     ExperimentPlan,
     ExperimentRun,
+    ExpectedImprovement,
     Hypothesis,
     HypothesisScore,
     InnovationCandidate,
     MethodImplementation,
+    ReasoningStep,
     ResearchGap,
     ResearchProject,
     new_id,
@@ -407,6 +410,9 @@ class MockScientistRuntime:
         positive_fraction = round_summary.get("positive_pair_fraction")
         primary_saturated = bool(round_summary.get("primary_metric_saturated", False))
 
+        reasoning_chain: list[ReasoningStep] = []
+        alternative_decisions: list[AlternativeDecision] = []
+
         if failed or pair_count == 0:
             decision = "diagnose"
             phase = "sensitivity"
@@ -414,12 +420,34 @@ class MockScientistRuntime:
                 "当前轮存在失败运行或尚未形成有效成对结果；下一轮优先选择最小诊断单元，"
                 "区分执行链路问题、类别边界和 K 敏感性。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation=f"有效成对单元数 = {pair_count}, 失败运行数 = {len(failed)}",
+                conclusion="样本不足或存在执行问题，需要诊断",
+                confidence="高",
+            ))
+            alternative_decisions.append(AlternativeDecision(
+                decision="expand",
+                rejected_reason="在失败运行原因未知的情况下扩展实验会增加风险",
+            ))
         elif pair_count >= minimum_pairs and positive_fraction is not None:
             decision = "stop"
             phase = "complete"
             rationale = (
                 "已达到预注册的最小成对样本数，当前证据可以进入正式配对统计与创新审查。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation=f"配对数 {pair_count} >= 最小要求 {minimum_pairs}",
+                conclusion="已达到统计检验所需的最小样本量",
+                confidence="高",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=2,
+                observation=f"正向配对比例 = {positive_fraction:.2%}",
+                conclusion="效应方向一致，可以得出结论",
+                confidence="高" if positive_fraction >= 0.8 else "中",
+            ))
         elif primary_saturated:
             decision = "expand"
             phase = "main_study"
@@ -427,6 +455,22 @@ class MockScientistRuntime:
                 "预注册主指标在当前类别上饱和，零差异不能区分两种策略；"
                 "扩展到更难类别，同时保留像素指标作为机制和边界诊断。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation="主指标已饱和（所有值 >= 0.995）",
+                conclusion="当前类别无法区分策略效果",
+                confidence="高",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=2,
+                observation="需要测试更难类别或改变检测器",
+                conclusion="扩展到新类别以寻找有效区分区域",
+                confidence="中",
+            ))
+            alternative_decisions.append(AlternativeDecision(
+                decision="stop",
+                rejected_reason="指标饱和时无法得出有意义的结论",
+            ))
         elif mean_difference is not None and mean_difference > 0 and (
             positive_fraction or 0
         ) >= 0.75:
@@ -435,23 +479,81 @@ class MockScientistRuntime:
             rationale = (
                 "首批效应方向较一致但证据量仍不足；扩展到新类别，以检验收益是否具有跨类别复现性。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation=f"平均效应量 = {mean_difference:.4f} > 0",
+                conclusion="处理组（k_center）优于对照组（random）",
+                confidence="高",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=2,
+                observation=f"正向配对比例 = {positive_fraction:.2%} >= 75%",
+                conclusion="效应在多个独立单元上复现",
+                confidence="高",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=3,
+                observation=f"但配对数 {pair_count} < 最小要求 {minimum_pairs}",
+                conclusion="样本量不足以得出强结论，需要扩展",
+                confidence="中",
+            ))
         elif mean_difference is not None and mean_difference <= 0:
             decision = "diagnose"
             phase = "sensitivity"
             rationale = (
                 "观察到零效应或反向效应；改变类别或 K 做边界诊断，避免在无效区域盲目扩大计算。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation=f"平均效应量 = {mean_difference:.4f} <= 0",
+                conclusion="处理组未优于对照组，需要诊断原因",
+                confidence="高",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=2,
+                observation="可能是类别特性、K值或执行问题",
+                conclusion="需要进行诊断实验确定原因",
+                confidence="中",
+            ))
+            alternative_decisions.append(AlternativeDecision(
+                decision="expand",
+                rejected_reason="在效应为负的情况下扩展会增加计算浪费",
+            ))
         else:
             decision = "replicate"
             phase = "replication"
             rationale = (
                 "当前成对效应不稳定且样本不足；增加独立单元以判断波动来自随机种子还是类别差异。"
             )
+            reasoning_chain.append(ReasoningStep(
+                step=1,
+                observation=f"配对数 = {pair_count}, 效应量 = {mean_difference}",
+                conclusion="样本量不足以判断效应稳定性",
+                confidence="中",
+            ))
+            reasoning_chain.append(ReasoningStep(
+                step=2,
+                observation=f"正向比例 = {positive_fraction}",
+                conclusion="需要更多独立样本来验证效应一致性",
+                confidence="中",
+            ))
+
+        expected_improvement: ExpectedImprovement | None = None
+        if mean_difference is not None and mean_difference > 0:
+            expected_improvement = ExpectedImprovement(
+                metric="image_auroc",
+                direction="increase",
+                estimated_delta=mean_difference * 0.2,
+                confidence="中",
+            )
 
         return ExperimentFeedbackProposal(
             advisor=self.name,
             decision=decision,
             rationale=rationale,
+            reasoning_chain=reasoning_chain,
+            alternative_decisions=alternative_decisions,
+            expected_improvement=expected_improvement,
             observed_patterns=[
                 f"有效成对单元 {pair_count}/{minimum_pairs}",
                 f"平均处理效应 {mean_difference}",
@@ -461,6 +563,7 @@ class MockScientistRuntime:
             ],
             next_phase=phase,
             recommended_cells=[] if decision == "stop" else allowed_cells[:2],
+            strategy_adjustment={},
             expected_information_gain=0.85 if decision == "diagnose" else 0.72,
             stop=decision == "stop",
         )
