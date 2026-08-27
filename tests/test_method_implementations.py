@@ -1,6 +1,5 @@
+import json
 from pathlib import Path
-
-import pytest
 
 from fsad_scientist.domain.models import (
     ExperimentPlan,
@@ -9,7 +8,6 @@ from fsad_scientist.domain.models import (
 )
 from fsad_scientist.repository import JsonProjectRepository
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VALID_DIGEST = "a" * 64
 
 
@@ -59,15 +57,21 @@ class TestBackwardCompatibility:
         plan = _minimal_plan()
         assert plan.method_implementation_digests == {}
 
-    def test_stored_projects_load_with_new_defaults(self) -> None:
-        storage = PROJECT_ROOT / "storage" / "projects"
-        if not storage.is_dir():
-            pytest.skip("storage directory not present in this checkout")
-        projects = JsonProjectRepository(storage).list()
-        if not projects:
-            pytest.skip("storage directory holds no projects")
-        for project in projects:
-            assert project.method_implementations == []
-            for plan in [project.experiment_plan, *project.experiment_plan_history]:
-                if plan is not None:
-                    assert plan.method_implementation_digests == {}
+    def test_stored_projects_load_with_new_defaults(self, tmp_path: Path) -> None:
+        legacy = ResearchProject(spec={}, experiment_plan=_minimal_plan())
+        payload = legacy.model_dump(mode="json")
+        payload.pop("method_implementations")
+        payload["experiment_plan"].pop("method_implementation_digests")
+
+        project_dir = tmp_path / legacy.id
+        project_dir.mkdir()
+        (project_dir / "project.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
+        projects = JsonProjectRepository(tmp_path).list()
+        assert len(projects) == 1
+        assert projects[0].method_implementations == []
+        assert projects[0].experiment_plan is not None
+        assert projects[0].experiment_plan.method_implementation_digests == {}
