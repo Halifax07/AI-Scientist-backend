@@ -55,7 +55,7 @@ def test_autonomous_discovery_reaches_human_gate(tmp_path):
     assert project.gaps
     assert project.hypotheses
     assert project.experiment_plan is not None
-    assert len(project.experiment_plan.hypothesis_ids) == 1
+    assert len(project.experiment_plan.hypothesis_ids) >= 1
     assert set(project.experiment_plan.hypothesis_contracts) == set(
         project.experiment_plan.hypothesis_ids
     )
@@ -83,7 +83,7 @@ def test_approval_queues_a_bounded_feasibility_batch(tmp_path):
         approved.experiment_plan.hypothesis_ids
     )
     assert all(
-        run.selection_strategy == "random"
+        run.selection_strategy in {"random", "k_center"}
         for run in approved.runs
         if run.protocol == "strict_k_shot"
     )
@@ -121,16 +121,17 @@ def test_legacy_multi_hypothesis_plan_requires_review_after_scoping(tmp_path):
     )
     workflow.repository.save(project)
 
-    with pytest.raises(InvalidTransitionError, match="单一可执行主假设"):
+    with pytest.raises(InvalidTransitionError, match="没有已注册实现"):
         workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
 
     migrated = workflow.repository.get(project.id)
     assert migrated.stage == ResearchStage.AWAITING_EXPERIMENT_APPROVAL
     assert migrated.experiment_plan is not None
-    assert migrated.experiment_plan.hypothesis_ids == [primary_hypothesis_id]
-    assert set(migrated.experiment_plan.hypothesis_contracts) == {
-        primary_hypothesis_id
-    }
+    assert primary_hypothesis_id in migrated.experiment_plan.hypothesis_ids
+    assert secondary.id in migrated.experiment_plan.hypothesis_ids
+    assert set(migrated.experiment_plan.hypothesis_contracts) == set(
+        migrated.experiment_plan.hypothesis_ids
+    )
     assert not migrated.runs
 
 
@@ -174,12 +175,14 @@ def test_scoping_skips_unregistered_dynamic_strategy_for_builtin_core(tmp_path):
 
     preregistered = run(workflow.advance(project.id))
     assert preregistered.experiment_plan is not None
-    assert preregistered.experiment_plan.hypothesis_ids == [core.id]
+    assert core.id in preregistered.experiment_plan.hypothesis_ids
+    assert query.id not in preregistered.experiment_plan.hypothesis_ids
 
     approved = workflow.approve_experiment_plan(
         project.id, approved_by="test-reviewer"
     )
-    assert {run.hypothesis_id for run in approved.runs} == {core.id}
+    assert core.id in {run.hypothesis_id for run in approved.runs}
+    assert query.id not in {run.hypothesis_id for run in approved.runs}
 
 
 def test_scoping_prefers_generated_dynamic_strategy_over_builtin_core(tmp_path):
@@ -231,12 +234,14 @@ def test_scoping_prefers_generated_dynamic_strategy_over_builtin_core(tmp_path):
     assert implementation.name == "dynamic_density_based_denoising"
     preregistered = run(workflow.advance(project.id))
     assert preregistered.experiment_plan is not None
-    assert preregistered.experiment_plan.hypothesis_ids == [query.id]
+    assert query.id in preregistered.experiment_plan.hypothesis_ids
+    assert core.id in preregistered.experiment_plan.hypothesis_ids
 
     approved = workflow.approve_experiment_plan(
         project.id, approved_by="test-reviewer"
     )
-    assert {run.hypothesis_id for run in approved.runs} == {query.id}
+    assert query.id in {run.hypothesis_id for run in approved.runs}
+    assert core.id in {run.hypothesis_id for run in approved.runs}
 
 
 def test_inconclusive_real_cycle_revises_hypothesis_without_losing_history(tmp_path):

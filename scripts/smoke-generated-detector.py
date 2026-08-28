@@ -88,6 +88,7 @@ def main() -> None:
         project = workflow.initialize_experiment_campaign(
             project.id,
             dataset=dataset,
+            hypothesis_id=hypothesis.id,
             detector=implementation.name,
             device="cpu",
             max_rounds=3,

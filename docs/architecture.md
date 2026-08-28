@@ -58,10 +58,13 @@ created
 关键规则：
 
 - `awaiting_experiment_approval` 必须由人批准预注册计划。
-- 每个真实 run 执行前必须接收一条用户指导；LLM 只能据此在本轮冻结队列中重排，服务端会校验最终 Run ID，原文、解释、处置结果和保护边界全部入账。
+- 每个创新点都携带自己的 `analysis_contract`、`execution_readiness` 和实验指导；每个 `ExperimentRound` 通过 `hypothesis_id` 与当前被验证创新点绑定，一个 campaign 可以按顺序包含多个创新点 Round。
+- 同一研究循环可以依次验证多个已批准创新点；上一个 campaign 完成后进入历史集合，再由用户选择下一个创新点，不需要生成无关替代假设。
+- 没有已注册算法适配器的创新点只能标记为 `requires_implementation`，不得伪装成已经可以执行或静默替换成 random/k-center 假设。
+- 每个 Round 仅在第 1 次内部迭代完成后接收一次用户指导；LLM 只能据此在当前 Round 的冻结队列中安排第 2、3 次迭代，服务端会校验最终 Run ID，原文、解释、处置结果和保护边界全部入账。
 - `experiments_queued` 不能直接进入分析，必须导入真实且终态的 Run。
-- `experiment_campaign` 把执行阶段拆为多轮：`planned → running → ready_for_feedback → completed`。
-- 每轮结束后，Qwen 只从服务端生成的 `allowed_cells` 中推荐最多两个类别/K/seed 单元；每个单元由系统强制生成 random/k-center 成对运行。
+- `experiment_campaign` 把执行阶段拆为按创新点排列的 Round：`planned → running → awaiting_guidance → ready_for_feedback → completed`。
+- 每个 Round 固定三次内部迭代；每次迭代由系统从服务端生成的 `allowed_cells` 中安排一个类别/K/seed 单元，并强制生成 random/k-center 成对运行。Round 汇总后才切换到下一个创新点。
 - 提前停止只有在达到预注册 `minimum_pairs` 后才会被接受；轮次、run 预算或候选空间耗尽时可确定性停止。
 - 只有 `verified=true` 的实验运行可以支持统计发现。
 - 只有文献和实验均完成校验，结果才可标记为 `evidence_supported_candidate`。

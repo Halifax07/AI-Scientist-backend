@@ -11,7 +11,8 @@
 - MVTec AD 数据审计与 DINOv2 正常样本画像
 - random/k-center 少样本支持集选择
 - AnomalyDINO、PatchCore、SubspaceAD 命令适配
-- 自适应实验树、Qwen 结果反馈和人类指导闸门
+- 多创新点 Round 实验树：每个 Round 固定三次自动迭代，并在第 1 次后接受一次人类指导
+- Qwen 结果规划、方法边界校验和 Research Ledger 留痕
 - 配对 bootstrap、符号置换检验和创新审查
 
 ## 快速启动

@@ -64,11 +64,18 @@ def main() -> None:
                 )
             )
             manifest_path = project["dataset_audits"][-1]["manifest_path"]
+            hypothesis_id = next(
+                item["id"]
+                for item in project["hypotheses"]
+                if item["execution_readiness"] == "executable"
+                and item["id"] in project["experiment_plan"]["hypothesis_ids"]
+            )
             project = checked(
                 client.post(
                     f"/api/v1/projects/{project['id']}/experiment-campaign/initialize",
                     json={
                         "dataset_manifest_path": manifest_path,
+                        "hypothesis_id": hypothesis_id,
                         "detector": "anomalydino",
                         "device": "cuda:0",
                         "max_rounds": 3,

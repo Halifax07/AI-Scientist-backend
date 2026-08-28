@@ -55,11 +55,18 @@ def main() -> None:
             )
             print(f"plan approved -> {project['stage']}", flush=True)
             audit = project["dataset_audits"][-1]
+            hypothesis_id = next(
+                item["id"]
+                for item in project["hypotheses"]
+                if item["id"] in project["experiment_plan"]["hypothesis_ids"]
+                and item.get("execution_readiness") == "executable"
+            )
             project = checked(
                 client.post(
                     f"/api/v1/projects/{arguments.project_id}/experiment-campaign/initialize",
                     json={
                         "dataset_manifest_path": audit["manifest_path"],
+                        "hypothesis_id": hypothesis_id,
                         "detector": "anomalydino",
                         "device": "cuda:0",
                         "max_rounds": 3,

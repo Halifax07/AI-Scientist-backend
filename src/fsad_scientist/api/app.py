@@ -33,6 +33,7 @@ from fsad_scientist.api.schemas import (
     InitializeExperimentCampaignRequest,
     PrepareRunRequest,
     ProjectDatasetAuditRequest,
+    ReviewExperimentRoundRequest,
     RunResultRequest,
     StartNextResearchCycleRequest,
     SupportPlanRequest,
@@ -459,6 +460,7 @@ def create_app(
         return workflow.initialize_experiment_campaign(
             project_id,
             dataset=dataset,
+            hypothesis_id=body.hypothesis_id,
             device=body.device,
             detector=body.detector,
             max_rounds=body.max_rounds,
@@ -637,8 +639,12 @@ def create_app(
     async def review_experiment_campaign_round(
         project_id: str,
         workflow: WorkflowDependency,
+        body: ReviewExperimentRoundRequest | None = None,
     ) -> ResearchProject:
-        return await workflow.review_experiment_round(project_id)
+        return await workflow.review_experiment_round(
+            project_id,
+            user_guidance=body.user_guidance if body else None,
+        )
 
     @app.post(
         "/api/v1/projects/{project_id}/runs/{run_id}/result",
@@ -871,7 +877,22 @@ def _create_mock_manifest(dataset_name: str, root: str) -> DatasetManifest:
 
     from fsad_scientist.datasets.models import DatasetAuditIssue, DatasetFileRecord
 
-    categories = ["bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut", "pill", "screw", "tile", "transistor", "wood", "zipper"]
+    categories = [
+        "bottle",
+        "cable",
+        "capsule",
+        "carpet",
+        "grid",
+        "hazelnut",
+        "leather",
+        "metal_nut",
+        "pill",
+        "screw",
+        "tile",
+        "transistor",
+        "wood",
+        "zipper",
+    ]
     files: list[DatasetFileRecord] = []
     for category in categories:
         for i in range(5):
@@ -948,17 +969,23 @@ def _create_mock_execution_record(
 ) -> ExecutionRecord:
     """Create a mock execution record for development without real data."""
     import random
+
     from fsad_scientist.experiments.models import (
         ExecutionRecord,
         NormalizedExperimentResult,
     )
-    from fsad_scientist.domain.models import utc_now
 
     strategy_bias = 0.015 if run.selection_strategy == "k_center" else 0.0
     seed_variance = (run.seed % 3) * 0.003
     category_variance = hash(run.category) % 10 * 0.001
 
-    image_auroc = 0.85 + strategy_bias + seed_variance + category_variance + random.uniform(-0.01, 0.01)
+    image_auroc = (
+        0.85
+        + strategy_bias
+        + seed_variance
+        + category_variance
+        + random.uniform(-0.01, 0.01)
+    )
     image_auroc = max(0.5, min(0.99, image_auroc))
 
     pixel_auroc = 0.78 + strategy_bias * 0.5 + random.uniform(-0.02, 0.02)
@@ -971,7 +998,15 @@ def _create_mock_execution_record(
     stderr_path = output_dir / "stderr.log"
     record_path = output_dir / "execution.json"
 
-    stdout_path.write_text(f"[MOCK] Run {run.id} - {run.detector} on {run.category}\n[MOCK] Strategy: {run.selection_strategy}, K={run.shots}, seed={run.seed}\n[MOCK] image_auroc={image_auroc:.4f}\n", encoding="utf-8")
+    stdout_path.write_text(
+        (
+            f"[MOCK] Run {run.id} - {run.detector} on {run.category}\n"
+            f"[MOCK] Strategy: {run.selection_strategy}, K={run.shots}, "
+            f"seed={run.seed}\n"
+            f"[MOCK] image_auroc={image_auroc:.4f}\n"
+        ),
+        encoding="utf-8",
+    )
     stderr_path.write_text("", encoding="utf-8")
 
     record = ExecutionRecord(

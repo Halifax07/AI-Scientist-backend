@@ -18,9 +18,6 @@ from fsad_scientist.domain.models import (
     ResearchGap,
     ResearchProject,
     new_id,
-    ReasoningStep,
-    AlternativeDecision,
-    ExpectedImprovement,
 )
 from fsad_scientist.experiments.code_safety import (
     extract_detector_source,
@@ -115,7 +112,11 @@ class QwenScientistRuntime(MockScientistRuntime):
             system_prompt=(
                 "你负责把研究空白转化为可证伪科学假设。每个假设必须包含零假设、"
                 "变量、预测方向和明确的证伪条件；从不同机制提出 3 至 6 个候选，"
-                "不要写成模糊的工程目标。除论文标题和标准技术名词外，"
+                "不要写成模糊的工程目标。至少提出 3 个能够由当前工具链直接验证的创新假设："
+                "analysis_contract.kind 必须为 selection_main_effect，treatment 必须为 k_center，"
+                "control 必须为 random；不同创新点应通过机制主张、主指标、类别边界或 K 敏感性"
+                "形成真正不同的证伪问题。可以补充需要新代码的前瞻候选，但不能把它标成可执行。"
+                "除论文标题和标准技术名词外，"
                 "所有自然语言字段使用简体中文。"
             ),
             payload={
@@ -123,6 +124,15 @@ class QwenScientistRuntime(MockScientistRuntime):
                 "evidence_candidates": [
                     item.model_dump(mode="json") for item in project.evidence
                 ],
+                "execution_capabilities": {
+                    "implemented_intervention": "k_center",
+                    "implemented_control": "random",
+                    "implemented_kind": "selection_main_effect",
+                    "detectors": ["anomalydino", "patchcore", "subspacead"],
+                    "datasets": ["MVTec AD"],
+                    "shots": project.spec.constraints.shots,
+                    "rule": "只有上述干预和对照可以标记为当前可执行",
+                },
                 "required_fields": [
                     "gap_id",
                     "title",
@@ -152,13 +162,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                             "evidence_ids": ["existing evidence id"],
                             "closest_prior_work": ["string"],
                             "analysis_contract": {
-                                "kind": (
-                                    "selection_main_effect|detector_interaction|"
-                                    "query_adaptation"
-                                ),
+                                "kind": "selection_main_effect",
                                 "metric": "string",
-                                "treatment": "string",
-                                "control": "string",
+                                "treatment": "k_center",
+                                "control": "random",
                                 "alpha": 0.05,
                                 "minimum_pairs": 6,
                             },
@@ -270,6 +277,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                 system_prompt=(
                     "你是少样本工业视觉异常检测的自适应实验规划智能体。"
                     "你的输出必须包含完整的推理过程，让非专业用户也能理解决策逻辑。\n\n"
+                    "【当前实验语义】一个 Round 只验证一个创新点，固定包含 3 次内部迭代。"
+                    "当 completed_iterations=1 时，这是唯一一次中途指导：必须规划后续两次迭代，"
+                    "不得建议停止或创建新的 Round；当 completed_iterations=3 时，只需汇总结果，"
+                    "由系统自动切换到下一个创新点。\n\n"
                     "【决策类型】你可以给出以下决策：\n"
                     "1. expand: 扩展到新类别，检验效应跨类别泛化能力\n"
                     "2. replicate: 增加随机种子，提高统计可信度\n"
@@ -292,8 +303,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                     "   - confidence: 对该结论的置信度（高/中/低）\n"
                     "2. 在 alternative_decisions 中说明你考虑过但未选择的方案及其原因\n"
                     "3. 在 expected_improvement 中说明预期的改进方向和幅度\n"
-                    "4. pair_count/cumulative_pair_count 是全活动累计配对数，round_pair_count 是本轮新增数\n"
-                    "5. mean_difference/positive_pair_fraction 仅描述本轮；跨轮总体方向必须读取 cumulative_primary_summary\n"
+                    "4. pair_count/cumulative_pair_count 描述当前创新点 Round 的累计配对数，"
+                    "round_pair_count 是当前 Round 已形成的配对数\n"
+                    "5. mean_difference/positive_pair_fraction 描述当前 Round；"
+                    "不同创新点之间不得直接合并为一个效应量\n"
                     "6. 只有达到 minimum_pairs 后才能建议 stop\n"
                     "7. 所有自然语言字段使用简体中文"
                 ),
@@ -308,6 +321,12 @@ class QwenScientistRuntime(MockScientistRuntime):
                         None,
                     ),
                     "round_summary": round_summary,
+                    "round_contract": {
+                        "hypothesis_id": round_summary.get("hypothesis_id"),
+                        "iteration_target": 3,
+                        "completed_iterations": round_summary.get("completed_iterations", 0),
+                        "human_guidance_gate": "after_iteration_1_only",
+                    },
                     "recent_human_guidance": [
                         item.model_dump(mode="json")
                         for item in project.guidance_records[-8:]
@@ -409,11 +428,15 @@ class QwenScientistRuntime(MockScientistRuntime):
             response = await self.client.complete(
                 role_name="HumanExperimentGuidanceAgent",
                 system_prompt=(
-                    "你负责解释用户在单次真实实验执行前的指导。你只能从 candidate_runs "
-                    "中选择一个 run_id，可以调整执行优先级，但绝不能修改预注册配置、指标、"
-                    "数据边界或生成任意命令。若建议需要新增类别、K、seed、检测器或指标，"
-                    "将 disposition 标为 not_applicable，并选择系统默认候选，同时说明应在"
-                    "下一实验轮或下一研究循环重新预注册。所有自然语言使用简体中文。"
+                    "你负责解释用户指导或系统自动执行动作。底层一次请求只选择一个已排队的 run_id；"
+                    "系统会连续调用该接口完成当前 Round 的三次内部迭代。用户指导只在第 1 次迭代"
+                    "结束后通过 Round 审查接口提交一次，不应被解释成每个 run 都需要人工批准。你只能"
+                    "从 candidate_runs 中选择一个 run_id，可以调整执行优先级，但绝不能修改预注册"
+                    "配置、"
+                    "指标、数据边界或生成任意命令。若建议需要新增类别、K、seed、检测器或指标，将"
+                    "disposition 标为 not_applicable，并选择系统默认候选，同时说明应在下一实验"
+                    " Round"
+                    "或下一研究循环重新预注册。所有自然语言使用简体中文。"
                 ),
                 payload={
                     "user_guidance": guidance,

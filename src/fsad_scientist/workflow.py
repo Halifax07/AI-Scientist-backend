@@ -194,7 +194,7 @@ class ResearchWorkflow:
 
         elif project.stage == ResearchStage.HYPOTHESES_PROPOSED:
             project.hypotheses = await self.runtime.review_hypotheses(project)
-            self._ensure_executable_core_hypothesis(project)
+            self._ensure_executable_hypotheses(project)
             self._move(
                 project,
                 stage=ResearchStage.HYPOTHESES_REVIEWED,
@@ -212,7 +212,7 @@ class ResearchWorkflow:
             )
 
         elif project.stage == ResearchStage.HYPOTHESES_REVIEWED:
-            self._ensure_executable_core_hypothesis(project)
+            self._ensure_executable_hypotheses(project)
             if project.experiment_plan is not None:
                 project.experiment_plan_history.append(
                     project.experiment_plan.model_copy(deep=True)
@@ -386,7 +386,7 @@ class ResearchWorkflow:
         if excluded_hypothesis_ids:
             self.repository.save(project)
             raise InvalidTransitionError(
-                "预注册计划已收敛为单一可执行主假设；请刷新页面复核后再次批准"
+                "预注册计划已移除当前工具链不可执行的创新点；请刷新页面复核后再次批准"
             )
 
         self._enforce_method_implementation_gate(project)
@@ -672,6 +672,12 @@ class ResearchWorkflow:
         self,
         project: ResearchProject,
     ) -> list[str]:
+        """Keep every executable innovation in the preregistered portfolio.
+
+        The historical name is retained for saved-project/API compatibility.  A
+        campaign no longer collapses the plan to one primary hypothesis: each
+        retained hypothesis receives one Round of three internal iterations.
+        """
         plan = project.experiment_plan
         if plan is None:
             return []
@@ -681,51 +687,39 @@ class ResearchWorkflow:
             hypothesis_id
             for hypothesis_id in plan.hypothesis_ids
             if hypothesis_id in hypotheses
-            and self._contract_is_supported_primary(
-                hypotheses[hypothesis_id].analysis_contract
-            )
+            and hypotheses[hypothesis_id].analysis_contract is not None
+            and hypotheses[hypothesis_id].analysis_contract.kind
+            in {"selection_main_effect", "query_adaptation"}
         ]
-        primary_hypothesis_id = min(
-            supported_hypothesis_ids,
-            key=lambda hypothesis_id: (
-                self._primary_hypothesis_priority(
-                    project, hypotheses[hypothesis_id]
-                ),
-                plan.hypothesis_ids.index(hypothesis_id),
-            ),
-            default=None,
-        )
-        if primary_hypothesis_id is None:
+        if not supported_hypothesis_ids:
             raise InvalidTransitionError(
-                "预注册计划没有当前执行器可支持的主假设，请重新设计实验计划"
+                "预注册计划没有当前执行器可支持的创新点，请重新设计实验计划"
             )
-        if plan.hypothesis_ids == [primary_hypothesis_id] and set(
+        if plan.hypothesis_ids == supported_hypothesis_ids and set(
             plan.hypothesis_contracts
-        ) == {primary_hypothesis_id}:
+        ) == set(supported_hypothesis_ids):
             return []
 
         excluded_hypothesis_ids = [
             hypothesis_id
             for hypothesis_id in plan.hypothesis_ids
-            if hypothesis_id != primary_hypothesis_id
+            if hypothesis_id not in supported_hypothesis_ids
         ]
-        primary_contract = plan.hypothesis_contracts.get(primary_hypothesis_id)
-        if primary_contract is None:
-            primary_contract = hypotheses[primary_hypothesis_id].analysis_contract
-        if primary_contract is None:
-            raise InvalidTransitionError("主假设缺少分析契约")
-
-        plan.hypothesis_ids = [primary_hypothesis_id]
+        plan.hypothesis_ids = supported_hypothesis_ids
         plan.hypothesis_contracts = {
-            primary_hypothesis_id: primary_contract.model_copy(deep=True)
+            hypothesis_id: (
+                plan.hypothesis_contracts.get(hypothesis_id)
+                or hypotheses[hypothesis_id].analysis_contract
+            ).model_copy(deep=True)
+            for hypothesis_id in supported_hypothesis_ids
         }
         plan.preregistration_digest = self._plan_preregistration_digest(plan)
         project.record_event(
             actor="experiment_plan_scope_guard",
             action="scope_experiment_plan",
-            summary="预注册计划已限定为单一可执行主假设，与实际实验队列保持一致。",
+            summary="预注册计划已保留全部可执行创新点，每个创新点对应一个实验 Round。",
             payload={
-                "primary_hypothesis_id": primary_hypothesis_id,
+                "retained_hypothesis_ids": supported_hypothesis_ids,
                 "excluded_hypothesis_ids": excluded_hypothesis_ids,
             },
         )
@@ -751,6 +745,24 @@ class ResearchWorkflow:
         return not any(
             marker in name for name in names for marker in protocol_markers
         )
+
+    @staticmethod
+    def _contract_is_experimentable(
+        project: ResearchProject,
+        hypothesis: Hypothesis,
+    ) -> bool:
+        contract = hypothesis.analysis_contract
+        if contract is None or contract.kind not in {
+            "selection_main_effect",
+            "query_adaptation",
+        }:
+            return False
+        approved = BUILTIN_STRATEGIES | {
+            item.name
+            for item in project.method_implementations
+            if item.kind == "selection_strategy" and item.status == "approved"
+        }
+        return contract.treatment in approved and contract.control in approved
 
     @staticmethod
     def _primary_hypothesis_priority(
@@ -1039,6 +1051,7 @@ class ResearchWorkflow:
         project_id: str,
         *,
         dataset: DatasetManifest,
+        hypothesis_id: str,
         device: str = "cuda:0",
         detector: str = "anomalydino",
         max_rounds: int = 3,
@@ -1048,7 +1061,14 @@ class ResearchWorkflow:
         if project.stage != ResearchStage.EXPERIMENTS_QUEUED:
             raise InvalidTransitionError("Approve the preregistered plan before starting a loop")
         if project.experiment_campaign is not None:
-            raise InvalidTransitionError("The project already has an experiment campaign")
+            if project.experiment_campaign.status != "completed":
+                raise InvalidTransitionError(
+                    "The project already has an active experiment campaign"
+                )
+            project.experiment_campaign_history.append(
+                project.experiment_campaign.model_copy(deep=True)
+            )
+            project.experiment_campaign = None
         if project.experiment_plan is None:
             raise InvalidTransitionError("The project has no current experiment plan")
         current_plan_id = project.experiment_plan.id
@@ -1083,6 +1103,7 @@ class ResearchWorkflow:
                 project,
                 audit=audit,
                 dataset=dataset,
+                hypothesis_id=hypothesis_id,
                 device=device,
                 detector=detector,
                 max_rounds=max_rounds,
@@ -1098,8 +1119,8 @@ class ResearchWorkflow:
             actor="adaptive_experiment_planner",
             action="initialize_experiment_campaign",
             summary=(
-                "已用渐进式实验树替换一次性穷举队列；首轮仅冻结最小成对可行性实验，"
-                "后续单元将由真实结果驱动。"
+                "已建立创新点驱动的闭环实验队列；每个创新点对应一个 Round，"
+                "每个 Round 固定三次内部迭代，并在第 1 次迭代后接受一次用户指导。"
             ),
             payload={
                 "campaign_id": campaign.id,
@@ -1117,7 +1138,7 @@ class ResearchWorkflow:
         self,
         project_id: str,
         *,
-        user_guidance: str,
+        user_guidance: str | None = None,
     ) -> tuple[ExperimentRun, ExperimentGuidanceDecision]:
         """Interpret human advice and select only from the frozen current queue."""
 
@@ -1125,9 +1146,10 @@ class ResearchWorkflow:
         campaign = project.experiment_campaign
         if campaign is None or campaign.status != "active":
             raise InvalidTransitionError("The experiment campaign is not accepting runs")
-        guidance = user_guidance.strip()
+        guidance = (user_guidance or "").strip()
+        human_guidance = bool(guidance)
         if not guidance:
-            raise InvalidTransitionError("Guidance is required before a real experiment")
+            guidance = "系统按本 Round 已预注册的迭代顺序自动执行。"
         candidates = self.experiment_planner.queued_runs(project)
         if not candidates:
             raise ResultsRequiredError("No queued experiment is available in the current round")
@@ -1153,44 +1175,50 @@ class ResearchWorkflow:
                 },
             )
 
-        record = UserGuidanceRecord(
-            scope="experiment_execution",
-            target_action="execute_next_experiment",
-            text=guidance,
-            research_cycle=project.research_cycle,
-            round_id=campaign.rounds[-1].id,
-            advisor=decision.advisor,
-            interpretation=decision.interpretation,
-            disposition=decision.disposition,
-            rationale=decision.rationale,
-            selected_run_id=selected.id,
-            affected_ids=[selected.id],
-            protected_constraints=decision.protected_constraints,
-        )
-        project.guidance_records.append(record)
-        project.record_event(
-            actor="human_guidance_agent",
-            action="interpret_experiment_guidance",
-            summary=(
-                f"用户在真实运行前提交指导；AI Scientist 判定为 "
-                f"{decision.disposition}，选择 {selected.id}。"
-            ),
-            payload={
-                "guidance_id": record.id,
-                "guidance": guidance,
-                "decision": decision.model_dump(mode="json"),
-                "candidate_run_ids": [run.id for run in candidates],
-            },
-        )
+        if human_guidance:
+            record = UserGuidanceRecord(
+                scope="experiment_execution",
+                target_action="execute_next_experiment",
+                text=guidance,
+                research_cycle=project.research_cycle,
+                round_id=campaign.rounds[-1].id,
+                advisor=decision.advisor,
+                interpretation=decision.interpretation,
+                disposition=decision.disposition,
+                rationale=decision.rationale,
+                selected_run_id=selected.id,
+                affected_ids=[selected.id],
+                protected_constraints=decision.protected_constraints,
+            )
+            project.guidance_records.append(record)
+            project.record_event(
+                actor="human_guidance_agent",
+                action="interpret_experiment_guidance",
+                summary=(
+                    f"用户在真实运行前提交指导；AI Scientist 判定为 "
+                    f"{decision.disposition}，选择 {selected.id}。"
+                ),
+                payload={
+                    "guidance_id": record.id,
+                    "guidance": guidance,
+                    "decision": decision.model_dump(mode="json"),
+                    "candidate_run_ids": [run.id for run in candidates],
+                },
+            )
         self.repository.save(project)
         return selected, decision
 
-    async def review_experiment_round(self, project_id: str) -> ResearchProject:
+    async def review_experiment_round(
+        self,
+        project_id: str,
+        *,
+        user_guidance: str | None = None,
+    ) -> ResearchProject:
         project = self.repository.get(project_id)
         campaign = project.experiment_campaign
         if campaign is None:
             raise InvalidTransitionError("The project has no experiment campaign")
-        if campaign.status != "awaiting_feedback":
+        if campaign.status not in {"awaiting_guidance", "awaiting_feedback"}:
             raise ResultsRequiredError("The current experiment round is not ready for feedback")
 
         summary = self.experiment_planner.summarize_current_round(project)
@@ -1200,6 +1228,57 @@ class ResearchWorkflow:
             round_summary=summary,
             allowed_cells=allowed_cells,
         )
+        if campaign.status == "awaiting_guidance":
+            guidance = (user_guidance or "").strip()
+            if not guidance:
+                raise InvalidTransitionError("每个 Round 中途必须提交一次用户指导")
+            try:
+                new_runs = self.experiment_planner.apply_midpoint_guidance(
+                    project,
+                    proposal=proposal,
+                    summary=summary,
+                )
+            except ValueError as exc:
+                raise InvalidTransitionError(str(exc)) from exc
+            current = campaign.rounds[-1]
+            record = UserGuidanceRecord(
+                scope="round_iteration",
+                target_action="continue_round_iterations",
+                text=guidance,
+                research_cycle=project.research_cycle,
+                round_id=current.id,
+                advisor=proposal.advisor,
+                interpretation=(
+                    "该建议用于调整本 Round 第 2、3 次迭代的类别、K 与随机种子优先级。"
+                ),
+                disposition="applied",
+                rationale=proposal.rationale,
+                affected_ids=[run.id for run in new_runs],
+                protected_constraints=[
+                    "创新点与分析契约不变",
+                    "固定三次迭代",
+                    "测试标签不参与支持集选择",
+                ],
+            )
+            project.guidance_records.append(record)
+            project.runs.extend(new_runs)
+            project.status = ProjectStatus.WAITING_EXTERNAL
+            project.next_action = campaign.next_action
+            project.record_event(
+                actor="human_guidance_agent",
+                action="continue_round_iterations",
+                summary=(
+                    f"用户已在 Round {current.index} 中途提交唯一一次指导；"
+                    "系统已据此排定第 2、3 次自动迭代。"
+                ),
+                payload={
+                    "guidance_id": record.id,
+                    "guidance": guidance,
+                    "new_run_ids": [run.id for run in new_runs],
+                },
+            )
+            return self.repository.save(project)
+
         try:
             new_runs = self.experiment_planner.apply_feedback(
                 project,
@@ -1215,8 +1294,8 @@ class ResearchWorkflow:
             actor=proposal.advisor,
             action="review_experiment_round",
             summary=(
-                f"第 {summary['round_index']} 轮真实结果已反馈到规划器；"
-                f"决策={proposal.decision}，下一轮新增 {len(new_runs)} 次运行。"
+                f"Round {summary['round_index']} 的三次迭代已汇总；"
+                f"决策={proposal.decision}，下一创新点新增 {len(new_runs)} 次初始运行。"
             ),
             payload={
                 "round_summary": summary,
@@ -1359,8 +1438,6 @@ class ResearchWorkflow:
         if plan is None:
             return []
 
-        if len(plan.hypothesis_ids) != 1:
-            raise InvalidTransitionError("实验计划必须且只能绑定一个主假设")
         hypothesis_ids = plan.hypothesis_ids
         datasets = plan.datasets[:1]
         categories = plan.categories[:3]
@@ -1374,55 +1451,38 @@ class ResearchWorkflow:
             "strict_k_shot": ["random"],
             "pool_compression_m30": ["random", "k_center"],
         }
-        hypothesis = (
-            next(
-                (item for item in project.hypotheses if item.id == hypothesis_ids[0]),
-                None,
-            )
-            if hypothesis_ids
-            else None
-        )
-        contract = hypothesis.analysis_contract if hypothesis is not None else None
-        custom_pair = (
-            [contract.control, contract.treatment]
-            if contract is not None
-            and contract.kind in {"selection_main_effect", "query_adaptation"}
-            and (
-                contract.treatment not in BUILTIN_STRATEGIES
-                or contract.control not in BUILTIN_STRATEGIES
-            )
-            else None
-        )
         for protocol in plan.protocols:
-            strategies = custom_pair or protocol_strategies.get(
-                protocol, plan.selection_strategies[:2]
-            )
-            combinations = product(
-                hypothesis_ids,
-                datasets,
-                categories,
-                detectors,
-                shots,
-                seeds,
-                strategies,
-            )
-            for hypothesis_id, dataset, category, detector, shot, seed, strategy in combinations:
-                if len(runs) >= max_runs:
-                    return runs
-                runs.append(
-                    ExperimentRun(
-                        plan_id=plan.id,
-                        hypothesis_id=hypothesis_id,
-                        protocol=protocol,
-                        dataset=dataset,
-                        category=category,
-                        detector=detector,
-                        selection_strategy=strategy,
-                        shots=shot,
-                        seed=seed,
-                        status=RunStatus.QUEUED,
-                    )
+            # Interleave hypotheses so a bounded legacy feasibility queue still
+            # contains at least one evidence item for every approved innovation.
+            combinations = product(datasets, categories, detectors, shots, seeds, hypothesis_ids)
+            for dataset, category, detector, shot, seed, hypothesis_id in combinations:
+                hypothesis = next(
+                    (item for item in project.hypotheses if item.id == hypothesis_id),
+                    None,
                 )
+                contract = hypothesis.analysis_contract if hypothesis is not None else None
+                strategies = (
+                    [contract.control, contract.treatment]
+                    if contract is not None
+                    else protocol_strategies.get(protocol, plan.selection_strategies[:2])
+                )
+                for strategy in strategies:
+                    if len(runs) >= max_runs:
+                        return runs
+                    runs.append(
+                        ExperimentRun(
+                            plan_id=plan.id,
+                            hypothesis_id=hypothesis_id,
+                            protocol=protocol,
+                            dataset=dataset,
+                            category=category,
+                            detector=detector,
+                            selection_strategy=strategy,
+                            shots=shot,
+                            seed=seed,
+                            status=RunStatus.QUEUED,
+                        )
+                    )
         return runs
 
     @staticmethod
@@ -1571,8 +1631,8 @@ class ResearchWorkflow:
             )
 
     @staticmethod
-    def _ensure_executable_core_hypothesis(project: ResearchProject) -> None:
-        """Operationalize the team research brief without changing its scientific claim."""
+    def _ensure_executable_hypotheses(project: ResearchProject) -> None:
+        """Normalize every supported innovation without inventing a replacement claim."""
 
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
@@ -1619,71 +1679,23 @@ class ResearchWorkflow:
                         ),
                         payload={"hypothesis_id": hypothesis.id, "original": original},
                     )
-                return
+                continue
 
-        selected_gap = next(
-            (gap for gap in project.gaps if gap.status == "selected"),
-            project.gaps[0] if project.gaps else None,
-        )
-        if selected_gap is None:
-            raise InvalidTransitionError(
-                "A research gap is required to operationalize the experiment hypothesis"
+        executable = [
+            hypothesis
+            for hypothesis in project.hypotheses
+            if hypothesis.execution_readiness == "executable"
+            or any(
+                implementation.hypothesis_id == hypothesis.id
+                and implementation.kind == "selection_strategy"
+                and implementation.status in {"validated", "approved"}
+                for implementation in project.method_implementations
             )
-        core = Hypothesis(
-            gap_id=selected_gap.id,
-            title="正常参考样本的代表性是否比数量更重要",
-            claim=(
-                "在候选正常样本池固定且 K≤8 时，DINOv2 特征空间的 k-center 覆盖选样"
-                "相较随机选样，将提高 AnomalyDINO 的 Image AUROC，并降低跨支持集重采样波动。"
-            ),
-            null_hypothesis=(
-                "在相同类别、K、候选池和随机种子下，k-center 与 random 的 Image AUROC"
-                "成对差异为零，且稳定性没有改善。"
-            ),
-            rationale=(
-                "团队阶段性调研将正常样本代表性确定为主问题；该对照可直接在 MVTec AD"
-                "正常训练图像上实施，不使用测试异常参与选择。"
-            ),
-            independent_variables=["支持集选择策略", "K", "类别", "随机种子"],
-            dependent_variables=[
-                "Image AUROC",
-                "Pixel AUROC",
-                "跨支持集标准差",
-                "特征覆盖半径",
-            ],
-            predicted_direction=(
-                "k-center 的平均成对效应为正，且覆盖半径与性能损失或波动正相关。"
-            ),
-            falsification_conditions=[
-                "达到预注册最小配对数后，Image AUROC 成对效应置信区间仍包含零且效应可忽略",
-                "收益无法跨至少三个 MVTec 类别复现",
-                "覆盖半径改善但检测性能与稳定性不随之改善",
-            ],
-            evidence_ids=[item.id for item in project.evidence],
-            closest_prior_work=[
-                item.title
-                for item in project.evidence
-                if any(name in item.title.casefold() for name in ("patchcore", "anomalydino"))
-            ],
-            analysis_contract=AnalysisContract(
-                kind="selection_main_effect",
-                metric="image_auroc",
-                treatment="k_center",
-                control="random",
-                minimum_pairs=6,
-            ),
-            status=HypothesisStatus.SHORTLISTED,
-        )
-        project.hypotheses.append(core)
-        project.record_event(
-            actor="research_brief_operationalizer",
-            action="register_core_experiment_hypothesis",
-            summary=(
-                "现有候选中没有可由当前真实工具链直接检验的支持集选择主效应；"
-                "系统已把团队调研确定的核心问题注册为可证伪实验假设。"
-            ),
-            payload={"hypothesis_id": core.id},
-        )
+        ]
+        if not executable:
+            raise InvalidTransitionError(
+                "当前创新点都需要先实现方法适配器；系统不会替换成无关假设。"
+            )
 
 
 def _evidence_key(item: EvidenceRecord) -> str:

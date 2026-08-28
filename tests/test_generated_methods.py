@@ -182,6 +182,7 @@ def test_generate_replaces_builtin_strategy_and_syncs_plan(tmp_path: Path) -> No
     campaign_project = workflow.initialize_experiment_campaign(
         approved.id,
         dataset=dataset,
+        hypothesis_id=hypothesis.id,
         max_rounds=3,
         max_runs=6,
     )
@@ -791,6 +792,17 @@ def test_campaign_initializes_with_generated_detector(tmp_path: Path) -> None:
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=next(
+            item.id
+            for item in project.hypotheses
+            if item.id
+            in (
+                project.experiment_plan.hypothesis_ids
+                if project.experiment_plan
+                else []
+            )
+            and item.execution_readiness == "executable"
+        ),
         detector=implementation.name,
         max_rounds=3,
         max_runs=6,
@@ -825,6 +837,7 @@ def test_campaign_rejects_unapproved_generated_detector(tmp_path: Path) -> None:
         workflow.initialize_experiment_campaign(
             project.id,
             dataset=dataset,
+            hypothesis_id=hypothesis.id,
             detector=implementation.name,
             max_rounds=3,
             max_runs=6,
@@ -852,6 +865,7 @@ def test_campaign_uses_approved_custom_strategy(tmp_path: Path) -> None:
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=hypothesis.id,
         max_rounds=3,
         max_runs=6,
     )
@@ -876,6 +890,17 @@ def test_campaign_skips_validated_but_unapproved_strategy(tmp_path: Path) -> Non
     project = workflow.initialize_experiment_campaign(
         project.id,
         dataset=dataset,
+        hypothesis_id=next(
+            item.id
+            for item in project.hypotheses
+            if item.id
+            in (
+                project.experiment_plan.hypothesis_ids
+                if project.experiment_plan
+                else []
+            )
+            and item.execution_readiness == "executable"
+        ),
         max_rounds=3,
         max_runs=6,
     )
@@ -1086,6 +1111,7 @@ def test_api_campaign_initialize_accepts_generated_detector_name(tmp_path: Path)
         f"/api/v1/projects/{project_id}/experiment-campaign/initialize",
         json={
             "dataset_manifest_path": manifest_path,
+            "hypothesis_id": approved.json()["experiment_plan"]["hypothesis_ids"][0],
             "detector": implementation["name"],
             "device": "cpu",
             "max_rounds": 3,

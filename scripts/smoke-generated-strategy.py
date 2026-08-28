@@ -95,6 +95,7 @@ def main() -> None:
         project = workflow.initialize_experiment_campaign(
             project.id,
             dataset=dataset,
+            hypothesis_id=hypothesis.id,
             detector="anomalydino",
             max_rounds=3,
             max_runs=8,

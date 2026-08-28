@@ -33,10 +33,10 @@ Updated: 2026-08-10
 - [x] Persistent adaptive campaign/round/node/run model with information-gain-per-cost ordering.
 - [x] Server-validated Qwen feedback actions and result-driven next-round construction.
 - [x] Direction-B React experiment console with dataset audit, loop rail, round summaries, efficiency, execution controls, and ledger trace.
-- [x] Three-round, 12-run real MVTec campaign on the local RTX 4060.
+- [x] Historical three-round, 12-run real MVTec campaign on the local RTX 4060 (legacy single-hypothesis protocol).
 - [x] Two live Qwen replanning decisions over real results: bottle → cable/capsule → transistor plus validator-filled carpet boundary test.
 - [x] Formal paired bootstrap/sign-permutation analysis over six registered pairs.
-- [x] Human-guidance gates before every real run and before each evidence-driven research-cycle restart.
+- [x] One human-guidance gate after iteration 1 of every innovation Round; research-cycle restart still has its own guidance gate.
 - [x] Qwen guidance interpretation with server-side queued-Run validation and immutable Research Ledger records.
 - [x] Campaign history rollover so a second research cycle preserves all earlier runs and negative findings.
 - [x] Physical frontend/backend separation: `frontend/` and `backend/`, with independent startup and build paths.
@@ -61,6 +61,8 @@ Updated: 2026-08-10
 - Synthetic smoke run `run_ab29f3f191c2` completed on CUDA. Its deliberately easy synthetic metrics are integration diagnostics only and are excluded from scientific findings.
 
 ## Validation snapshot
+
+> 下方真实活动记录来自旧版“一个主假设、多轮扩展”协议；当前实现采用“每个创新点一个 Round、每个 Round 三次内部迭代”。
 
 - Backend: 26 tests passed.
 - Static analysis: Ruff passed for `src`, `tests`, and `scripts`.

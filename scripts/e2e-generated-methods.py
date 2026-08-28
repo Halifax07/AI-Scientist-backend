@@ -24,8 +24,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw
 
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.api.app import create_app
@@ -126,7 +126,13 @@ def main() -> None:
                 },
             )
         )
-        _emit({"event": "project_created", "project_id": project["id"], "storage": str(storage_path)})
+        _emit(
+            {
+                "event": "project_created",
+                "project_id": project["id"],
+                "storage": str(storage_path),
+            }
+        )
 
         while project["stage"] != "awaiting_experiment_approval":
             project = _checked(client.post(f"/api/v1/projects/{project['id']}/advance"))
@@ -213,7 +219,13 @@ def main() -> None:
         if detector["name"] not in plan.detectors:
             plan.detectors.append(detector["name"])
         repository.save(draft)
-        _emit({"event": "plan_registered", "hypothesis_ids": plan.hypothesis_ids, "detectors": plan.detectors})
+        _emit(
+            {
+                "event": "plan_registered",
+                "hypothesis_ids": plan.hypothesis_ids,
+                "detectors": plan.detectors,
+            }
+        )
 
         # 4) Human approval gate; implementations move to approved here.
         project = _checked(
@@ -249,6 +261,7 @@ def main() -> None:
                 f"/api/v1/projects/{project['id']}/experiment-campaign/initialize",
                 json={
                     "dataset_manifest_path": manifest_path,
+                    "hypothesis_id": hypothesis["id"],
                     "detector": detector["name"],
                     "device": "cpu",
                     "max_rounds": 3,
@@ -352,7 +365,12 @@ def main() -> None:
                     "error": execution["error"],
                 }
             )
-            _emit({"event": "run_executed", **{k: v for k, v in completed[-1].items() if k != "metrics"}})
+            _emit(
+                {
+                    "event": "run_executed",
+                    **{k: v for k, v in completed[-1].items() if k != "metrics"},
+                }
+            )
             if len(completed) >= 2 and all(
                 item["status"] != "succeeded" for item in completed[-2:]
             ):

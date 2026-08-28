@@ -50,6 +50,7 @@ class AdaptiveExperimentPlanner:
         *,
         audit: DatasetAuditRecord,
         dataset: DatasetManifest,
+        hypothesis_id: str,
         device: str,
         detector: str = "anomalydino",
         max_rounds: int = 3,
@@ -66,7 +67,15 @@ class AdaptiveExperimentPlanner:
                 "；自定义检测器需先生成实现并获批准"
             )
 
-        hypothesis = self._select_hypothesis(project)
+        hypothesis = self._select_hypothesis(project, hypothesis_id=hypothesis_id)
+        hypothesis_ids = [
+            hypothesis.id,
+            *[
+                item.id
+                for item in self._eligible_hypotheses(project)
+                if item.id != hypothesis.id
+            ],
+        ]
         contract = hypothesis.analysis_contract
         if contract is None:
             raise ValueError("The selected hypothesis has no analysis contract")
@@ -89,19 +98,43 @@ class AdaptiveExperimentPlanner:
         seeds = sorted(set(plan.seeds))
         if not shots or not seeds:
             raise ValueError("The experiment plan must contain at least one K and one seed")
+        if len(categories) * len(shots) * len(seeds) < 3:
+            raise ValueError(
+                "Each innovation Round needs at least three distinct registered cells "
+                "for its three internal iterations"
+            )
 
-        effective_max_runs = min(max_runs, project.spec.budget.max_experiments)
-        if effective_max_runs < 2:
-            raise ValueError("The adaptive campaign requires budget for one paired experiment")
+        historical_campaign_runs = sum(
+            run.round_id is not None and run.plan_id == plan.id for run in project.runs
+        )
+        remaining_run_budget = project.spec.budget.max_experiments - historical_campaign_runs
+        effective_max_runs = min(max_runs, remaining_run_budget)
+        if effective_max_runs < 6:
+            raise ValueError(
+                "The remaining project budget cannot fund one innovation Round (6 runs)"
+            )
+        # A complete Round consumes exactly three paired iterations.  Never
+        # promise more innovation rounds than the frozen project budget can fund.
+        round_capacity = min(
+            len(hypothesis_ids),
+            max_rounds,
+            effective_max_runs // 6,
+        )
+        hypothesis_ids = hypothesis_ids[: max(1, round_capacity)]
         initial_k = 2 if 2 in shots else shots[0]
-        initial_seeds = seeds[: min(2, effective_max_runs // 2)]
+        # A Round is one innovation.  Its first experimental iteration is
+        # executed before the single human midpoint-guidance gate.
+        initial_seeds = seeds[:1]
         initial_cells = [
             ExperimentCell(category=categories[0], shots=initial_k, seed=seed)
             for seed in initial_seeds
         ]
-        exhaustive_run_count = len(categories) * len(shots) * len(seeds) * 2
+        exhaustive_run_count = (
+            len(hypothesis_ids) * len(categories) * len(shots) * len(seeds) * 2
+        )
         campaign = ExperimentCampaign(
             hypothesis_id=hypothesis.id,
+            hypothesis_ids=hypothesis_ids,
             dataset_audit_id=audit.id,
             dataset_manifest_path=audit.manifest_path,
             dataset_digest=audit.digest,
@@ -112,7 +145,7 @@ class AdaptiveExperimentPlanner:
             control=contract.control,
             metric=contract.metric,
             device=device,
-            max_rounds=max_rounds,
+            max_rounds=len(hypothesis_ids),
             max_runs=effective_max_runs,
             exhaustive_run_count=exhaustive_run_count,
         )
@@ -123,14 +156,15 @@ class AdaptiveExperimentPlanner:
             phase="feasibility",
             objective="验证真实数据、特征、支持集选择和检测器链路，并获得首批成对效应。",
             rationale=(
-                f"先在 bottle、K=2 和两个随机种子上比较 {contract.control} 与 "
+                f"先在 bottle、K=2 和一个随机种子上比较 {contract.control} 与 "
                 f"{contract.treatment}，并使用 {detector} 执行检测；"
-                "用四次真实运行换取端到端可行性和初始效应信息。"
+                "用一组成对真实运行换取端到端可行性和初始效应信息。"
             ),
             cells=initial_cells,
             information_gain=0.90,
             falsification_value=0.80,
             parent_id=None,
+            hypothesis_id=hypothesis.id,
         )
         campaign.rounds.append(first_round)
         campaign.nodes.extend(nodes)
@@ -153,7 +187,7 @@ class AdaptiveExperimentPlanner:
             raise ValueError(f"Unknown experiment round: {round_id}")
         runs_by_id = {run.id: run for run in project.runs}
         runs = [runs_by_id[run_id] for run_id in current.run_ids if run_id in runs_by_id]
-        metric = campaign.metric
+        metric = current.metric
         grouped: dict[tuple[str, int, int], dict[str, ExperimentRun]] = defaultdict(dict)
         failed_run_ids: list[str] = []
         duration_seconds = 0.0
@@ -168,8 +202,8 @@ class AdaptiveExperimentPlanner:
         by_category: dict[str, list[float]] = defaultdict(list)
         paired_metrics: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for (category, shots, seed), strategies in sorted(grouped.items()):
-            treatment = strategies.get(campaign.treatment)
-            control = strategies.get(campaign.control)
+            treatment = strategies.get(current.treatment)
+            control = strategies.get(current.control)
             if treatment is None or control is None:
                 continue
             common_metrics = sorted(set(treatment.metrics) & set(control.metrics))
@@ -192,7 +226,7 @@ class AdaptiveExperimentPlanner:
                 }
             )
 
-        hypothesis = self._hypothesis(project, campaign.hypothesis_id)
+        hypothesis = self._hypothesis(project, current.hypothesis_id)
         minimum_pairs = (
             hypothesis.analysis_contract.minimum_pairs
             if hypothesis.analysis_contract is not None
@@ -207,7 +241,7 @@ class AdaptiveExperimentPlanner:
         for run in project.runs:
             if (
                 run.round_id is not None
-                and run.hypothesis_id == campaign.hypothesis_id
+                and run.hypothesis_id == current.hypothesis_id
                 and run.status == RunStatus.SUCCEEDED
                 and run.verified
                 and metric in run.metrics
@@ -216,10 +250,10 @@ class AdaptiveExperimentPlanner:
                     run.selection_strategy
                 ] = run
         cumulative_differences = [
-            strategies[campaign.treatment].metrics[metric]
-            - strategies[campaign.control].metrics[metric]
+            strategies[current.treatment].metrics[metric]
+            - strategies[current.control].metrics[metric]
             for strategies in campaign_pair_runs.values()
-            if campaign.treatment in strategies and campaign.control in strategies
+            if current.treatment in strategies and current.control in strategies
         ]
         cumulative_pair_count = len(cumulative_differences)
         mean_difference = fmean(item["difference"] for item in differences) if differences else None
@@ -240,6 +274,8 @@ class AdaptiveExperimentPlanner:
         return {
             "round_id": current.id,
             "round_index": current.index,
+            "hypothesis_id": current.hypothesis_id,
+            "completed_iterations": current.completed_iterations,
             "phase": current.phase,
             "metric": metric,
             "planned_runs": len(runs),
@@ -293,8 +329,15 @@ class AdaptiveExperimentPlanner:
             "exhaustive_run_count": campaign.exhaustive_run_count,
         }
 
-    def allowed_next_cells(self, project: ResearchProject) -> list[ExperimentCell]:
+    def allowed_next_cells(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis_id: str | None = None,
+    ) -> list[ExperimentCell]:
         campaign = self._campaign(project)
+        current = campaign.rounds[-1]
+        target_hypothesis_id = hypothesis_id or current.hypothesis_id
         plan = project.experiment_plan
         if plan is None:
             return []
@@ -308,7 +351,7 @@ class AdaptiveExperimentPlanner:
         used = {
             (run.category, run.shots, run.seed)
             for run in project.runs
-            if run.round_id is not None and run.hypothesis_id == campaign.hypothesis_id
+            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
         }
         candidates = [
             ExperimentCell(category=category, shots=shots, seed=seed)
@@ -319,9 +362,15 @@ class AdaptiveExperimentPlanner:
         ]
         # Prefer replication breadth, then K sensitivity, before accumulating seeds.
         current_categories = {
-            run.category for run in project.runs if run.round_id is not None
+            run.category
+            for run in project.runs
+            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
         }
-        current_shots = {run.shots for run in project.runs if run.round_id is not None}
+        current_shots = {
+            run.shots
+            for run in project.runs
+            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
+        }
         return sorted(
             candidates,
             key=lambda cell: (
@@ -332,6 +381,69 @@ class AdaptiveExperimentPlanner:
                 cell.shots,
             ),
         )
+
+    def apply_midpoint_guidance(
+        self,
+        project: ResearchProject,
+        *,
+        proposal: ExperimentFeedbackProposal,
+        summary: dict[str, Any],
+    ) -> list[ExperimentRun]:
+        """Schedule iterations 2 and 3 inside the same innovation Round."""
+
+        campaign = self._campaign(project)
+        current = campaign.rounds[-1]
+        if campaign.status != "awaiting_guidance" or current.status != "awaiting_guidance":
+            raise ValueError("The current round is not waiting for midpoint guidance")
+        allowed = self.allowed_next_cells(project)
+        allowed_by_key = {
+            (item.category, item.shots, item.seed): item for item in allowed
+        }
+        selected: list[ExperimentCell] = []
+        for item in proposal.recommended_cells:
+            key = (item.category, item.shots, item.seed)
+            if key in allowed_by_key and allowed_by_key[key] not in selected:
+                selected.append(allowed_by_key[key])
+            if len(selected) == 2:
+                break
+        for item in allowed:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) == 2:
+                break
+        if len(selected) != 2:
+            raise ValueError("The preregistered search space cannot fund three iterations")
+
+        _, nodes, runs = self._build_round(
+            project,
+            campaign=campaign,
+            index=current.index,
+            phase=current.phase,
+            objective=current.objective,
+            rationale=current.rationale,
+            cells=selected,
+            information_gain=proposal.expected_information_gain,
+            falsification_value=0.85,
+            parent_id=current.node_ids[-1] if current.node_ids else None,
+            hypothesis_id=current.hypothesis_id,
+            iteration_start=2,
+        )
+        for node in nodes:
+            node.round_id = current.id
+        for run in runs:
+            run.round_id = current.id
+        current.node_ids.extend(node.id for node in nodes)
+        current.run_ids.extend(run.id for run in runs)
+        current.guidance_received = True
+        current.feedback = proposal
+        current.result_summary = summary
+        current.status = "planned"
+        current.efficiency["planned_runs"] = len(current.run_ids)
+        campaign.nodes.extend(nodes)
+        campaign.status = "active"
+        campaign.next_action = "execute_remaining_round_iterations"
+        self._refresh_efficiency(campaign, project=project, additional_runs=len(runs))
+        return runs
 
     def apply_feedback(
         self,
@@ -344,114 +456,53 @@ class AdaptiveExperimentPlanner:
         current = campaign.rounds[-1]
         if current.status != "ready_for_feedback":
             raise ValueError("The current round is not ready for feedback")
-
-        allowed = self.allowed_next_cells(project)
-        allowed_keys = {(cell.category, cell.shots, cell.seed) for cell in allowed}
-        remaining_pairs = max((campaign.max_runs - self._campaign_run_count(project)) // 2, 0)
-        selected: list[ExperimentCell] = []
-        for cell in proposal.recommended_cells:
-            key = (cell.category, cell.shots, cell.seed)
-            if key in allowed_keys and key not in {
-                (item.category, item.shots, item.seed) for item in selected
-            }:
-                selected.append(cell)
-            if len(selected) >= min(2, remaining_pairs):
-                break
-
-        minimum_pairs = int(summary.get("minimum_pairs", 6))
-        enough_evidence = int(summary.get("pair_count", 0)) >= minimum_pairs
-        if proposal.stop and not enough_evidence:
-            proposal = proposal.model_copy(
-                deep=True,
-                update={
-                    "decision": "expand",
-                    "next_phase": "replication",
-                    "stop": False,
-                    "rationale": (
-                        proposal.rationale
-                        + " 系统否决了提前停止：尚未达到预注册最小成对样本数。"
-                    ),
-                },
-            )
-        exhausted = (
-            campaign.current_round >= campaign.max_rounds
-            or remaining_pairs == 0
-            or not allowed
-        )
-        should_stop = proposal.stop and enough_evidence
-        target_cells = min(2, remaining_pairs)
-        accepted_recommendation_count = len(selected)
-        if not should_stop and not exhausted and len(selected) < target_cells:
-            selected_keys = {
-                (item.category, item.shots, item.seed) for item in selected
-            }
-            for cell in allowed:
-                key = (cell.category, cell.shots, cell.seed)
-                if key not in selected_keys:
-                    selected.append(cell)
-                    selected_keys.add(key)
-                if len(selected) >= target_cells:
-                    break
-        if not should_stop:
-            proposal = proposal.model_copy(
-                deep=True,
-                update={"recommended_cells": selected},
-            )
-
         current.feedback = proposal
         current.result_summary = summary
         current.status = "completed"
         current.completed_at = utc_now()
         self._update_nodes_for_round(campaign, current, project, summary)
 
-        if should_stop or exhausted:
+        next_index = current.index + 1
+        if next_index > len(campaign.hypothesis_ids):
             campaign.status = "completed"
             campaign.next_action = "analyze_verified_results"
-            if should_stop:
-                campaign.termination_reason = "advisor_stop_after_minimum_pairs"
-            elif campaign.current_round >= campaign.max_rounds:
-                campaign.termination_reason = "maximum_rounds_reached"
-            elif remaining_pairs == 0:
-                campaign.termination_reason = "run_budget_exhausted"
-            else:
-                campaign.termination_reason = "allowed_search_space_exhausted"
+            campaign.termination_reason = "all_innovation_rounds_completed"
             campaign.completed_at = utc_now()
             self._refresh_efficiency(campaign, project=project)
             return []
 
-        if not selected:
+        remaining_runs = campaign.max_runs - self._campaign_run_count(project)
+        if remaining_runs < 6:
             campaign.status = "completed"
             campaign.next_action = "analyze_verified_results"
-            campaign.termination_reason = "no_valid_next_experiment"
+            campaign.termination_reason = "run_budget_exhausted_before_next_innovation"
             campaign.completed_at = utc_now()
             self._refresh_efficiency(campaign, project=project)
             return []
-
-        phase = self._validated_next_phase(proposal.next_phase)
+        next_hypothesis_id = campaign.hypothesis_ids[next_index - 1]
+        next_hypothesis = self._hypothesis(project, next_hypothesis_id)
+        next_contract = next_hypothesis.analysis_contract
+        if next_contract is None:
+            raise ValueError("The next innovation has no analysis contract")
+        allowed = self.allowed_next_cells(project, hypothesis_id=next_hypothesis_id)
+        if not allowed:
+            raise ValueError("No experiment cell is available for the next innovation")
         parent_id = current.node_ids[0] if current.node_ids else None
-        next_index = campaign.current_round + 1
-        selected_summary = "；".join(
-            f"{cell.category}，K={cell.shots}，seed={cell.seed}" for cell in selected
-        )
-        scheduling_note = (
-            "原建议中的可执行单元不足，系统按预注册边界回退；实际排期："
-            if accepted_recommendation_count < len(selected)
-            else "实际排期："
-        )
-        next_round_rationale = (
-            f"{proposal.rationale} {scheduling_note}{selected_summary}。"
-        )
         next_round, nodes, runs = self._build_round(
             project,
             campaign=campaign,
             index=next_index,
-            phase=phase,
-            objective=self._objective_for(proposal.decision, campaign.metric),
-            rationale=next_round_rationale,
-            cells=selected,
-            information_gain=proposal.expected_information_gain,
-            falsification_value=0.90 if proposal.decision == "diagnose" else 0.75,
+            phase="feasibility",
+            objective=f"验证创新点 H{next_index}：{next_hypothesis.title}",
+            rationale=(
+                "上一创新点已完成三次自动迭代。现在切换到下一创新点，并先执行"
+                f"第 1 次迭代；比较 {next_contract.treatment} 与 {next_contract.control}。"
+            ),
+            cells=[allowed[0]],
+            information_gain=0.9,
+            falsification_value=0.85,
             parent_id=parent_id,
+            hypothesis_id=next_hypothesis_id,
         )
         campaign.current_round = next_index
         campaign.rounds.append(next_round)
@@ -490,10 +541,16 @@ class AdaptiveExperimentPlanner:
         if runs and all(
             run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED} for run in runs
         ):
-            current.status = "ready_for_feedback"
+            current.completed_iterations = len(current.node_ids)
             current.completed_at = utc_now()
-            campaign.status = "awaiting_feedback"
-            campaign.next_action = "analyze_round_and_plan_next"
+            if current.completed_iterations == 1 and not current.guidance_received:
+                current.status = "awaiting_guidance"
+                campaign.status = "awaiting_guidance"
+                campaign.next_action = "collect_midpoint_guidance"
+            else:
+                current.status = "ready_for_feedback"
+                campaign.status = "awaiting_feedback"
+                campaign.next_action = "analyze_round_and_advance_innovation"
         elif any(run.status == RunStatus.RUNNING for run in runs):
             current.status = "running"
             current.started_at = current.started_at or utc_now()
@@ -590,19 +647,31 @@ class AdaptiveExperimentPlanner:
         information_gain: float,
         falsification_value: float,
         parent_id: str | None,
+        hypothesis_id: str | None = None,
+        iteration_start: int = 1,
     ) -> tuple[ExperimentRound, list[ExperimentNodeRecord], list[ExperimentRun]]:
         plan = project.experiment_plan
         if plan is None:
             raise ValueError("Experiment plan is missing")
+        round_hypothesis_id = hypothesis_id or campaign.hypothesis_id
+        hypothesis = self._hypothesis(project, round_hypothesis_id)
+        contract = hypothesis.analysis_contract
+        if contract is None or not self._contract_is_executable(project, contract):
+            raise ValueError(f"Hypothesis is not executable: {round_hypothesis_id}")
+        campaign.hypothesis_id = round_hypothesis_id
+        campaign.treatment = contract.treatment
+        campaign.control = contract.control
+        campaign.metric = contract.metric
         round_id = new_id("round")
         nodes: list[ExperimentNodeRecord] = []
         runs: list[ExperimentRun] = []
-        for cell in cells:
+        for cell_offset, cell in enumerate(cells):
+            iteration = min(iteration_start + cell_offset, 3)
             node_id = new_id("experiment_node")
             cost = 2.0
             priority_node = ExperimentNode(
                 id=node_id,
-                hypothesis_id=campaign.hypothesis_id,
+                hypothesis_id=round_hypothesis_id,
                 phase=ExperimentPhase(phase),
                 parent_id=parent_id,
                 information_gain=max(min(information_gain, 1.0), 0.0),
@@ -613,7 +682,7 @@ class AdaptiveExperimentPlanner:
             node_runs = [
                 ExperimentRun(
                     plan_id=plan.id,
-                    hypothesis_id=campaign.hypothesis_id,
+                    hypothesis_id=round_hypothesis_id,
                     protocol=campaign.protocol,
                     dataset="MVTec AD",
                     category=cell.category,
@@ -621,6 +690,7 @@ class AdaptiveExperimentPlanner:
                     selection_strategy=strategy,
                     shots=cell.shots,
                     seed=cell.seed,
+                    iteration=iteration,
                     round_id=round_id,
                     node_id=node_id,
                     phase=phase,
@@ -632,6 +702,7 @@ class AdaptiveExperimentPlanner:
                 ExperimentNodeRecord(
                     id=node_id,
                     round_id=round_id,
+                    iteration=iteration,
                     parent_id=parent_id,
                     phase=phase,
                     objective=(
@@ -654,6 +725,10 @@ class AdaptiveExperimentPlanner:
             phase=phase,
             objective=objective,
             rationale=rationale,
+            hypothesis_id=round_hypothesis_id,
+            treatment=contract.treatment,
+            control=contract.control,
+            metric=contract.metric,
             node_ids=[node.id for node in nodes],
             run_ids=[run.id for run in runs],
             efficiency={"planned_runs": len(runs)},
@@ -684,7 +759,12 @@ class AdaptiveExperimentPlanner:
         return contract.treatment in approved and contract.control in approved
 
     @classmethod
-    def _select_hypothesis(cls, project: ResearchProject) -> Hypothesis:
+    def _select_hypothesis(
+        cls,
+        project: ResearchProject,
+        *,
+        hypothesis_id: str,
+    ) -> Hypothesis:
         approved_hypothesis_ids = (
             project.experiment_plan.hypothesis_ids if project.experiment_plan else []
         )
@@ -694,6 +774,7 @@ class AdaptiveExperimentPlanner:
             if hypothesis.analysis_contract is not None
             and cls._contract_is_executable(project, hypothesis.analysis_contract)
             and hypothesis.id in approved_hypothesis_ids
+            and hypothesis.id == hypothesis_id
         ]
         eligible.sort(
             key=lambda item: (
@@ -703,10 +784,22 @@ class AdaptiveExperimentPlanner:
         )
         if not eligible:
             raise ValueError(
-                "The approved plan has no executable paired hypothesis"
-                "（random/k_center 或已批准的自定义策略）"
+                "The selected innovation is not approved or executable by the current toolchain "
+                "(random/k_center or an approved custom strategy)"
             )
         return eligible[0]
+
+    @classmethod
+    def _eligible_hypotheses(cls, project: ResearchProject) -> list[Hypothesis]:
+        approved_ids = project.experiment_plan.hypothesis_ids if project.experiment_plan else []
+        by_id = {item.id: item for item in project.hypotheses}
+        return [
+            by_id[hypothesis_id]
+            for hypothesis_id in approved_ids
+            if hypothesis_id in by_id
+            and by_id[hypothesis_id].analysis_contract is not None
+            and cls._contract_is_executable(project, by_id[hypothesis_id].analysis_contract)
+        ]
 
     @staticmethod
     def _approved_categories(
@@ -721,7 +814,23 @@ class AdaptiveExperimentPlanner:
     def _campaign(project: ResearchProject) -> ExperimentCampaign:
         if project.experiment_campaign is None:
             raise ValueError("The project has no active experiment campaign")
-        return project.experiment_campaign
+        campaign = project.experiment_campaign
+        # Backfill fields introduced by the innovation-per-round protocol for
+        # projects created by the previous single-hypothesis version.
+        if not campaign.hypothesis_ids and campaign.hypothesis_id:
+            campaign.hypothesis_ids = [campaign.hypothesis_id]
+        for experiment_round in campaign.rounds:
+            if not experiment_round.hypothesis_id:
+                experiment_round.hypothesis_id = campaign.hypothesis_id
+            if not experiment_round.treatment:
+                experiment_round.treatment = campaign.treatment
+            if not experiment_round.control:
+                experiment_round.control = campaign.control
+            if not experiment_round.metric:
+                experiment_round.metric = campaign.metric
+            if experiment_round.iteration_target < 3:
+                experiment_round.iteration_target = 3
+        return campaign
 
     @staticmethod
     def _hypothesis(project: ResearchProject, hypothesis_id: str) -> Hypothesis:
@@ -781,13 +890,13 @@ class AdaptiveExperimentPlanner:
                 else "failed"
             )
             node.result_summary = {
-                "metric": campaign.metric,
+                "metric": experiment_round.metric,
                 "runs": [
                     {
                         "run_id": run.id,
                         "strategy": run.selection_strategy,
                         "status": run.status,
-                        "value": run.metrics.get(campaign.metric),
+                        "value": run.metrics.get(experiment_round.metric),
                     }
                     for run in node_runs
                 ],

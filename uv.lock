@@ -752,6 +752,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "openai" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pypdf" },
@@ -782,6 +783,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "scikit-learn" },
 ]
 experiment = [
     { name = "mlflow" },
@@ -791,7 +793,6 @@ experiment = [
 ]
 vision = [
     { name = "numpy" },
-    { name = "pillow" },
     { name = "torch" },
     { name = "torchvision", version = "0.24.1", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'aarch64' and platform_python_implementation == 'CPython' and sys_platform == 'linux'" },
     { name = "torchvision", version = "0.24.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 'aarch64' or platform_python_implementation != 'CPython' or sys_platform != 'linux'" },
@@ -815,7 +816,7 @@ requires-dist = [
     { name = "opencv-python", marker = "extra == 'detectors'", specifier = ">=4.10,<5" },
     { name = "pandas", marker = "extra == 'detectors'", specifier = ">=2.2,<4" },
     { name = "pandas", marker = "extra == 'experiment'", specifier = ">=2.2,<4" },
-    { name = "pillow", marker = "extra == 'vision'", specifier = ">=11,<13" },
+    { name = "pillow", specifier = ">=11,<13" },
     { name = "pretrainedmodels", marker = "extra == 'detectors'", specifier = ">=0.7,<1" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
@@ -826,6 +827,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
     { name = "scikit-image", marker = "extra == 'detectors'", specifier = ">=0.24,<1" },
     { name = "scikit-learn", marker = "extra == 'detectors'", specifier = ">=1.6,<2" },
+    { name = "scikit-learn", marker = "extra == 'dev'", specifier = ">=1.6,<2" },
     { name = "scikit-learn", marker = "extra == 'experiment'", specifier = ">=1.6,<2" },
     { name = "scipy", marker = "extra == 'detectors'", specifier = ">=1.14,<2" },
     { name = "tifffile", marker = "extra == 'detectors'", specifier = ">=2024,<2027" },

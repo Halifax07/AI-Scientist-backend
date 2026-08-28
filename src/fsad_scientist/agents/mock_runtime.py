@@ -12,12 +12,12 @@ from fsad_scientist.domain.models import (
     AnalysisFinding,
     ArtifactRecord,
     EvidenceRecord,
+    ExpectedImprovement,
     ExperimentCell,
     ExperimentFeedbackProposal,
     ExperimentGuidanceDecision,
     ExperimentPlan,
     ExperimentRun,
-    ExpectedImprovement,
     Hypothesis,
     HypothesisScore,
     InnovationCandidate,
@@ -263,27 +263,49 @@ class MockScientistRuntime:
             ),
             Hypothesis(
                 gap_id=gaps["代表性的定义可能依赖检测器结构"].id,
-                title="检测器结构决定参考集代表性目标",
+                title="覆盖选样收益具有结构类与纹理类边界",
                 claim=(
-                    "PatchCore/AnomalyDINO 的收益主要由局部覆盖半径解释，而"
-                    "SubspaceAD 的收益主要由参考特征有效秩解释。"
+                    "k-center 相对 random 的 Image AUROC 收益在结构异常类别上高于"
+                    "纹理异常类别，且该差异可由正常特征覆盖半径解释。"
                 ),
-                null_hypothesis="覆盖半径和有效秩对不同检测器的解释力不存在交互差异。",
-                rationale="近邻距离和子空间重建使用了不同的正常性几何假设。",
-                independent_variables=["检测器", "覆盖半径", "有效秩", "K"],
-                dependent_variables=["AUROC", "AUPRO", "支持集敏感度"],
-                predicted_direction="检测器与几何指标存在显著交互。",
+                null_hypothesis="k-center 的成对收益在结构类和纹理类之间没有差异。",
+                rationale="局部几何覆盖对结构变化和重复纹理的作用机制可能不同。",
+                independent_variables=["类别类型", "选择策略", "覆盖半径", "K"],
+                dependent_variables=["Image AUROC", "Pixel AUROC", "AUPRO"],
+                predicted_direction="结构异常类别获得更高的成对收益。",
                 falsification_conditions=[
-                    "交互效应不能跨类别复现",
-                    "替代几何指标具有同等或更高解释力",
+                    "类别组间效应差异的置信区间包含零",
+                    "差异不能跨至少三个类别复现",
                 ],
                 evidence_ids=evidence_ids,
                 analysis_contract=AnalysisContract(
-                    kind="detector_interaction",
+                    kind="selection_main_effect",
                     metric="image_auroc",
                     treatment="k_center",
                     control="random",
                     minimum_pairs=12,
+                ),
+            ),
+            Hypothesis(
+                gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
+                title="覆盖感知选样的收益随 K 增大而衰减",
+                claim=(
+                    "k-center 相对 random 的收益在 K=1/2 时最大，并随 K 增加到 4/8"
+                    "而显著衰减。"
+                ),
+                null_hypothesis="k-center 与 random 的成对效应不随 K 改变。",
+                rationale="极低 K 下正常模式遗漏最严重，代表性选样的边际价值应更高。",
+                independent_variables=["K", "选择策略", "类别"],
+                dependent_variables=["Image AUROC", "跨 seed 方差"],
+                predicted_direction="选择策略与 K 呈负向交互。",
+                falsification_conditions=["成对收益不随 K 增大而下降"],
+                evidence_ids=evidence_ids,
+                analysis_contract=AnalysisContract(
+                    kind="selection_main_effect",
+                    metric="image_auroc",
+                    treatment="k_center",
+                    control="random",
+                    minimum_pairs=6,
                 ),
             ),
             Hypothesis(
@@ -353,7 +375,16 @@ class MockScientistRuntime:
             "hypothesis_ids": [
                 item.id
                 for item in project.hypotheses
-                if item.status == HypothesisStatus.SHORTLISTED
+                if (
+                    item.execution_readiness == "executable"
+                    or any(
+                        implementation.hypothesis_id == item.id
+                        and implementation.kind == "selection_strategy"
+                        for implementation in registered
+                    )
+                )
+                and item.status
+                in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
             ],
             "hypothesis_contracts": hypothesis_contracts,
             "protocols": ["strict_k_shot", "pool_compression_m30"],
