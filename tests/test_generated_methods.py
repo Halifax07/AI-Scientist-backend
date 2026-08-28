@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
+from fsad_scientist.agents.qwen_runtime import QwenScientistRuntime
 from fsad_scientist.api.app import create_app
 from fsad_scientist.config import Settings
 from fsad_scientist.datasets.models import DatasetManifest
@@ -44,6 +45,17 @@ def build_awaiting_project(tmp_path: Path):
     return workflow, project
 
 
+class _FailingAgentScopeClient:
+    async def complete(self, **kwargs):
+        raise RuntimeError("simulated AgentScope failure")
+
+
+def use_failing_qwen_runtime(workflow: ResearchWorkflow) -> None:
+    runtime = QwenScientistRuntime()
+    runtime.client = _FailingAgentScopeClient()  # type: ignore[assignment]
+    workflow.runtime = runtime
+
+
 def build_reviewed_project(tmp_path: Path):
     workflow = ResearchWorkflow(
         repository=JsonProjectRepository(tmp_path / "ledger"),
@@ -56,6 +68,40 @@ def build_reviewed_project(tmp_path: Path):
     while project.stage != ResearchStage.HYPOTHESES_REVIEWED:
         project = run(workflow.advance(project.id))
     return workflow, project
+
+
+def test_generated_detector_scopes_plan_to_compatible_bound_hypothesis(
+    tmp_path: Path,
+) -> None:
+    workflow, project = build_reviewed_project(tmp_path)
+    hypothesis = next(
+        item
+        for item in project.hypotheses
+        if item.analysis_contract is not None
+        and item.analysis_contract.metric in {"image_auroc", "image_ap"}
+    )
+    generated = run(
+        workflow.implement_experiment_detector(
+            project.id,
+            hypothesis_id=hypothesis.id,
+            name_stem="image_only",
+        )
+    )
+    detector = next(
+        item
+        for item in generated.method_implementations
+        if item.kind == "detector" and item.hypothesis_id == hypothesis.id
+    )
+
+    planned = run(workflow.advance(project.id))
+
+    assert planned.experiment_plan is not None
+    assert planned.experiment_plan.hypothesis_ids == [hypothesis.id]
+    assert planned.experiment_plan.detectors == [detector.name]
+    assert planned.experiment_plan.hypothesis_contracts[hypothesis.id].metric in {
+        "image_auroc",
+        "image_ap",
+    }
 
 
 def query_adaptation_hypothesis(project):
@@ -568,6 +614,20 @@ def test_generate_marks_rejected_on_bad_static_code(tmp_path: Path, monkeypatch)
     assert not any(item.kind == "generated_strategy" for item in updated.artifacts)
 
 
+def test_non_mock_selection_fallback_is_rejected_before_persistence(tmp_path: Path) -> None:
+    workflow, project = build_awaiting_project(tmp_path)
+    hypothesis = query_adaptation_hypothesis(project)
+    use_failing_qwen_runtime(workflow)
+    before = workflow.repository.get(project.id)
+
+    with pytest.raises(InvalidTransitionError, match="deterministic-fallback"):
+        run(workflow.implement_experiment_method(project.id, hypothesis_id=hypothesis.id))
+
+    stored = workflow.repository.get(project.id)
+    assert stored.method_implementations == before.method_implementations
+    assert stored.artifacts == before.artifacts
+
+
 def test_approval_gate_blocks_unimplemented_strategy(tmp_path: Path) -> None:
     workflow, project = build_awaiting_project(tmp_path)
     project, _ = inject_query_adaptation_into_plan(workflow, project.id)
@@ -711,6 +771,26 @@ def test_generate_detector_marks_rejected_on_bad_static_code(tmp_path: Path, mon
     assert not any(item.kind == "generated_detector" for item in updated.artifacts)
 
 
+def test_non_mock_detector_fallback_is_rejected_before_persistence(tmp_path: Path) -> None:
+    workflow, project = build_awaiting_project(tmp_path)
+    hypothesis = query_adaptation_hypothesis(project)
+    use_failing_qwen_runtime(workflow)
+    before = workflow.repository.get(project.id)
+
+    with pytest.raises(InvalidTransitionError, match="deterministic-fallback"):
+        run(
+            workflow.implement_experiment_detector(
+                project.id,
+                name_stem="nearest_prototype",
+                hypothesis_id=hypothesis.id,
+            )
+        )
+
+    stored = workflow.repository.get(project.id)
+    assert stored.method_implementations == before.method_implementations
+    assert stored.artifacts == before.artifacts
+
+
 def test_approval_gate_blocks_unimplemented_detector(tmp_path: Path) -> None:
     workflow, project = build_awaiting_project(tmp_path)
     project = inject_generated_detector_into_plan(
@@ -747,7 +827,7 @@ def test_approval_gate_blocks_unvalidated_detector(tmp_path: Path) -> None:
 
 def test_approval_approves_validated_detector(tmp_path: Path) -> None:
     workflow, project = build_awaiting_project(tmp_path)
-    hypothesis = query_adaptation_hypothesis(project)
+    hypothesis = selection_main_effect_hypothesis(project)
     run(
         workflow.implement_experiment_detector(
             project.id,
@@ -760,6 +840,8 @@ def test_approval_approves_validated_detector(tmp_path: Path) -> None:
         item for item in project.method_implementations if item.kind == "detector"
     )
     project = inject_generated_detector_into_plan(workflow, project.id, implementation.name)
+    with pytest.raises(InvalidTransitionError, match="请刷新页面复核后再次批准"):
+        workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
     approved = workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
     implementation = next(
         item for item in approved.method_implementations if item.kind == "detector"
@@ -769,7 +851,7 @@ def test_approval_approves_validated_detector(tmp_path: Path) -> None:
 
 def test_campaign_initializes_with_generated_detector(tmp_path: Path) -> None:
     workflow, project = build_awaiting_project(tmp_path)
-    hypothesis = query_adaptation_hypothesis(project)
+    hypothesis = selection_main_effect_hypothesis(project)
     run(
         workflow.implement_experiment_detector(
             project.id,
@@ -782,6 +864,8 @@ def test_campaign_initializes_with_generated_detector(tmp_path: Path) -> None:
         item for item in project.method_implementations if item.kind == "detector"
     )
     project = inject_generated_detector_into_plan(workflow, project.id, implementation.name)
+    with pytest.raises(InvalidTransitionError, match="请刷新页面复核后再次批准"):
+        workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
     approved = workflow.approve_experiment_plan(project.id, approved_by="test-reviewer")
     dataset = dataset_manifest()
     project = workflow.attach_dataset_audit(
@@ -933,7 +1017,7 @@ def test_api_generate_detector_endpoint(tmp_path: Path) -> None:
         item
         for item in project["hypotheses"]
         if item.get("analysis_contract")
-        and item["analysis_contract"]["kind"] == "query_adaptation"
+        and item["analysis_contract"]["metric"] in {"image_auroc", "image_ap"}
     )
     response = client.post(
         f"/api/v1/projects/{project_id}/experiment-methods/generate-detector",
@@ -1074,7 +1158,7 @@ def test_api_campaign_initialize_accepts_generated_detector_name(tmp_path: Path)
         item
         for item in project["hypotheses"]
         if item.get("analysis_contract")
-        and item["analysis_contract"]["kind"] == "query_adaptation"
+        and item["analysis_contract"]["metric"] in {"image_auroc", "image_ap"}
     )
     generated = client.post(
         f"/api/v1/projects/{project_id}/experiment-methods/generate-detector",
@@ -1092,6 +1176,11 @@ def test_api_campaign_initialize_accepts_generated_detector_name(tmp_path: Path)
     stored.experiment_plan.detectors.append(implementation["name"])
     repository.save(stored)
 
+    scoped = client.post(
+        f"/api/v1/projects/{project_id}/approve",
+        json={"approved_by": "api-tester"},
+    )
+    assert scoped.status_code == 409
     approved = client.post(
         f"/api/v1/projects/{project_id}/approve",
         json={"approved_by": "api-tester"},

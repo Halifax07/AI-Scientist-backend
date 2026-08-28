@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fsad_scientist.agents.contracts import ScientistRuntime
+from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.config import PROJECT_ROOT
 from fsad_scientist.datasets.models import DatasetManifest
 from fsad_scientist.domain.enums import (
@@ -41,7 +42,11 @@ from fsad_scientist.experiments.detector_runner import (
     assemble_detector_file,
     run_detector_smoke,
 )
-from fsad_scientist.experiments.loop import AdaptiveExperimentPlanner
+from fsad_scientist.experiments.loop import (
+    AdaptiveExperimentPlanner,
+    is_supported_primary_metric,
+    normalize_primary_metric,
+)
 from fsad_scientist.experiments.strategy_runner import (
     GeneratedStrategyRunner,
     assemble_strategy_file,
@@ -526,6 +531,10 @@ class ResearchWorkflow:
             None,
         )
         if existing is not None:
+            self._reject_non_mock_deterministic_fallback(
+                existing,
+                implementation_kind="选样策略",
+            )
             if existing.name in BUILTIN_STRATEGIES:
                 raise InvalidTransitionError(
                     f"Generated strategy {existing.name} cannot use a built-in name"
@@ -559,6 +568,10 @@ class ResearchWorkflow:
             hypothesis=hypothesis,
             strategy_name=strategy_name,
             control_name=control_name,
+        )
+        self._reject_non_mock_deterministic_fallback(
+            implementation,
+            implementation_kind="选样策略",
         )
         implementation.name = strategy_name
         project.method_implementations = [
@@ -683,21 +696,58 @@ class ResearchWorkflow:
             return []
 
         hypotheses = {item.id: item for item in project.hypotheses}
-        supported_hypothesis_ids = [
-            hypothesis_id
-            for hypothesis_id in plan.hypothesis_ids
-            if hypothesis_id in hypotheses
-            and hypotheses[hypothesis_id].analysis_contract is not None
-            and hypotheses[hypothesis_id].analysis_contract.kind
-            in {"selection_main_effect", "query_adaptation"}
+        generated_detectors = [
+            item
+            for item in project.method_implementations
+            if item.kind == "detector"
+            and item.status in {"validated", "approved"}
+            and item.name in plan.detectors
         ]
+        generated_detector_hypothesis_ids = {
+            item.hypothesis_id for item in generated_detectors
+        }
+        requested_detectors = list(plan.detectors)
+        if generated_detectors:
+            plan.detectors = list(dict.fromkeys(item.name for item in generated_detectors))
+        supported_hypothesis_ids: list[str] = []
+        normalized_contracts: dict[str, AnalysisContract] = {}
+        for hypothesis_id in plan.hypothesis_ids:
+            hypothesis = hypotheses.get(hypothesis_id)
+            contract = hypothesis.analysis_contract if hypothesis is not None else None
+            if (
+                contract is None
+                or contract.kind not in {"selection_main_effect", "query_adaptation"}
+                or not is_supported_primary_metric(contract.metric)
+            ):
+                continue
+            normalized_metric = normalize_primary_metric(contract.metric)
+            if generated_detectors and (
+                hypothesis_id not in generated_detector_hypothesis_ids
+                or normalized_metric not in {"image_auroc", "image_ap"}
+            ):
+                continue
+            normalized_contract = contract.model_copy(
+                update={"metric": normalized_metric}
+            )
+            hypothesis.analysis_contract = normalized_contract
+            planned_contract = plan.hypothesis_contracts.get(hypothesis_id)
+            if planned_contract is not None:
+                if not is_supported_primary_metric(planned_contract.metric):
+                    continue
+                normalized_contract = planned_contract.model_copy(
+                    update={"metric": normalize_primary_metric(planned_contract.metric)}
+                )
+            supported_hypothesis_ids.append(hypothesis_id)
+            normalized_contracts[hypothesis_id] = normalized_contract.model_copy(deep=True)
         if not supported_hypothesis_ids:
             raise InvalidTransitionError(
                 "预注册计划没有当前执行器可支持的创新点，请重新设计实验计划"
             )
-        if plan.hypothesis_ids == supported_hypothesis_ids and set(
-            plan.hypothesis_contracts
-        ) == set(supported_hypothesis_ids):
+        if (
+            plan.hypothesis_ids == supported_hypothesis_ids
+            and plan.hypothesis_contracts == normalized_contracts
+            and requested_detectors == plan.detectors
+        ):
             return []
 
         excluded_hypothesis_ids = [
@@ -706,13 +756,7 @@ class ResearchWorkflow:
             if hypothesis_id not in supported_hypothesis_ids
         ]
         plan.hypothesis_ids = supported_hypothesis_ids
-        plan.hypothesis_contracts = {
-            hypothesis_id: (
-                plan.hypothesis_contracts.get(hypothesis_id)
-                or hypotheses[hypothesis_id].analysis_contract
-            ).model_copy(deep=True)
-            for hypothesis_id in supported_hypothesis_ids
-        }
+        plan.hypothesis_contracts = normalized_contracts
         plan.preregistration_digest = self._plan_preregistration_digest(plan)
         project.record_event(
             actor="experiment_plan_scope_guard",
@@ -731,6 +775,8 @@ class ResearchWorkflow:
             "selection_main_effect",
             "query_adaptation",
         }:
+            return False
+        if not is_supported_primary_metric(contract.metric):
             return False
         protocol_markers = (
             "compression ratio",
@@ -887,6 +933,10 @@ class ResearchWorkflow:
             None,
         )
         if existing is not None and existing.status in {"approved", "validated"}:
+            self._reject_non_mock_deterministic_fallback(
+                existing,
+                implementation_kind="检测器",
+            )
             project.record_event(
                 actor="method_registry",
                 action="implement_experiment_detector",
@@ -900,6 +950,10 @@ class ResearchWorkflow:
             hypothesis=hypothesis,
             name_stem=name_stem,
             reference_description=reference_description,
+        )
+        self._reject_non_mock_deterministic_fallback(
+            implementation,
+            implementation_kind="检测器",
         )
         project.method_implementations = [
             item
@@ -984,6 +1038,26 @@ class ResearchWorkflow:
             },
         )
         return self.repository.save(project)
+
+    def _reject_non_mock_deterministic_fallback(
+        self,
+        implementation: MethodImplementation,
+        *,
+        implementation_kind: str,
+    ) -> None:
+        if type(self.runtime) is MockScientistRuntime:
+            return
+        fallback_markers = [
+            marker
+            for marker in implementation.provenance
+            if "fallback" in marker
+        ]
+        if any("deterministic-fallback" in marker for marker in fallback_markers):
+            raise InvalidTransitionError(
+                f"非 mock 运行时返回了 deterministic-fallback {implementation_kind}实现，"
+                "已拒绝注册；请修复 AgentScope 调用后重试。"
+                f"失败标记：{', '.join(fallback_markers)}"
+            )
 
     def attach_evidence(
         self,
