@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from typing import Any
 
 from fsad_scientist.agents.agentscope_client import AgentScopeJsonClient
@@ -29,6 +30,54 @@ from fsad_scientist.experiments.code_safety import (
 )
 from fsad_scientist.experiments.detector_runner import assemble_detector_file
 from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
+
+
+async def _generate_validated_source(
+    *,
+    client: Any,
+    role_name: str,
+    system_prompt: str,
+    request_payload: dict[str, Any],
+    extractor: Callable[[str], str],
+    validator: Callable[[str], Any],
+    repair_focus: str,
+    failure_label: str,
+) -> tuple[str, list[str]]:
+    source = ""
+    issues: list[str] = []
+    for attempt in range(4):
+        repairing = attempt > 0
+        payload = request_payload
+        prompt = system_prompt
+        if repairing:
+            payload = {
+                **request_payload,
+                "previous_source_code": source,
+                "validation_issues": issues,
+                "repair_instruction": "逐条修复全部结构化输出与静态校验问题。",
+            }
+            prompt = (
+                system_prompt
+                + "上一版响应未通过结构化解析、源码提取或静态校验。"
+                "必须逐条消除 validation_issues；"
+                + repair_focus
+                + "只返回包含 source_code 的 JSON 对象。"
+            )
+        try:
+            response = await client.complete(
+                role_name=role_name,
+                system_prompt=prompt,
+                payload=payload,
+            )
+            source = extractor(str(response.get("source_code", "")))
+        except ValueError as exc:
+            issues = [str(exc)]
+            continue
+        validation = validator(source)
+        if validation.passed:
+            return source, issues
+        issues = validation.issues
+    raise ValueError(f"四次生成后的{failure_label}仍未通过：" + "；".join(issues))
 
 
 class QwenScientistRuntime(MockScientistRuntime):
@@ -115,7 +164,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                 "不要写成模糊的工程目标。至少提出 3 个能够由当前工具链直接验证的创新假设："
                 "analysis_contract.kind 必须为 selection_main_effect，treatment 必须为 k_center，"
                 "control 必须为 random；不同创新点应通过机制主张、主指标、类别边界或 K 敏感性"
-                "形成真正不同的证伪问题。可以补充需要新代码的前瞻候选，但不能把它标成可执行。"
+                "形成真正不同的证伪问题。analysis_contract.metric 必须严格使用以下标识之一："
+                "image_auroc、pixel_auroc、image_ap、aupro；不要返回 Image AUROC、Pixel AUROC、"
+                "AUPRO 等展示标签或 Recall at FPR=5% 等执行器不支持的指标。可以补充需要新代码的"
+                "前瞻候选，但不能把它标成可执行。"
                 "除论文标题和标准技术名词外，"
                 "所有自然语言字段使用简体中文。"
             ),
@@ -163,7 +215,7 @@ class QwenScientistRuntime(MockScientistRuntime):
                             "closest_prior_work": ["string"],
                             "analysis_contract": {
                                 "kind": "selection_main_effect",
-                                "metric": "string",
+                                "metric": "image_auroc|pixel_auroc|image_ap|aupro",
                                 "treatment": "k_center",
                                 "control": "random",
                                 "alpha": 0.05,
@@ -527,37 +579,16 @@ class QwenScientistRuntime(MockScientistRuntime):
                 },
                 "return": {"source_code": "string"},
             }
-            response = await self.client.complete(
+            source, validation_issues = await _generate_validated_source(
+                client=self.client,
                 role_name="MethodImplementerAgent",
                 system_prompt=system_prompt,
-                payload=request_payload,
+                request_payload=request_payload,
+                extractor=extract_select_function,
+                validator=validate_strategy_source,
+                repair_focus="select 函数体内不得定义任何嵌套函数或类；",
+                failure_label="选样策略",
             )
-            source = extract_select_function(str(response.get("source_code", "")))
-            validation = validate_strategy_source(source)
-            if not validation.passed:
-                validation_issues = validation.issues
-                response = await self.client.complete(
-                    role_name="MethodImplementerAgent",
-                    system_prompt=(
-                        system_prompt
-                        + "上一版源码未通过静态校验。请只修复下列问题，保持策略语义不变；"
-                        "仍然只返回完整的 def select 函数源码，不要返回解释或 Markdown。"
-                    ),
-                    payload={
-                        **request_payload,
-                        "previous_source_code": source,
-                        "validation_issues": validation.issues,
-                        "repair_instruction": "修复上一版源码的全部静态校验问题。",
-                    },
-                )
-                source = extract_select_function(str(response.get("source_code", "")))
-                validation = validate_strategy_source(source)
-                if not validation.passed:
-                    validation_issues = validation.issues
-                    raise ValueError(
-                        "定向修复后的选样策略仍未通过静态校验："
-                        + "；".join(validation.issues)
-                    )
             assembled = assemble_strategy_file(source)
             digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
             provenance = [self.name, "static_contract:accepted"]
@@ -582,9 +613,12 @@ class QwenScientistRuntime(MockScientistRuntime):
             fallback.provenance.append(
                 f"{self.name}:deterministic-fallback:{type(exc).__name__}"
             )
-            if validation_issues:
+            fallback_issues = validation_issues or (
+                [str(exc)] if isinstance(exc, ValueError) else []
+            )
+            if fallback_issues:
                 fallback.provenance.append(
-                    f"{self.name}:validation-fallback:{'; '.join(validation_issues)}"
+                    f"{self.name}:validation-fallback:{'; '.join(fallback_issues)}"
                 )
             return fallback
 
@@ -608,7 +642,13 @@ class QwenScientistRuntime(MockScientistRuntime):
                 "scipy/sklearn/PIL/cv2/torch/torchvision/transformers/timm）与顶层普通函数；"
                 "辅助函数名不得以下划线开头，不得定义嵌套函数或类；必须恰好包含一个函数"
                 "def anomaly_score(image, support_images, seed) -> float，单图调用必须轻量。"
-                "分数越高表示越异常。禁止读写文件、联网、启动子进程、eval/exec、"
+                "分数越高表示越异常：核心必须计算测试图与正常支持图之间的非负偏离距离，"
+                "并直接返回随偏离增大的统计量；禁止对距离取负、取倒数或转换成相似度。"
+                "应把支持图缩放到测试图尺寸，计算对齐像素的 RGB 绝对或平方距离，"
+                "对多个支持图逐像素取最小距离，再用 95% 到 99% 高分位聚合为图像分数。"
+                "禁止只用全图均值、标准差或直方图，因为局部缺陷会被平均掉。"
+                "必须保证局部明显颜色/纹理缺陷得到高于正常图的分数。"
+                "禁止读写文件、联网、启动子进程、eval/exec、"
                 "torch.hub.load/hub.load 下载。固定 seed 必须确定性输出；数据读取、标签"
                 "推导、AUROC 计算与输出由系统模板负责，不要重复实现。除代码外所有自然语言"
                 "使用简体中文。"
@@ -637,37 +677,16 @@ class QwenScientistRuntime(MockScientistRuntime):
                 },
                 "return": {"source_code": "string"},
             }
-            response = await self.client.complete(
+            source, validation_issues = await _generate_validated_source(
+                client=self.client,
                 role_name="DetectorImplementerAgent",
                 system_prompt=system_prompt,
-                payload=request_payload,
+                request_payload=request_payload,
+                extractor=extract_detector_source,
+                validator=validate_detector_source,
+                repair_focus="不要引入新的函数、类、导入或外部依赖；",
+                failure_label="检测器",
             )
-            source = extract_detector_source(str(response.get("source_code", "")))
-            validation = validate_detector_source(source)
-            if not validation.passed:
-                validation_issues = validation.issues
-                response = await self.client.complete(
-                    role_name="DetectorImplementerAgent",
-                    system_prompt=(
-                        system_prompt
-                        + "上一版源码未通过静态校验。请只修复下列问题，保持检测器语义不变；"
-                        "仍然只返回完整源码，不要返回解释或 Markdown。"
-                    ),
-                    payload={
-                        **request_payload,
-                        "previous_source_code": source,
-                        "validation_issues": validation.issues,
-                        "repair_instruction": "修复上一版源码的全部静态校验问题。",
-                    },
-                )
-                source = extract_detector_source(str(response.get("source_code", "")))
-                validation = validate_detector_source(source)
-                if not validation.passed:
-                    validation_issues = validation.issues
-                    raise ValueError(
-                        "定向修复后的检测器仍未通过静态校验："
-                        + "；".join(validation.issues)
-                    )
             assembled = assemble_detector_file(source)
             digest = hashlib.sha256(assembled.encode("utf-8")).hexdigest()
             provenance = [self.name, "static_contract:accepted"]
@@ -692,9 +711,12 @@ class QwenScientistRuntime(MockScientistRuntime):
             fallback.provenance.append(
                 f"{self.name}:deterministic-fallback:{type(exc).__name__}"
             )
-            if validation_issues:
+            fallback_issues = validation_issues or (
+                [str(exc)] if isinstance(exc, ValueError) else []
+            )
+            if fallback_issues:
                 fallback.provenance.append(
-                    f"{self.name}:validation-fallback:{'; '.join(validation_issues)}"
+                    f"{self.name}:validation-fallback:{'; '.join(fallback_issues)}"
                 )
             return fallback
 

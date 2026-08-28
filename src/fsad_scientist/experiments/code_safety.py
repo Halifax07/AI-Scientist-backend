@@ -85,6 +85,34 @@ FORBIDDEN_FUNC_CALLS = frozenset(
 
 FORBIDDEN_NAMES = frozenset({"__builtins__", "__import__"})
 
+ALLOWED_STRATEGY_DIRECT_CALLS = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "next",
+        "pow",
+        "range",
+        "reversed",
+        "round",
+        "set",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    }
+)
+
 REQUIRED_PARAMETERS = ("candidate_ids", "embeddings", "k", "seed")
 
 REQUIRED_DETECTOR_PARAMETERS = ("image", "support_images", "seed")
@@ -103,8 +131,9 @@ class CodeValidationResult:
 class _StrategyVisitor(ast.NodeVisitor):
     """Flag forbidden constructs anywhere inside the select function body."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_global_helpers: bool = False) -> None:
         self.issues: list[str] = []
+        self.allow_global_helpers = allow_global_helpers
 
     def visit_Import(self, node: ast.Import) -> None:
         self.issues.append("select 函数体内不允许 import 语句（模板已导入允许的模块）")
@@ -122,6 +151,14 @@ class _StrategyVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_FUNC_CALLS:
             self.issues.append(f"禁止调用 {node.func.id!r}")
+        elif (
+            isinstance(node.func, ast.Name)
+            and node.func.id not in ALLOWED_STRATEGY_DIRECT_CALLS
+            and not self.allow_global_helpers
+        ):
+            self.issues.append(
+                f"禁止调用未由模板提供的全局函数 {node.func.id!r}；请把计算直接写入 select"
+            )
         self.generic_visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -272,6 +309,9 @@ def sanitize_strategy_name(stem: str) -> str:
 
 class _DetectorVisitor(_StrategyVisitor):
     """Strategy rules plus download-API and structure bans for detector code."""
+
+    def __init__(self) -> None:
+        super().__init__(allow_global_helpers=True)
 
     def visit_Call(self, node: ast.Call) -> None:
         dotted = ast.unparse(node.func)

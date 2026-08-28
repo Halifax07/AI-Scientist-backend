@@ -62,6 +62,16 @@ class TestValidateStrategySource:
             message = _validate_fails(source)
             assert call in message
 
+    def test_undefined_helper_call_rejected_before_smoke(self) -> None:
+        source = (
+            "def select(candidate_ids, embeddings, k, seed):\n"
+            "    score = _euclidean_dist_sq(embeddings[candidate_ids[0]], [0.0])\n"
+            "    return candidate_ids[:k] if score >= 0 else []\n"
+        )
+        message = _validate_fails(source)
+        assert "_euclidean_dist_sq" in message
+        assert "直接写入 select" in message
+
     def test_builtins_access_rejected(self) -> None:
         source = (
             "def select(candidate_ids, embeddings, k, seed):\n"

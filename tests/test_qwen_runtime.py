@@ -195,18 +195,19 @@ def test_qwen_implement_selection_strategy_repairs_invalid_source() -> None:
     assert not any("fallback" in item for item in implementation.provenance)
 
 
-def test_qwen_implement_selection_strategy_falls_back_after_invalid_repair() -> None:
+def test_qwen_implement_selection_strategy_retries_malformed_response() -> None:
     project, hypothesis = _build_project_and_hypothesis()
     runtime = QwenScientistRuntime()
-    invalid_source = (
-        "def select(candidate_ids, embeddings, k, seed):\n"
-        "    import random\n"
-        "    def helper():\n"
-        "        return 1\n"
-        "    return candidate_ids[:k]\n"
-    )
     runtime.client = _SequenceClient(
-        [{"source_code": invalid_source}, {"source_code": invalid_source}]
+        [
+            ValueError("Agent output must contain one valid JSON object"),
+            {
+                "source_code": (
+                    "def select(candidate_ids, embeddings, k, seed):\n"
+                    "    return sorted(candidate_ids)[:k]\n"
+                )
+            },
+        ]
     )  # type: ignore[assignment]
 
     implementation = asyncio.run(
@@ -219,6 +220,35 @@ def test_qwen_implement_selection_strategy_falls_back_after_invalid_repair() -> 
     )
 
     assert len(runtime.client.calls) == 2
+    assert validate_strategy_source(implementation.source_code).passed is True
+    assert any("validation-repair" in item for item in implementation.provenance)
+    assert not any("fallback" in item for item in implementation.provenance)
+
+
+def test_qwen_implement_selection_strategy_falls_back_after_invalid_repair() -> None:
+    project, hypothesis = _build_project_and_hypothesis()
+    runtime = QwenScientistRuntime()
+    invalid_source = (
+        "def select(candidate_ids, embeddings, k, seed):\n"
+        "    import random\n"
+        "    def helper():\n"
+        "        return 1\n"
+        "    return candidate_ids[:k]\n"
+    )
+    runtime.client = _SequenceClient(
+        [{"source_code": invalid_source}] * 4
+    )  # type: ignore[assignment]
+
+    implementation = asyncio.run(
+        runtime.implement_selection_strategy(
+            project,
+            hypothesis=hypothesis,
+            strategy_name="query_adaptive",
+            control_name="random",
+        )
+    )
+
+    assert len(runtime.client.calls) == 4
     assert validate_strategy_source(implementation.source_code).passed is True
     assert any("validation-fallback" in item for item in implementation.provenance)
     assert any("deterministic-fallback" in item for item in implementation.provenance)
@@ -340,7 +370,7 @@ def test_qwen_implement_detector_falls_back_after_invalid_repair() -> None:
         "    return 1.0\n"
     )
     runtime.client = _SequenceClient(
-        [{"source_code": invalid_source}, {"source_code": invalid_source}]
+        [{"source_code": invalid_source}] * 4
     )  # type: ignore[assignment]
 
     implementation = asyncio.run(
@@ -352,7 +382,7 @@ def test_qwen_implement_detector_falls_back_after_invalid_repair() -> None:
         )
     )
 
-    assert len(runtime.client.calls) == 2
+    assert len(runtime.client.calls) == 4
     assert validate_detector_source(implementation.source_code).passed is True
     assert any("validation-fallback" in item for item in implementation.provenance)
     assert any("deterministic-fallback" in item for item in implementation.provenance)

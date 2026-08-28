@@ -4,6 +4,7 @@ import json
 import os
 from typing import Any
 
+from httpx import HTTPError
 from openai import APIConnectionError, APIStatusError
 
 
@@ -80,6 +81,10 @@ class AgentScopeJsonClient:
             raise AgentScopeUnavailableError(
                 "无法连接 DashScope，请检查网络和服务地址。"
             ) from exc
+        except HTTPError as exc:
+            raise AgentScopeUnavailableError(
+                "DashScope 流式响应中断，请稍后重试当前步骤。"
+            ) from exc
         return _parse_json_object(reply.get_text_content())
 
 
@@ -93,12 +98,24 @@ def _api_error_code(exc: APIStatusError) -> str | None:
 
 def _parse_json_object(value: str) -> dict[str, Any]:
     text = value.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        text = "\n".join(lines[1:-1]).strip()
-        if text.startswith("json"):
-            text = text[4:].lstrip()
-    parsed = json.loads(text)
+    if not text:
+        raise ValueError("Agent output must contain one JSON object")
+
+    decoder = json.JSONDecoder()
+    object_start = text.find("{")
+    if object_start < 0:
+        raise ValueError("Agent output must contain one JSON object")
+    try:
+        parsed, object_end = decoder.raw_decode(text, object_start)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Agent output must contain one valid JSON object") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("Agent output must be one JSON object")
+        raise ValueError("Agent output must contain one JSON object")
+
+    # A JSON array containing an object is not an acceptable substitute for the
+    # object response, even when the array is surrounded by explanatory prose.
+    prefix = text[:object_start].rstrip()
+    suffix = text[object_end:].lstrip()
+    if prefix.endswith("[") and suffix.startswith("]"):
+        raise ValueError("Agent output must contain one JSON object")
     return parsed
