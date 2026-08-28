@@ -783,6 +783,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
+    { name = "scikit-learn" },
 ]
 experiment = [
     { name = "mlflow" },
@@ -826,6 +827,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9,<1" },
     { name = "scikit-image", marker = "extra == 'detectors'", specifier = ">=0.24,<1" },
     { name = "scikit-learn", marker = "extra == 'detectors'", specifier = ">=1.6,<2" },
+    { name = "scikit-learn", marker = "extra == 'dev'", specifier = ">=1.6,<2" },
     { name = "scikit-learn", marker = "extra == 'experiment'", specifier = ">=1.6,<2" },
     { name = "scipy", marker = "extra == 'detectors'", specifier = ">=1.14,<2" },
     { name = "tifffile", marker = "extra == 'detectors'", specifier = ">=2024,<2027" },
