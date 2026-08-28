@@ -19,6 +19,10 @@ from fsad_scientist.integrations.anomalydino_pixel_metrics import (
     inject_metric_protocol,
     install_post_eval_overrides,
 )
+from fsad_scientist.integrations.anomalydino_single import (
+    _disable_example_plots,
+    _disable_final_sample_plot,
+)
 
 
 def _write_fixture(
@@ -214,3 +218,34 @@ def test_post_eval_override_keeps_upstream_output_shape_and_adds_protocol(tmp_pa
     assert module.eval_finished_run(output_dir=tmp_path, seed=3) == "upstream-result"
     payload = json.loads((tmp_path / "metrics_seed=3.json").read_text(encoding="utf-8"))
     assert payload["metric_protocol"] == PIXEL_METRIC_PROTOCOL
+
+
+def test_single_run_wrapper_disables_nonessential_example_plots() -> None:
+    forwarded = [
+        "--dataset",
+        "MVTec",
+        "--save_examples",
+        "--eval_segm",
+        "--no-save_examples",
+    ]
+
+    actual = _disable_example_plots(forwarded)
+
+    assert actual == ["--dataset", "MVTec", "--eval_segm", "--no-save_examples"]
+
+
+def test_single_run_wrapper_disables_final_sample_plot_callback() -> None:
+    called = False
+
+    class VisualizeModule:
+        @staticmethod
+        def create_sample_plots(*args: object, **kwargs: object) -> None:
+            nonlocal called
+            called = True
+
+    module = VisualizeModule()
+    _disable_final_sample_plot(module)
+
+    module.create_sample_plots("results", seed=0)
+
+    assert called is False

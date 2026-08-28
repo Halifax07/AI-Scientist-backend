@@ -31,6 +31,27 @@ ExperimentPhaseName = Literal[
     "cross_dataset",
 ]
 
+SUPPORTED_PRIMARY_METRICS = frozenset(
+    {"image_auroc", "pixel_auroc", "image_ap", "aupro"}
+)
+_PRIMARY_METRIC_ALIASES = {
+    "imageauroc": "image_auroc",
+    "pixelauroc": "pixel_auroc",
+    "imageap": "image_ap",
+    "aupro": "aupro",
+}
+
+
+def normalize_primary_metric(metric: str) -> str:
+    """Normalize display-style metric labels to the executor vocabulary."""
+
+    key = "".join(character for character in metric.strip().casefold() if character.isalnum())
+    return _PRIMARY_METRIC_ALIASES.get(key, metric.strip())
+
+
+def is_supported_primary_metric(metric: str) -> bool:
+    return normalize_primary_metric(metric) in SUPPORTED_PRIMARY_METRICS
+
 
 class AdaptiveExperimentPlanner:
     """Build and validate a budgeted result-to-next-experiment loop.
@@ -132,6 +153,9 @@ class AdaptiveExperimentPlanner:
         exhaustive_run_count = (
             len(hypothesis_ids) * len(categories) * len(shots) * len(seeds) * 2
         )
+        primary_metric = normalize_primary_metric(contract.metric)
+        if primary_metric not in SUPPORTED_PRIMARY_METRICS:
+            raise ValueError(f"Unsupported primary metric: {contract.metric}")
         campaign = ExperimentCampaign(
             hypothesis_id=hypothesis.id,
             hypothesis_ids=hypothesis_ids,
@@ -143,7 +167,7 @@ class AdaptiveExperimentPlanner:
             detector=detector,
             treatment=contract.treatment,
             control=contract.control,
-            metric=contract.metric,
+            metric=primary_metric,
             device=device,
             max_rounds=len(hypothesis_ids),
             max_runs=effective_max_runs,
@@ -187,7 +211,7 @@ class AdaptiveExperimentPlanner:
             raise ValueError(f"Unknown experiment round: {round_id}")
         runs_by_id = {run.id: run for run in project.runs}
         runs = [runs_by_id[run_id] for run_id in current.run_ids if run_id in runs_by_id]
-        metric = current.metric
+        metric = normalize_primary_metric(current.metric)
         grouped: dict[tuple[str, int, int], dict[str, ExperimentRun]] = defaultdict(dict)
         failed_run_ids: list[str] = []
         duration_seconds = 0.0
@@ -407,10 +431,10 @@ class AdaptiveExperimentPlanner:
             if len(selected) == 2:
                 break
         for item in allowed:
+            if len(selected) >= 2:
+                break
             if item not in selected:
                 selected.append(item)
-            if len(selected) == 2:
-                break
         if len(selected) != 2:
             raise ValueError("The preregistered search space cannot fund three iterations")
 
@@ -658,10 +682,13 @@ class AdaptiveExperimentPlanner:
         contract = hypothesis.analysis_contract
         if contract is None or not self._contract_is_executable(project, contract):
             raise ValueError(f"Hypothesis is not executable: {round_hypothesis_id}")
+        primary_metric = normalize_primary_metric(contract.metric)
+        if primary_metric not in SUPPORTED_PRIMARY_METRICS:
+            raise ValueError(f"Unsupported primary metric: {contract.metric}")
         campaign.hypothesis_id = round_hypothesis_id
         campaign.treatment = contract.treatment
         campaign.control = contract.control
-        campaign.metric = contract.metric
+        campaign.metric = primary_metric
         round_id = new_id("round")
         nodes: list[ExperimentNodeRecord] = []
         runs: list[ExperimentRun] = []
@@ -728,7 +755,7 @@ class AdaptiveExperimentPlanner:
             hypothesis_id=round_hypothesis_id,
             treatment=contract.treatment,
             control=contract.control,
-            metric=contract.metric,
+            metric=primary_metric,
             node_ids=[node.id for node in nodes],
             run_ids=[run.id for run in runs],
             efficiency={"planned_runs": len(runs)},

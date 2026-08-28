@@ -131,6 +131,118 @@ def test_feedback_loop_uses_results_and_respects_run_budget(tmp_path):
     assert project.stage == ResearchStage.RESULTS_READY
 
 
+def test_midpoint_guidance_caps_two_valid_recommendations(tmp_path, monkeypatch):
+    workflow, project = build_approved_project(tmp_path, max_experiments=12)
+    dataset = dataset_manifest()
+    project = workflow.attach_dataset_audit(
+        project.id,
+        manifest=dataset,
+        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
+    )
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=executable_hypothesis_id(project),
+        max_rounds=3,
+        max_runs=12,
+    )
+    complete_current_round(workflow, project.id)
+    before = workflow.repository.get(project.id)
+    assert before.experiment_campaign is not None
+    allowed = workflow.experiment_planner.allowed_next_cells(before)
+    assert len(allowed) >= 2
+    assert allowed[0] != allowed[1]
+
+    async def recommend_two_valid_cells(project, *, round_summary, allowed_cells):
+        return ExperimentFeedbackProposal(
+            advisor="test-advisor",
+            rationale="两个有效单元足以排定后续两次迭代。",
+            recommended_cells=[allowed_cells[0], allowed_cells[1]],
+            expected_information_gain=0.5,
+        )
+
+    monkeypatch.setattr(workflow.runtime, "recommend_next_experiments", recommend_two_valid_cells)
+    reviewed = run(
+        workflow.review_experiment_round(
+            before.id,
+            user_guidance="按推荐的两个有效单元继续本轮。",
+        )
+    )
+
+    assert reviewed.experiment_campaign is not None
+    current = reviewed.experiment_campaign.rounds[-1]
+    new_runs = [run_record for run_record in reviewed.runs if run_record.iteration in {2, 3}]
+    assert len(new_runs) == 4
+    assert [run_record.iteration for run_record in new_runs].count(2) == 2
+    assert [run_record.iteration for run_record in new_runs].count(3) == 2
+    assert len(current.run_ids) == 6
+
+
+def test_metric_alias_normalizes_and_forms_a_valid_pair(tmp_path):
+    workflow, project = build_approved_project(tmp_path, max_experiments=6)
+    assert project.experiment_plan is not None
+    hypothesis_id = executable_hypothesis_id(project)
+    hypothesis = next(item for item in project.hypotheses if item.id == hypothesis_id)
+    assert hypothesis.analysis_contract is not None
+    hypothesis.analysis_contract = hypothesis.analysis_contract.model_copy(
+        update={"metric": "Image AUROC"}
+    )
+    project.experiment_plan.hypothesis_contracts[hypothesis_id] = (
+        hypothesis.analysis_contract.model_copy(deep=True)
+    )
+    workflow.repository.save(project)
+
+    dataset = dataset_manifest()
+    project = workflow.attach_dataset_audit(
+        project.id,
+        manifest=dataset,
+        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
+    )
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=hypothesis_id,
+        max_rounds=1,
+        max_runs=6,
+    )
+
+    assert project.experiment_campaign is not None
+    assert project.experiment_campaign.metric == "image_auroc"
+    assert project.experiment_campaign.rounds[0].metric == "image_auroc"
+    complete_current_round(workflow, project.id)
+    summary = workflow.experiment_planner.summarize_current_round(
+        workflow.repository.get(project.id)
+    )
+    assert summary["metric"] == "image_auroc"
+    assert summary["pair_count"] == 1
+
+
+def test_plan_scope_excludes_unsupported_primary_metric(tmp_path):
+    workflow = ResearchWorkflow(
+        repository=JsonProjectRepository(tmp_path / "ledger"),
+        runtime=MockScientistRuntime(),
+    )
+    project = workflow.create_project(ProjectSpec())
+    while project.stage != ResearchStage.AWAITING_EXPERIMENT_APPROVAL:
+        project = run(workflow.advance(project.id))
+    assert project.experiment_plan is not None
+    unsupported_id = project.experiment_plan.hypothesis_ids[-1]
+    unsupported = next(item for item in project.hypotheses if item.id == unsupported_id)
+    assert unsupported.analysis_contract is not None
+    unsupported.analysis_contract = unsupported.analysis_contract.model_copy(
+        update={"metric": "Recall at FPR=5%"}
+    )
+    project.experiment_plan.hypothesis_contracts[unsupported_id] = (
+        unsupported.analysis_contract.model_copy(deep=True)
+    )
+    workflow.repository.save(project)
+
+    excluded = workflow._scope_experiment_plan_to_primary_hypothesis(project)
+
+    assert unsupported_id in excluded
+    assert unsupported_id not in project.experiment_plan.hypothesis_ids
+
+
 def test_campaign_skips_higher_ranked_unsupported_strategy(tmp_path):
     workflow, project = build_approved_project(tmp_path)
     supported = next(

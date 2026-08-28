@@ -8,6 +8,22 @@ from pathlib import Path
 from typing import Any
 
 
+def _disable_example_plots(forwarded: list[str]) -> list[str]:
+    """Keep the single-run adapter focused on metrics and anomaly maps."""
+
+    return [
+        argument
+        for argument in forwarded
+        if argument not in {"--save_examples", "--no-save_examples"}
+    ] + ["--no-save_examples"]
+
+
+def _disable_final_sample_plot(visualize_module: Any) -> None:
+    """Disable the upstream post-evaluation preview without affecting metrics."""
+
+    visualize_module.create_sample_plots = lambda *args, **kwargs: None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the pinned AnomalyDINO implementation for one audited category"
@@ -39,9 +55,10 @@ def main() -> None:
     from fsad_scientist.integrations.anomalydino_pixel_metrics import (
         install_post_eval_overrides,
     )
-    from src import detection, post_eval, utils  # type: ignore[import-not-found]
+    from src import detection, post_eval, utils, visualize  # type: ignore[import-not-found]
 
     install_post_eval_overrides(post_eval)
+    _disable_final_sample_plot(visualize)
 
     original_read_tiff = post_eval.read_tiff
 
@@ -109,7 +126,7 @@ def main() -> None:
         return original_detection(*args, **kwargs)
 
     detection.run_anomaly_detection = frozen_support_detection
-    sys.argv = [str(script), *forwarded]
+    sys.argv = [str(script), *_disable_example_plots(forwarded)]
     runpy.run_path(str(script), run_name="__main__")
 
 
