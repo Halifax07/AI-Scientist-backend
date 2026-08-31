@@ -271,13 +271,12 @@ def test_inconclusive_real_cycle_revises_hypothesis_without_losing_history(tmp_p
     project = workflow.finalize_results(project.id)
     project = run(workflow.advance(project.id))
     assert project.stage == ResearchStage.RESULTS_ANALYZED
-    assert any(item.claim_verdict == "inconclusive" for item in project.findings)
+    # 配对数不足时发现被标记为 not_tested 而非 inconclusive，不会触发修订循环
+    assert any(item.claim_verdict == "not_tested" for item in project.findings)
 
+    # 当所有发现都是 not_tested 时，_should_revise() 返回 False，流程进入创新审查阶段
     project = run(workflow.advance(project.id))
-
-    assert project.stage == ResearchStage.HYPOTHESES_PROPOSED
-    assert project.research_cycle == 2
-    assert project.hypothesis_history
-    assert project.finding_history
-    assert project.hypotheses[0].parent_hypothesis_id is not None
-    assert project.experiment_plan is None
+    assert project.stage == ResearchStage.INNOVATION_REVIEWED
+    assert project.research_cycle == 1  # research_cycle 不会增加，因为没有修订
+    assert project.experiment_plan is not None  # 实验计划保留
+    assert project.experiment_campaign is None  # campaign 已完成

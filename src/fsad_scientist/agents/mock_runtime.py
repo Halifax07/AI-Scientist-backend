@@ -794,7 +794,7 @@ class MockScientistRuntime:
                         hypothesis_id=hypothesis.id,
                         statement="尚无足够的预注册成对真实结果，当前证据不足。",
                         boundary_conditions=["需要相同数据、类别、检测器、K 和 seed 的配对运行"],
-                        claim_verdict="inconclusive",
+                        claim_verdict="not_tested",  # 配对数不足时标记为 not_tested 而非 inconclusive，避免触发无限修订循环
                         verified=False,
                     )
                 )
@@ -806,6 +806,9 @@ class MockScientistRuntime:
                 verdict = "supported"
             elif enough_pairs and upper <= 0:
                 verdict = "rejected"
+            elif not enough_pairs:
+                # 配对数不足以满足预注册要求时标记为 not_tested，避免触发无限修订循环
+                verdict = "not_tested"
             else:
                 verdict = "inconclusive"
             supporting_ids = [
