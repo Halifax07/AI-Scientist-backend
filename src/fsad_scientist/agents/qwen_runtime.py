@@ -329,10 +329,11 @@ class QwenScientistRuntime(MockScientistRuntime):
                 system_prompt=(
                     "你是少样本工业视觉异常检测的自适应实验规划智能体。"
                     "你的输出必须包含完整的推理过程，让非专业用户也能理解决策逻辑。\n\n"
-                    "【当前实验语义】一个 Round 只验证一个创新点，固定包含 3 次内部迭代。"
-                    "当 completed_iterations=1 时，这是唯一一次中途指导：必须规划后续两次迭代，"
-                    "不得建议停止或创建新的 Round；当 completed_iterations=3 时，只需汇总结果，"
-                    "由系统自动切换到下一个创新点。\n\n"
+                    "【当前实验语义】一个 Round 只验证一个创新点，固定包含 3 次预注册迭代。"
+                    "默认执行模式是 parallel：多个已选创新点各自拥有独立 Round，三次迭代由本机"
+                    "并行调度，不能要求用户逐 Run 或逐 Round 批准，也不能把不同创新点的结果合并。"
+                    "兼容旧 sequential 模式时，completed_iterations=1 才允许一次中途指导；"
+                    "completed_iterations=3 时只汇总当前 Round。\n\n"
                     "【决策类型】你可以给出以下决策：\n"
                     "1. expand: 扩展到新类别，检验效应跨类别泛化能力\n"
                     "2. replicate: 增加随机种子，提高统计可信度\n"
@@ -377,7 +378,17 @@ class QwenScientistRuntime(MockScientistRuntime):
                         "hypothesis_id": round_summary.get("hypothesis_id"),
                         "iteration_target": 3,
                         "completed_iterations": round_summary.get("completed_iterations", 0),
-                        "human_guidance_gate": "after_iteration_1_only",
+                        "execution_mode": (
+                            project.experiment_campaign.execution_mode
+                            if project.experiment_campaign is not None
+                            else "sequential"
+                        ),
+                        "human_guidance_gate": (
+                            "none_for_parallel"
+                            if project.experiment_campaign is not None
+                            and project.experiment_campaign.execution_mode == "parallel"
+                            else "after_iteration_1_only"
+                        ),
                     },
                     "recent_human_guidance": [
                         item.model_dump(mode="json")

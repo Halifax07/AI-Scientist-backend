@@ -184,6 +184,13 @@ class Hypothesis(BaseModel):
     status: HypothesisStatus = HypothesisStatus.CANDIDATE
     revision: int = 1
     parent_hypothesis_id: str | None = None
+    # Human ranking is intentionally separate from the AI skeptic score.  The
+    # user can select several innovations, assign a priority and leave a short
+    # review without overwriting the machine-audited score.
+    user_selected: bool | None = None
+    user_priority: int | None = Field(default=None, ge=1, le=1000)
+    user_score: float | None = Field(default=None, ge=0, le=100)
+    user_review_note: str | None = Field(default=None, max_length=3000)
 
     @computed_field
     @property
@@ -214,15 +221,25 @@ class Hypothesis(BaseModel):
                 ),
                 f"至少形成 {contract.minimum_pairs} 组同类别、同 K、同 seed 的成对结果。",
                 (
-                    "每个实验 Round 在第 1 次迭代后接受一次用户指导，随后自动完成第 2、3 次迭代；"
-                    "不得改变已批准的对照边界。"
+                    "并行模式下每个实验 Round 自动完成 3 次迭代；旧串行模式才在第 1 次迭代后"
+                    "接受一次用户指导，且任何模式都不得改变已批准的对照边界。"
                 ),
             ]
         return [
             f"该创新需要实现 {contract.treatment} 与 {contract.control} 的可调用算法适配器。",
             f"实现后以 {contract.metric} 为主指标，至少收集 {contract.minimum_pairs} 组成对结果。",
-            "方法代码、参数和失败日志必须先登记到 Research Ledger，之后才能声明进入验证。",
-        ]
+        "方法代码、参数和失败日志必须先登记到 Research Ledger，之后才能声明进入验证。",
+    ]
+
+
+class HypothesisRanking(BaseModel):
+    """A user's auditable ranking decision for one generated hypothesis."""
+
+    hypothesis_id: str = Field(min_length=1)
+    selected: bool = True
+    priority: int = Field(default=1, ge=1, le=1000)
+    score: float = Field(default=50.0, ge=0, le=100)
+    note: str | None = Field(default=None, max_length=3000)
 
 
 class ExperimentPlan(BaseModel):
@@ -487,11 +504,14 @@ class ExperimentCampaign(BaseModel):
     control: str = "random"
     metric: str = "image_auroc"
     device: str = "cuda:0"
-    max_rounds: int = Field(default=3, ge=1, le=10)
+    max_rounds: int = Field(default=3, ge=1, le=100)
     iterations_per_round: int = Field(default=3, ge=3, le=3)
     max_runs: int = Field(default=24, ge=2, le=1000)
     exhaustive_run_count: int = Field(default=0, ge=0)
     current_round: int = Field(default=1, ge=1)
+    execution_mode: Literal["sequential", "parallel"] = "sequential"
+    parallelism: int = Field(default=1, ge=1, le=32)
+    selected_hypothesis_ids: list[str] = Field(default_factory=list)
     status: Literal[
         "active",
         "awaiting_guidance",
@@ -551,6 +571,44 @@ class WorkflowEvent(BaseModel):
     summary: str
     created_at: datetime = Field(default_factory=utc_now)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExperimentProgressEvent(BaseModel):
+    """Durable, structured progress emitted by the parallel experiment runner.
+
+    The UI consumes these records as an SSE stream, while persisting them in the
+    Research Ledger makes a disconnected run replayable and auditable.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("experiment_event"))
+    sequence: int = Field(ge=1)
+    event_type: Literal[
+        "campaign_started",
+        "run_queued",
+        "run_started",
+        "run_finished",
+        "round_ready",
+        "round_completed",
+        "batch_completed",
+        "campaign_completed",
+        "results_locked",
+        "statistics_completed",
+        "innovation_review_completed",
+        "hypothesis_revision_ready",
+        "report_ready",
+        "finalization_failed",
+        "campaign_failed",
+        "stream_completed",
+    ]
+    message: str
+    campaign_id: str | None = None
+    round_id: str | None = None
+    hypothesis_id: str | None = None
+    run_id: str | None = None
+    status: str | None = None
+    progress: float | None = Field(default=None, ge=0, le=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ArtifactRecord(BaseModel):
@@ -615,6 +673,7 @@ class ResearchProject(BaseModel):
     artifacts: list[ArtifactRecord] = Field(default_factory=list)
     method_implementations: list[MethodImplementation] = Field(default_factory=list)
     events: list[WorkflowEvent] = Field(default_factory=list)
+    experiment_progress: list[ExperimentProgressEvent] = Field(default_factory=list)
     next_action: str = "formalize_scope"
     research_cycle: int = 1
     created_at: datetime = Field(default_factory=utc_now)

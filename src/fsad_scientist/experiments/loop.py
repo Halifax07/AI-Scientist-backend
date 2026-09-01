@@ -76,6 +76,9 @@ class AdaptiveExperimentPlanner:
         detector: str = "anomalydino",
         max_rounds: int = 3,
         max_runs: int = 24,
+        execution_mode: Literal["sequential", "parallel"] = "sequential",
+        parallelism: int | None = None,
+        selected_hypothesis_ids: list[str] | None = None,
     ) -> tuple[ExperimentCampaign, list[ExperimentRun]]:
         plan = project.experiment_plan
         if plan is None or not plan.approved:
@@ -89,13 +92,29 @@ class AdaptiveExperimentPlanner:
             )
 
         hypothesis = self._select_hypothesis(project, hypothesis_id=hypothesis_id)
-        hypothesis_ids = [
+        eligible_hypothesis_ids = [
             hypothesis.id,
             *[
                 item.id
                 for item in self._eligible_hypotheses(project)
                 if item.id != hypothesis.id
             ],
+        ]
+        requested_ids = list(dict.fromkeys(selected_hypothesis_ids or eligible_hypothesis_ids))
+        if hypothesis.id not in requested_ids:
+            requested_ids.insert(0, hypothesis.id)
+        unknown_ids = [item for item in requested_ids if item not in eligible_hypothesis_ids]
+        if unknown_ids:
+            raise ValueError(
+                "Selected innovations are not approved or executable: "
+                + ", ".join(unknown_ids)
+            )
+        # Preserve the user's priority order for parallel campaigns.  The
+        # legacy sequential mode keeps the explicitly selected innovation first
+        # and then follows the preregistered order.
+        hypothesis_ids = requested_ids if execution_mode == "parallel" else [
+            hypothesis.id,
+            *[item for item in eligible_hypothesis_ids if item != hypothesis.id],
         ]
         contract = hypothesis.analysis_contract
         if contract is None:
@@ -142,14 +161,24 @@ class AdaptiveExperimentPlanner:
             effective_max_runs // 6,
         )
         hypothesis_ids = hypothesis_ids[: max(1, round_capacity)]
+        if not hypothesis_ids:
+            raise ValueError("At least one selected innovation is required")
         initial_k = 2 if 2 in shots else shots[0]
-        # A Round is one innovation.  Its first experimental iteration is
-        # executed before the single human midpoint-guidance gate.
+        # Sequential campaigns retain the original one-pair-at-a-time protocol.
+        # Parallel campaigns pre-register all three iterations for every
+        # selected innovation, allowing independent rounds to run concurrently
+        # without serially enumerating the full factorial space.
         initial_seeds = seeds[:1]
         initial_cells = [
             ExperimentCell(category=categories[0], shots=initial_k, seed=seed)
             for seed in initial_seeds
         ]
+        parallel_cells = [
+            ExperimentCell(category=category, shots=shot, seed=seed)
+            for category in categories
+            for shot in shots
+            for seed in seeds
+        ][:3]
         exhaustive_run_count = (
             len(hypothesis_ids) * len(categories) * len(shots) * len(seeds) * 2
         )
@@ -172,7 +201,56 @@ class AdaptiveExperimentPlanner:
             max_rounds=len(hypothesis_ids),
             max_runs=effective_max_runs,
             exhaustive_run_count=exhaustive_run_count,
+            execution_mode=execution_mode,
+            parallelism=max(
+                1,
+                min(
+                    parallelism or project.spec.budget.max_parallel_runs,
+                    project.spec.budget.max_parallel_runs,
+                    32,
+                ),
+            ),
+            selected_hypothesis_ids=hypothesis_ids,
         )
+        if execution_mode == "parallel":
+            all_runs: list[ExperimentRun] = []
+            for index, selected_id in enumerate(hypothesis_ids, start=1):
+                selected_hypothesis = self._hypothesis(project, selected_id)
+                selected_contract = selected_hypothesis.analysis_contract
+                if selected_contract is None:
+                    raise ValueError(f"Selected hypothesis has no analysis contract: {selected_id}")
+                experiment_round, nodes, round_runs = self._build_round(
+                    project,
+                    campaign=campaign,
+                    index=index,
+                    phase="feasibility",
+                    objective=f"验证创新点 H{index}：{selected_hypothesis.title}",
+                    rationale=(
+                        "并行预注册该创新点的三个独立迭代，比较 "
+                        f"{selected_contract.control} 与 {selected_contract.treatment}，"
+                        "并通过真实成对结果评估可证伪性。"
+                    ),
+                    cells=parallel_cells,
+                    information_gain=0.90,
+                    falsification_value=0.85,
+                    parent_id=None,
+                    hypothesis_id=selected_id,
+                )
+                campaign.rounds.append(experiment_round)
+                campaign.nodes.extend(nodes)
+                all_runs.extend(round_runs)
+            # _build_round keeps these fields useful for legacy clients.  Set
+            # them back to the first selected innovation for a stable summary.
+            campaign.hypothesis_id = hypothesis_ids[0]
+            first_contract = self._hypothesis(project, hypothesis_ids[0]).analysis_contract
+            if first_contract is not None:
+                campaign.treatment = first_contract.treatment
+                campaign.control = first_contract.control
+                campaign.metric = normalize_primary_metric(first_contract.metric)
+            campaign.next_action = "execute_parallel_batch"
+            self._refresh_efficiency(campaign)
+            return campaign, all_runs
+
         first_round, nodes, runs = self._build_round(
             project,
             campaign=campaign,
@@ -540,6 +618,94 @@ class AdaptiveExperimentPlanner:
         campaign = project.experiment_campaign
         if campaign is None or campaign.status == "completed":
             return
+
+        if campaign.execution_mode == "parallel":
+            # Parallel campaigns have one pre-registered Round per selected
+            # innovation.  Every Round already contains its three iterations,
+            # so completion of one Round must not block other Rounds.
+            by_id = {run.id: run for run in project.runs}
+            for experiment_round in campaign.rounds:
+                round_runs = [
+                    by_id[run_id]
+                    for run_id in experiment_round.run_ids
+                    if run_id in by_id
+                ]
+                for node in campaign.nodes:
+                    if node.id not in experiment_round.node_ids:
+                        continue
+                    node_runs = [
+                        by_id[run_id] for run_id in node.run_ids if run_id in by_id
+                    ]
+                    if any(run.status == RunStatus.RUNNING for run in node_runs):
+                        node.status = "running"
+                    elif node_runs and all(
+                        run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                        for run in node_runs
+                    ):
+                        node.status = (
+                            "succeeded"
+                            if all(
+                                run.status == RunStatus.SUCCEEDED and run.verified
+                                for run in node_runs
+                            )
+                            else "failed"
+                        )
+                    else:
+                        node.status = "pending"
+
+                if not round_runs:
+                    continue
+                terminal = all(
+                    run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                    for run in round_runs
+                )
+                if terminal:
+                    experiment_round.completed_iterations = min(
+                        experiment_round.iteration_target,
+                        max((run.iteration for run in round_runs), default=0),
+                    )
+                    experiment_round.completed_at = experiment_round.completed_at or utc_now()
+                    # Persist the deterministic metric summary as soon as a
+                    # Round becomes terminal.  The streaming UI can therefore
+                    # show paired effects immediately, even while other
+                    # innovation Rounds are still running and before the
+                    # advisor performs the final innovation review.
+                    experiment_round.result_summary = self.summarize_round(
+                        project,
+                        round_id=experiment_round.id,
+                    )
+                    # Parallel mode deliberately removes the midpoint human
+                    # gate: ranking is the only required user action and the
+                    # three pre-registered iterations run automatically.
+                    experiment_round.guidance_received = True
+                    if experiment_round.status != "completed":
+                        experiment_round.status = "ready_for_feedback"
+                elif any(run.status == RunStatus.RUNNING for run in round_runs):
+                    experiment_round.status = "running"
+                    experiment_round.started_at = experiment_round.started_at or utc_now()
+                else:
+                    experiment_round.status = "planned"
+
+            unfinished_rounds = [
+                item
+                for item in campaign.rounds
+                if item.status not in {"ready_for_feedback", "completed", "failed"}
+            ]
+            if unfinished_rounds:
+                campaign.status = "active"
+                campaign.next_action = "execute_parallel_batch"
+                campaign.current_round = min(item.index for item in unfinished_rounds)
+            elif any(item.status == "ready_for_feedback" for item in campaign.rounds):
+                campaign.status = "awaiting_feedback"
+                campaign.next_action = "review_parallel_rounds"
+                campaign.current_round = max(item.index for item in campaign.rounds)
+            else:
+                campaign.status = "completed"
+                campaign.next_action = "analyze_verified_results"
+                campaign.current_round = max(item.index for item in campaign.rounds)
+            self._refresh_efficiency(campaign, project=project)
+            return
+
         current = campaign.rounds[-1]
         runs = [run for run in project.runs if run.id in current.run_ids]
         for node in campaign.nodes:
@@ -641,17 +807,26 @@ class AdaptiveExperimentPlanner:
         campaign = project.experiment_campaign
         if campaign is None or campaign.status != "active":
             return []
-        current = campaign.rounds[-1]
         by_id = {run.id: run for run in project.runs}
+        rounds = campaign.rounds if campaign.execution_mode == "parallel" else campaign.rounds[-1:]
+        round_index = {
+            experiment_round.id: experiment_round.index
+            for experiment_round in campaign.rounds
+        }
         candidates = [
             by_id[run_id]
-            for run_id in current.run_ids
+            for experiment_round in rounds
+            for run_id in experiment_round.run_ids
             if run_id in by_id and by_id[run_id].status == RunStatus.QUEUED
         ]
         node_priority = {node.id: node.priority for node in campaign.nodes}
         return sorted(
             candidates,
-            key=lambda run: (-node_priority.get(run.node_id or "", 0.0), run.id),
+            key=lambda run: (
+                round_index.get(run.round_id or "", 0),
+                -node_priority.get(run.node_id or "", 0.0),
+                run.id,
+            ),
         )
 
     @classmethod

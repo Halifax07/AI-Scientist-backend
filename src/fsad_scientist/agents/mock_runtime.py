@@ -383,6 +383,7 @@ class MockScientistRuntime:
                         for implementation in registered
                     )
                 )
+                and item.user_selected is not False
                 and item.status
                 in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
             ],
@@ -794,7 +795,8 @@ class MockScientistRuntime:
                         hypothesis_id=hypothesis.id,
                         statement="尚无足够的预注册成对真实结果，当前证据不足。",
                         boundary_conditions=["需要相同数据、类别、检测器、K 和 seed 的配对运行"],
-                        claim_verdict="not_tested",  # 配对数不足时标记为 not_tested 而非 inconclusive，避免触发无限修订循环
+                        # 配对数不足时标记为 not_tested，避免触发无限修订循环。
+                        claim_verdict="not_tested",
                         verified=False,
                     )
                 )

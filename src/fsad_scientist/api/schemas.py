@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from fsad_scientist.domain.models import (
     EvidenceRecord,
     ExperimentGuidanceDecision,
+    HypothesisRanking,
     ProjectSpec,
     ResearchProject,
 )
@@ -31,6 +32,34 @@ class GenerateDetectorRequest(BaseModel):
 
 class StartNextResearchCycleRequest(BaseModel):
     user_guidance: str = Field(min_length=2, max_length=3000)
+
+
+class RankHypothesesRequest(BaseModel):
+    """Human ranking gate after all candidate generation is automatic."""
+
+    rankings: list[HypothesisRanking] = Field(min_length=1, max_length=1000)
+    auto_preregister: bool = True
+
+
+class AutoStartExperimentRequest(BaseModel):
+    dataset_manifest_path: str = Field(min_length=1)
+    hypothesis_id: str = Field(min_length=1)
+    selected_hypothesis_ids: list[str] | None = Field(default=None, max_length=100)
+    detector: str = Field(default="anomalydino", min_length=1, max_length=120)
+    device: str = Field(default="cuda:0", pattern=r"^(cpu|cuda(?::\d+)?)$")
+    max_rounds: int = Field(default=20, ge=1, le=100)
+    max_runs: int = Field(default=240, ge=6, le=1000)
+    max_parallel_runs: int | None = Field(default=None, ge=1, le=32)
+
+
+class ExecuteParallelExperimentRequest(BaseModel):
+    """Batch execution controls; run_ids enables selective replay/resume."""
+
+    run_ids: list[str] | None = Field(default=None, max_length=1000)
+    max_parallel_runs: int | None = Field(default=None, ge=1, le=32)
+    timeout_seconds: float = Field(default=3600.0, gt=0, le=86400)
+    force_embeddings: bool = False
+    auto_review: bool = True
 
 
 class RunResultRequest(BaseModel):
@@ -85,10 +114,13 @@ class ProjectDatasetAuditRequest(DatasetScanRequest):
 class InitializeExperimentCampaignRequest(BaseModel):
     dataset_manifest_path: str = Field(min_length=1)
     hypothesis_id: str = Field(min_length=1)
+    selected_hypothesis_ids: list[str] | None = Field(default=None, max_length=100)
     detector: str = Field(default="anomalydino", min_length=1, max_length=120)
     device: str = Field(default="cuda:0", pattern=r"^(cpu|cuda(?::\d+)?)$")
-    max_rounds: int = Field(default=3, ge=1, le=10)
+    max_rounds: int = Field(default=20, ge=1, le=100)
     max_runs: int = Field(default=24, ge=2, le=240)
+    execution_mode: Literal["sequential", "parallel"] = "sequential"
+    max_parallel_runs: int | None = Field(default=None, ge=1, le=32)
 
 
 class ExecuteNextExperimentRequest(BaseModel):

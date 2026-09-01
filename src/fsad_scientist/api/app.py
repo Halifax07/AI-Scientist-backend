@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, TypeVar, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from fsad_scientist import __version__
 from fsad_scientist.agents.agentscope_client import AgentScopeUnavailableError
@@ -16,6 +19,7 @@ from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.agents.qwen_runtime import QwenScientistRuntime
 from fsad_scientist.api.schemas import (
     ApprovalRequest,
+    AutoStartExperimentRequest,
     ClaimVerifyRequest,
     CreateProjectRequest,
     DatasetScanRequest,
@@ -25,6 +29,7 @@ from fsad_scientist.api.schemas import (
     EvidenceVerifyRequest,
     ExecuteNextExperimentRequest,
     ExecuteNextExperimentResponse,
+    ExecuteParallelExperimentRequest,
     ExecuteRunRequest,
     FullTextRequest,
     GenerateDetectorRequest,
@@ -33,6 +38,7 @@ from fsad_scientist.api.schemas import (
     InitializeExperimentCampaignRequest,
     PrepareRunRequest,
     ProjectDatasetAuditRequest,
+    RankHypothesesRequest,
     ReviewExperimentRoundRequest,
     RunResultRequest,
     StartNextResearchCycleRequest,
@@ -42,6 +48,7 @@ from fsad_scientist.config import Settings, get_settings
 from fsad_scientist.datasets.models import DatasetManifest, DatasetViewManifest
 from fsad_scientist.datasets.scanner import MvtecDatasetScanner
 from fsad_scientist.datasets.view import DatasetViewBuilder
+from fsad_scientist.domain.enums import ResearchStage, RunStatus
 from fsad_scientist.domain.models import (
     EvidenceRecord,
     ExperimentRun,
@@ -390,6 +397,33 @@ def create_app(
         return await workflow.advance(project_id)
 
     @app.post(
+        "/api/v1/projects/{project_id}/automation/ideation",
+        response_model=ResearchProject,
+    )
+    async def automate_ideation_to_ranking(
+        project_id: str,
+        workflow: WorkflowDependency,
+    ) -> ResearchProject:
+        """Run formalisation, evidence, gaps and hypothesis generation automatically."""
+
+        return await workflow.advance_to_hypothesis_ranking(project_id)
+
+    @app.post(
+        "/api/v1/projects/{project_id}/hypotheses/rank",
+        response_model=ResearchProject,
+    )
+    async def rank_hypotheses(
+        project_id: str,
+        body: RankHypothesesRequest,
+        workflow: WorkflowDependency,
+    ) -> ResearchProject:
+        return await workflow.rank_hypotheses(
+            project_id,
+            rankings=body.rankings,
+            auto_preregister=body.auto_preregister,
+        )
+
+    @app.post(
         "/api/v1/projects/{project_id}/research-cycles/next",
         response_model=ResearchProject,
     )
@@ -465,6 +499,41 @@ def create_app(
             detector=body.detector,
             max_rounds=body.max_rounds,
             max_runs=body.max_runs,
+            execution_mode=body.execution_mode,
+            parallelism=body.max_parallel_runs,
+            selected_hypothesis_ids=body.selected_hypothesis_ids,
+        )
+
+    @app.post(
+        "/api/v1/projects/{project_id}/experiment-campaign/auto-start",
+        response_model=ResearchProject,
+    )
+    async def auto_start_experiment_campaign(
+        project_id: str,
+        body: AutoStartExperimentRequest,
+        workflow: WorkflowDependency,
+        request: Request,
+    ) -> ResearchProject:
+        settings = cast(Settings, request.app.state.settings)
+        dataset_path = _resolve_artifact_path(
+            body.dataset_manifest_path,
+            settings.artifact_path,
+        )
+        dataset = _load_artifact_model(
+            str(dataset_path),
+            settings.artifact_path,
+            DatasetManifest,
+        )
+        return await workflow.auto_start_parallel_campaign(
+            project_id,
+            dataset=dataset,
+            hypothesis_id=body.hypothesis_id,
+            selected_hypothesis_ids=body.selected_hypothesis_ids,
+            device=body.device,
+            detector=body.detector,
+            max_rounds=body.max_rounds,
+            max_runs=body.max_runs,
+            parallelism=body.max_parallel_runs,
         )
 
     @app.post(
@@ -633,6 +702,75 @@ def create_app(
             )
 
     @app.post(
+        "/api/v1/projects/{project_id}/experiment-campaign/execute-stream",
+    )
+    async def execute_parallel_campaign_stream(
+        project_id: str,
+        body: ExecuteParallelExperimentRequest,
+        workflow: WorkflowDependency,
+        request: Request,
+    ) -> StreamingResponse:
+        """Run queued innovation Rounds concurrently and stream structured events."""
+
+        # Validate before returning StreamingResponse.  Exceptions raised after
+        # headers are sent cannot be converted into the normal JSON error shape,
+        # which used to make a missing/finished campaign look like a silent
+        # ``Failed to fetch`` in the browser.
+        project = workflow.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            raise HTTPException(409, "The project has no parallel experiment campaign")
+        if campaign.status != "active":
+            raise HTTPException(409, "The parallel campaign is not accepting runs")
+
+        return StreamingResponse(
+            _stream_parallel_execution(
+                project_id,
+                body=body,
+                workflow=workflow,
+                settings=cast(Settings, request.app.state.settings),
+                locks=cast(dict[str, asyncio.Lock], request.app.state.experiment_locks),
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get(
+        "/api/v1/projects/{project_id}/experiment-campaign/events",
+    )
+    async def experiment_campaign_events(
+        project_id: str,
+        workflow: WorkflowDependency,
+        after: int = 0,
+    ) -> StreamingResponse:
+        """Replay persisted progress events for a disconnected UI client."""
+
+        project = workflow.repository.get(project_id)
+        events = [item for item in project.experiment_progress if item.sequence > after]
+
+        async def replay() -> AsyncIterator[str]:
+            for item in events:
+                yield _sse_data(item.model_dump(mode="json"))
+            yield _sse_data(
+                {
+                    "event_type": "stream_completed",
+                    "message": "已 replay 当前已持久化的实验进度。",
+                    "sequence": events[-1].sequence if events else after,
+                    "payload": {"project_id": project_id},
+                }
+            )
+
+        return StreamingResponse(
+            replay(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.post(
         "/api/v1/projects/{project_id}/experiment-campaign/review",
         response_model=ResearchProject,
     )
@@ -799,6 +937,667 @@ def create_app(
         return workflow.finalize_results(project_id)
 
     return app
+
+
+async def _stream_parallel_execution(
+    project_id: str,
+    *,
+    body: ExecuteParallelExperimentRequest,
+    workflow: ResearchWorkflow,
+    settings: Settings,
+    locks: dict[str, asyncio.Lock],
+) -> AsyncIterator[str]:
+    """Execute the selected campaign queue with bounded concurrency.
+
+    A producer performs the real work and puts durable, structured events on an
+    in-memory queue.  The consumer yields SSE frames immediately, so the UI can
+    render every Run and Round as soon as the local executor reports it.
+    """
+
+    lock = locks.setdefault(project_id, asyncio.Lock())
+    async with lock:
+        project = workflow.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            raise HTTPException(409, "The project has no parallel experiment campaign")
+        if campaign.status != "active":
+            raise HTTPException(409, "The parallel campaign is not accepting runs")
+
+        selected = workflow.select_parallel_runs(
+            project_id,
+            run_ids=body.run_ids,
+        )
+        total = len(selected)
+        selected_run_ids = {item.id for item in selected}
+        campaign_run_ids = {
+            run_id
+            for experiment_round in campaign.rounds
+            for run_id in experiment_round.run_ids
+        }
+        parallelism = min(
+            body.max_parallel_runs or campaign.parallelism,
+            campaign.parallelism,
+            settings_for_parallelism(project, settings),
+        )
+        parallelism = max(1, parallelism)
+        event_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        state_lock = asyncio.Lock()
+        round_ready_emitted: set[str] = set()
+        embedding_cache: dict[str, DinoEmbeddingManifest] = {}
+        embedding_locks: dict[str, asyncio.Lock] = {}
+
+        def progress_for(run_ids: set[str]) -> float:
+            current = workflow.repository.get(project_id)
+            terminal = sum(
+                run.id in run_ids
+                and run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                for run in current.runs
+            )
+            return min(terminal / max(len(run_ids), 1), 1.0)
+
+        async def emit(
+            event_type: str,
+            message: str,
+            *,
+            run_id: str | None = None,
+            round_id: str | None = None,
+            hypothesis_id: str | None = None,
+            status: str | None = None,
+            progress: float | None = None,
+            payload: dict[str, object] | None = None,
+            snapshot: bool = True,
+        ) -> None:
+            async with state_lock:
+                event = workflow.record_experiment_progress(
+                    project_id,
+                    event_type=event_type,
+                    message=message,
+                    campaign_id=campaign.id,
+                    round_id=round_id,
+                    hypothesis_id=hypothesis_id,
+                    run_id=run_id,
+                    status=status,
+                    progress=progress,
+                    payload=payload,
+                )
+                frame = event.model_dump(mode="json")
+                if snapshot:
+                    frame["project"] = workflow.repository.get(project_id).model_dump(mode="json")
+                await event_queue.put(frame)
+
+        async def producer() -> None:
+            try:
+                await emit(
+                    "campaign_started",
+                    f"已启动 {total} 个实验运行，最多同时执行 {parallelism} 个。",
+                    status=campaign.status,
+                    progress=0.0,
+                    payload={
+                        "total_runs": total,
+                        "parallelism": parallelism,
+                        "run_ids": [item.id for item in selected],
+                        "hypothesis_ids": sorted({item.hypothesis_id for item in selected}),
+                    },
+                )
+                semaphore = asyncio.Semaphore(parallelism)
+
+                async def run_one(run: ExperimentRun) -> None:
+                    try:
+                        await emit(
+                            "run_queued",
+                            f"{run.id} 已进入并行执行队列。",
+                            run_id=run.id,
+                            round_id=run.round_id,
+                            hypothesis_id=run.hypothesis_id,
+                            status=run.status,
+                        )
+                        async with semaphore:
+                            async with state_lock:
+                                workflow.mark_run_running(project_id, run_id=run.id)
+                            await emit(
+                                "run_started",
+                                f"{run.id} 已开始执行。",
+                                run_id=run.id,
+                                round_id=run.round_id,
+                                hypothesis_id=run.hypothesis_id,
+                                status="running",
+                            )
+                            record = await _execute_campaign_run(
+                                project_id,
+                                run=run,
+                                body=body,
+                                workflow=workflow,
+                                settings=settings,
+                                state_lock=state_lock,
+                                embedding_cache=embedding_cache,
+                                embedding_locks=embedding_locks,
+                            )
+                            async with state_lock:
+                                current = workflow.repository.get(project_id)
+                                current_run = next(
+                                    item for item in current.runs if item.id == run.id
+                                )
+                                terminal = sum(
+                                    item.id in selected_run_ids
+                                    and item.status
+                                    in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                                    for item in current.runs
+                                )
+                            await emit(
+                                "run_finished",
+                                (
+                                    f"{run.id} 已完成。"
+                                    if current_run.status == RunStatus.SUCCEEDED
+                                    else f"{run.id} 执行失败：{current_run.error or '未知错误'}"
+                                ),
+                                run_id=run.id,
+                                round_id=run.round_id,
+                                hypothesis_id=run.hypothesis_id,
+                                status=current_run.status,
+                                progress=min(terminal / max(total, 1), 1.0),
+                                payload={
+                                    "run": current_run.model_dump(mode="json"),
+                                    "execution": record.model_dump(mode="json"),
+                                },
+                            )
+                            async with state_lock:
+                                refreshed = workflow.repository.get(project_id)
+                                refreshed_campaign = refreshed.experiment_campaign
+                                ready_rounds = []
+                                if refreshed_campaign is not None:
+                                    for experiment_round in refreshed_campaign.rounds:
+                                        if (
+                                            experiment_round.status == "ready_for_feedback"
+                                            and experiment_round.id not in round_ready_emitted
+                                        ):
+                                            round_ready_emitted.add(experiment_round.id)
+                                            ready_rounds.append(
+                                                (
+                                                    experiment_round.id,
+                                                    experiment_round.index,
+                                                    experiment_round.hypothesis_id,
+                                                    experiment_round.status,
+                                                    workflow.experiment_planner.summarize_round(
+                                                        refreshed,
+                                                        round_id=experiment_round.id,
+                                                    ),
+                                                )
+                                            )
+                            for (
+                                ready_round_id,
+                                ready_round_index,
+                                ready_hypothesis_id,
+                                ready_status,
+                                ready_summary,
+                            ) in ready_rounds:
+                                await emit(
+                                    "round_ready",
+                                    (
+                                        f"Round {ready_round_index} 的三次迭代已完成，"
+                                        "正在汇总结果。"
+                                    ),
+                                    round_id=ready_round_id,
+                                    hypothesis_id=ready_hypothesis_id,
+                                    status=ready_status,
+                                    payload={
+                                        "round_index": ready_round_index,
+                                        "summary": ready_summary,
+                                    },
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # A worker-level failure should become a terminal Run and
+                        # a normal progress event; one bad innovation must not
+                        # abort all other selected innovations in the batch.
+                        error = f"{type(exc).__name__}: {exc}"
+                        async with state_lock:
+                            current = workflow.repository.get(project_id)
+                            current_run = next(
+                                (item for item in current.runs if item.id == run.id),
+                                None,
+                            )
+                            if current_run is not None and current_run.status in {
+                                RunStatus.QUEUED,
+                                RunStatus.RUNNING,
+                            }:
+                                workflow.record_run_result(
+                                    project_id,
+                                    run_id=run.id,
+                                    metrics={},
+                                    artifact_paths=[],
+                                    code_revision=None,
+                                    environment_digest=None,
+                                    success=False,
+                                    verified=False,
+                                    result_source="real_executor",
+                                    error=error,
+                                )
+                                current = workflow.repository.get(project_id)
+                                current_run = next(
+                                    item for item in current.runs if item.id == run.id
+                                )
+                            terminal = sum(
+                                item.id in selected_run_ids
+                                and item.status
+                                in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                                for item in current.runs
+                            )
+                        await emit(
+                            "run_finished",
+                            f"{run.id} 执行失败：{error}",
+                            run_id=run.id,
+                            round_id=run.round_id,
+                            hypothesis_id=run.hypothesis_id,
+                            status="failed",
+                            progress=min(terminal / max(total, 1), 1.0),
+                            payload={"error": error},
+                        )
+
+                await asyncio.gather(*(run_one(item) for item in selected))
+                completed = workflow.repository.get(project_id)
+                completed_campaign = completed.experiment_campaign
+                if (
+                    body.auto_review
+                    and completed_campaign is not None
+                    and completed_campaign.status == "awaiting_feedback"
+                ):
+                    ready_round_ids = {
+                        item.id
+                        for item in completed_campaign.rounds
+                        if item.status == "ready_for_feedback"
+                    }
+                    completed = await workflow.complete_parallel_campaign(project_id)
+                    completed_rounds = (
+                        completed.experiment_campaign.rounds
+                        if completed.experiment_campaign
+                        else []
+                    )
+                    for experiment_round in completed_rounds:
+                        if (
+                            ready_round_ids
+                            and experiment_round.id not in ready_round_ids
+                        ):
+                            continue
+                        await emit(
+                            "round_completed",
+                            f"Round {experiment_round.index} 已完成创新点结果审查。",
+                            round_id=experiment_round.id,
+                            hypothesis_id=experiment_round.hypothesis_id,
+                            status=experiment_round.status,
+                            payload={
+                                "summary": experiment_round.result_summary,
+                                "feedback": experiment_round.feedback.model_dump(mode="json")
+                                if experiment_round.feedback
+                                else None,
+                            },
+                        )
+                final_project = workflow.repository.get(project_id)
+                final_campaign = final_project.experiment_campaign
+                campaign_completed = bool(
+                    final_campaign is not None and final_campaign.status == "completed"
+                )
+                final_progress = progress_for(campaign_run_ids)
+                completion_event = "campaign_completed" if campaign_completed else "batch_completed"
+                await emit(
+                    completion_event,
+                    (
+                        "所选创新点已完成并行实验与 Round 汇总。"
+                        if campaign_completed
+                        else "本次并行批次已结束，仍有未执行队列可继续启动。"
+                    ),
+                    status=final_campaign.status if final_campaign else None,
+                    progress=final_progress,
+                    payload={
+                        "campaign_status": final_campaign.status if final_campaign else None,
+                        "next_action": final_campaign.next_action if final_campaign else None,
+                        "batch_run_count": total,
+                        "campaign_run_count": len(campaign_run_ids),
+                    },
+                )
+                final_stage = final_project.stage
+                if campaign_completed and body.auto_review:
+                    try:
+                        finalized = workflow.finalize_results(project_id)
+                        await emit(
+                            "results_locked",
+                            "全部选中创新点的实验结果已锁定，开始统一统计分析。",
+                            status=finalized.stage.value,
+                            progress=1.0,
+                            payload={
+                                "verified_runs": sum(
+                                    run.status == RunStatus.SUCCEEDED and run.verified
+                                    for run in finalized.runs
+                                ),
+                                "failed_runs": sum(
+                                    run.status == RunStatus.FAILED for run in finalized.runs
+                                ),
+                            },
+                        )
+                        analyzed = await workflow.advance(project_id)
+                        final_stage = analyzed.stage
+                        await emit(
+                            "statistics_completed",
+                            "成对统计与假设判定已完成，各创新点结果保持独立。",
+                            status=analyzed.stage.value,
+                            progress=1.0,
+                            payload={
+                                "finding_count": len(analyzed.findings),
+                                "stage": analyzed.stage.value,
+                            },
+                        )
+                        if analyzed.stage == ResearchStage.RESULTS_ANALYZED:
+                            reviewed = await workflow.advance(project_id)
+                            final_stage = reviewed.stage
+                            if reviewed.stage == ResearchStage.HYPOTHESES_PROPOSED:
+                                await emit(
+                                    "hypothesis_revision_ready",
+                                    (
+                                        "当前证据不足以支持原主张，AI Scientist 已生成修订假设，"
+                                        "等待下一次用户排名。"
+                                    ),
+                                    status=reviewed.stage.value,
+                                    progress=1.0,
+                                    payload={
+                                        "hypothesis_count": len(reviewed.hypotheses),
+                                        "research_cycle": reviewed.research_cycle,
+                                    },
+                                )
+                            elif reviewed.stage == ResearchStage.INNOVATION_REVIEWED:
+                                await emit(
+                                    "innovation_review_completed",
+                                    "创新审查已完成，结果包含新颖性、机制、边界和复现性依据。",
+                                    status=reviewed.stage.value,
+                                    progress=1.0,
+                                    payload={
+                                        "innovation_count": len(reviewed.innovations),
+                                        "innovations": [
+                                            {
+                                                "id": item.id,
+                                                "hypothesis_id": item.hypothesis_id,
+                                                "title": item.title,
+                                                "status": item.status,
+                                                "confidence": item.confidence,
+                                                "core_finding": item.core_finding,
+                                                "difference_from_prior_work": (
+                                                    item.difference_from_prior_work
+                                                ),
+                                                "boundary_conditions": item.boundary_conditions,
+                                                "reproducibility_evidence": (
+                                                    item.reproducibility_evidence
+                                                ),
+                                            }
+                                            for item in reviewed.innovations
+                                        ],
+                                    },
+                                )
+                                report = await workflow.advance(project_id)
+                                final_stage = report.stage
+                                if report.stage == ResearchStage.REPORT_READY:
+                                    await emit(
+                                        "report_ready",
+                                        "研究输出清单已生成，可导出报告和复现材料。",
+                                        status=report.stage.value,
+                                        progress=1.0,
+                                        payload={
+                                            "artifact_count": len(report.artifacts),
+                                        },
+                                    )
+                    except Exception as exc:
+                        final_stage = workflow.repository.get(project_id).stage
+                        await emit(
+                            "finalization_failed",
+                            f"实验已完成，但结果收尾暂未完成：{type(exc).__name__}: {exc}",
+                            status=final_stage.value,
+                            progress=1.0,
+                            payload={"error": f"{type(exc).__name__}: {exc}"},
+                        )
+                final_project = workflow.repository.get(project_id)
+                await emit(
+                    "stream_completed",
+                    "实验流已结束；所有状态均已写入 Research Ledger。",
+                    status=final_project.stage.value,
+                    progress=final_progress,
+                    payload={
+                        "project_id": project_id,
+                        "batch_completed": True,
+                        "campaign_completed": campaign_completed,
+                        "stage": final_stage.value,
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                with suppress(Exception):
+                    async with state_lock:
+                        workflow.fail_parallel_campaign(project_id, reason=error)
+                await emit(
+                    "campaign_failed",
+                    f"并行实验流失败：{error}",
+                    status="failed",
+                    payload={"error": error},
+                )
+                await emit(
+                    "stream_completed",
+                    "实验流因错误结束；请查看失败 Run 和 Research Ledger。",
+                    status="failed",
+                    payload={"project_id": project_id},
+                )
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(event_queue.get(), timeout=15.0)
+                except TimeoutError:
+                    yield _sse_data(
+                        {
+                            "event_type": "heartbeat",
+                            "message": "实验仍在运行，等待本地执行器返回结构化状态。",
+                        }
+                    )
+                    continue
+                yield _sse_data(frame)
+                if frame.get("event_type") == "stream_completed":
+                    break
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await producer_task
+
+
+async def _execute_campaign_run(
+    project_id: str,
+    *,
+    run: ExperimentRun,
+    body: ExecuteParallelExperimentRequest,
+    workflow: ResearchWorkflow,
+    settings: Settings,
+    state_lock: asyncio.Lock,
+    embedding_cache: dict[str, DinoEmbeddingManifest],
+    embedding_locks: dict[str, asyncio.Lock],
+) -> ExecutionRecord:
+    """Execute one already-reserved run and persist success or failure."""
+
+    project = workflow.repository.get(project_id)
+    campaign = project.experiment_campaign
+    if campaign is None:
+        raise HTTPException(409, "The project has no experiment campaign")
+    output_dir = settings.artifact_path / "runs" / project_id / run.id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        dataset_path = _resolve_artifact_path(
+            campaign.dataset_manifest_path,
+            settings.artifact_path,
+        )
+        dataset = _load_artifact_model(
+            str(dataset_path),
+            settings.artifact_path,
+            DatasetManifest,
+        )
+        if dataset.digest != campaign.dataset_digest:
+            raise HTTPException(409, "Dataset changed after campaign preregistration")
+
+        if settings.runtime == "mock":
+            record = _create_mock_execution_record(run, output_dir)
+            updated_metrics = (
+                record.normalized_result.metrics if record.normalized_result else {}
+            )
+            async with state_lock:
+                workflow.record_run_result(
+                    project_id,
+                    run_id=run.id,
+                    metrics=updated_metrics,
+                    artifact_paths=[],
+                    code_revision="mock",
+                    environment_digest="mock",
+                    success=True,
+                    verified=True,
+                    result_source="synthetic_test",
+                    preparation_path=str((output_dir / "preparation.json").resolve()),
+                    execution_record_path=str((output_dir / "execution.json").resolve()),
+                    duration_seconds=record.duration_seconds,
+                    error=None,
+                )
+            return record
+
+        category_lock = embedding_locks.setdefault(run.category, asyncio.Lock())
+        async with category_lock:
+            embeddings = embedding_cache.get(run.category)
+            if embeddings is None:
+                embeddings = await asyncio.to_thread(
+                    DinoV2Embedder(
+                        settings.artifact_path,
+                        model_id=settings.dinov2_profile_model,
+                        device=campaign.device,
+                        batch_size=8,
+                    ).extract,
+                    dataset,
+                    category=run.category,
+                    force=body.force_embeddings,
+                )
+                embedding_cache[run.category] = embeddings
+        custom_strategies, strategy_runner = _custom_strategy_context(project, settings)
+        prepared = await asyncio.to_thread(
+            ExperimentPreparationService(settings.artifact_path).prepare,
+            project_id=project_id,
+            run=run,
+            dataset=dataset,
+            dataset_manifest_path=dataset_path,
+            embeddings=embeddings,
+            candidate_pool_size=campaign.candidate_pool_size,
+            custom_strategies=custom_strategies,
+            strategy_runner=strategy_runner,
+        )
+        view = _load_artifact_model(
+            prepared.dataset_view_manifest_path,
+            settings.artifact_path,
+            DatasetViewManifest,
+        )
+        support = _load_artifact_model(
+            prepared.support_manifest_path,
+            settings.artifact_path,
+            SupportSetManifest,
+        )
+        command = resolve_detector_command(
+            project,
+            run,
+            MethodRegistry(settings.artifact_path.parents[0]),
+            dataset_view=Path(view.view_root),
+            output_dir=output_dir,
+            device=campaign.device,
+        )
+        record = await ExperimentRunner(
+            project_root=settings.artifact_path.parents[0],
+            artifact_root=settings.artifact_path,
+        ).execute(
+            run,
+            command,
+            output_dir=output_dir,
+            dataset_view=view,
+            support_manifest=support,
+            timeout_seconds=body.timeout_seconds,
+        )
+        normalized = record.normalized_result
+        if normalized is not None:
+            _attach_support_geometry(normalized.metrics, support)
+        async with state_lock:
+            workflow.record_run_result(
+                project_id,
+                run_id=run.id,
+                metrics=normalized.metrics if normalized else {},
+                artifact_paths=[
+                    record.stdout_path,
+                    record.stderr_path,
+                    *record.discovered_artifacts,
+                ],
+                code_revision=record.code_revision,
+                environment_digest=record.environment_digest,
+                success=record.status == "succeeded" and normalized is not None,
+                verified=record.status == "succeeded" and normalized is not None,
+                result_source="real_executor",
+                preparation_path=str(
+                    (
+                        settings.artifact_path
+                        / "prepared_runs"
+                        / project_id
+                        / f"{run.id}.json"
+                    ).resolve()
+                ),
+                execution_record_path=str((output_dir / "execution.json").resolve()),
+                duration_seconds=record.duration_seconds,
+                error=record.error,
+            )
+        return record
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        current = workflow.repository.get(project_id)
+        current_run = next((item for item in current.runs if item.id == run.id), None)
+        if current_run is not None and current_run.status == RunStatus.RUNNING:
+            async with state_lock:
+                workflow.record_run_result(
+                    project_id,
+                    run_id=run.id,
+                    metrics={},
+                    artifact_paths=[],
+                    code_revision=None,
+                    environment_digest=None,
+                    success=False,
+                    verified=False,
+                    result_source="real_executor",
+                    execution_record_path=str((output_dir / "execution.json").resolve()),
+                    error=error,
+                )
+        return ExecutionRecord(
+            run_id=run.id,
+            method=run.detector,
+            status="failed",
+            command=[],
+            cwd=str(output_dir),
+            output_dir=str(output_dir),
+            environment_overrides={},
+            dataset_view_digest="",
+            support_manifest_digest="",
+            environment_digest="",
+            stdout_path=str(output_dir / "stdout.log"),
+            stderr_path=str(output_dir / "stderr.log"),
+            error=error,
+        )
+
+
+def settings_for_parallelism(project: ResearchProject, settings: Settings) -> int:
+    """Resolve a conservative upper bound for local hardware execution."""
+
+    del settings
+    return max(1, min(project.spec.budget.max_parallel_runs, 32))
+
+
+def _sse_data(payload: dict[str, object]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
 
 def _build_runtime(
