@@ -350,6 +350,11 @@ class ResearchWorkflow:
                     cycle_guidance.interpretation = "本次运行未生成满足结构约束的修订假设。"
                     cycle_guidance.disposition = "not_applicable"
                     cycle_guidance.rationale = "系统保留原始建议，但未据此伪造新的研究主张。"
+                if project.experiment_campaign is not None:
+                    project.experiment_campaign_history.append(
+                        project.experiment_campaign.model_copy(deep=True)
+                    )
+                    project.experiment_campaign = None
                 project.innovations = await self.runtime.review_innovations(project)
                 self._move(
                     project,
