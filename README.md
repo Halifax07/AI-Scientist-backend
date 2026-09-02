@@ -11,7 +11,7 @@
 - MVTec AD 数据审计与 DINOv2 正常样本画像
 - random/k-center 少样本支持集选择
 - AnomalyDINO、PatchCore、SubspaceAD 命令适配
-- 多创新点并行实验树：用户排名后每个创新点对应一个 Round，Round 自动完成三次迭代
+- 多创新点并行实验树：用户排名后每个创新点对应一个 Round；首轮完成后每个 Round 接收一次用户指导，再自动完成第 2、3 次迭代
 - SSE 实验流与 Research Ledger 回放：Run/Round/汇总状态实时推送，断线后可按序号恢复
 - Qwen 结果规划、方法边界校验和 Research Ledger 留痕
 - 配对 bootstrap、符号置换检验和创新审查
@@ -58,8 +58,9 @@ GET  /projects/{id}/experiment-campaign/events?after=N
 ```
 
 并行 Round 预注册三次迭代（每次迭代为同类别、同 K、同 seed 的 random/k-center 成对运行），
-不会穷举所有候选组合。每个 Run 的排队、启动、结束、Round 就绪、AI 汇总和批次完成事件都会
-写入 `ResearchProject.experiment_progress`；Round 一旦完成三次迭代就先持久化成对指标摘要，
-前端无需等待其他创新点即可查看初步效应。选择性批次结束时发出 `batch_completed`，全部 Round
-完成时才发出 `campaign_completed`；完整批次还会继续流式发出结果锁定、统计分析、创新审查和
+不会穷举所有候选组合。系统先并行完成所有 Round 的第 1 次迭代，并发出
+`round_guidance_required`；用户可在每个 Round 卡片中提交一次指导，系统只重排该 Round
+已预注册的第 2、3 次迭代，不能改变方法、指标或数据边界。每个 Run 的排队、启动、结束、
+Round 指导、Round 汇总和批次完成事件都会写入 `ResearchProject.experiment_progress`；全部
+Round 完成时才发出 `campaign_completed`，随后继续流式发出结果锁定、统计分析、创新审查和
 报告就绪事件。实验指标仍只能来自本地真实执行器或明确标记的 Mock。

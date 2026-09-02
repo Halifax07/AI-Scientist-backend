@@ -142,10 +142,9 @@ def test_parallel_stream_executes_selected_rounds_and_persists_events(tmp_path):
     assert len(queued["experiment_campaign"]["rounds"]) == 2
     assert len(queued["runs"]) == 12
 
-    first_round_ids = queued["experiment_campaign"]["rounds"][0]["run_ids"]
     streamed = client.post(
         f"/api/v1/projects/{project.id}/experiment-campaign/execute-stream",
-        json={"max_parallel_runs": 2, "run_ids": first_round_ids},
+        json={"max_parallel_runs": 2},
     )
     assert streamed.status_code == 200
     frames = [
@@ -156,15 +155,62 @@ def test_parallel_stream_executes_selected_rounds_and_persists_events(tmp_path):
     event_types = [frame["event_type"] for frame in frames]
     assert event_types[0] == "campaign_started"
     assert "run_started" in event_types
-    assert "round_ready" in event_types
+    assert "round_guidance_required" in event_types
     assert "batch_completed" in event_types
     assert event_types[-1] == "stream_completed"
 
     partial = workflow.repository.get(project.id)
     assert partial.experiment_campaign is not None
-    assert partial.experiment_campaign.status == "active"
-    assert partial.experiment_campaign.rounds[0].result_summary["terminal_runs"] == 6
-    assert partial.experiment_campaign.rounds[0].result_summary["round_pair_count"] == 3
+    assert partial.experiment_campaign.status == "awaiting_guidance"
+    assert all(
+        item.status == "awaiting_guidance"
+        for item in partial.experiment_campaign.rounds
+    )
+    assert partial.experiment_campaign.rounds[0].result_summary["terminal_runs"] == 2
+    assert partial.experiment_campaign.rounds[0].result_summary["round_pair_count"] == 1
+
+    first_round_id = partial.experiment_campaign.rounds[0].id
+    reviewed = client.post(
+        f"/api/v1/projects/{project.id}/experiment-campaign/review",
+        json={
+            "round_id": first_round_id,
+            "user_guidance": "优先检验首轮趋势最可能失效的类别。",
+        },
+    )
+    assert reviewed.status_code == 200
+    after_first_guidance = reviewed.json()
+    assert after_first_guidance["experiment_campaign"]["status"] == "active"
+
+    continued = client.post(
+        f"/api/v1/projects/{project.id}/experiment-campaign/execute-stream",
+        json={"max_parallel_runs": 2},
+    )
+    assert continued.status_code == 200
+    continued_frames = [
+        json.loads(line[6:])
+        for line in continued.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    continued_event_types = [frame["event_type"] for frame in continued_frames]
+    assert "run_started" in continued_event_types
+    assert "batch_completed" in continued_event_types
+    assert continued_event_types[-1] == "stream_completed"
+
+    waiting = workflow.repository.get(project.id)
+    assert waiting.experiment_campaign is not None
+    assert waiting.experiment_campaign.status == "awaiting_guidance"
+    assert waiting.experiment_campaign.rounds[0].status == "ready_for_feedback"
+    assert waiting.experiment_campaign.rounds[1].status == "awaiting_guidance"
+
+    second_round_id = waiting.experiment_campaign.rounds[1].id
+    reviewed_second = client.post(
+        f"/api/v1/projects/{project.id}/experiment-campaign/review",
+        json={
+            "round_id": second_round_id,
+            "user_guidance": "保持对照条件不变，并补齐第二轮的敏感性验证。",
+        },
+    )
+    assert reviewed_second.status_code == 200
 
     streamed_remaining = client.post(
         f"/api/v1/projects/{project.id}/experiment-campaign/execute-stream",
@@ -192,4 +238,6 @@ def test_parallel_stream_executes_selected_rounds_and_persists_events(tmp_path):
         for run in final.runs
         if run.round_id is not None
     )
-    assert len(final.experiment_progress) == len(frames) + len(remaining_frames)
+    assert len(final.experiment_progress) == (
+        len(frames) + len(continued_frames) + len(remaining_frames)
+    )

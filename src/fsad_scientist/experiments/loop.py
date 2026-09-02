@@ -484,19 +484,153 @@ class AdaptiveExperimentPlanner:
             ),
         )
 
+    def remaining_round_cells(
+        self,
+        project: ResearchProject,
+        *,
+        round_id: str,
+    ) -> list[ExperimentCell]:
+        """Return queued, pre-registered cells for iterations 2–3 of a Round.
+
+        Parallel campaigns register all three iterations before execution.  A
+        midpoint guidance decision may reorder those frozen cells, but it must
+        not create new cells or silently expand the search space.
+        """
+
+        campaign = self._campaign(project)
+        current = next(
+            (item for item in campaign.rounds if item.id == round_id),
+            None,
+        )
+        if current is None:
+            raise ValueError(f"Unknown experiment round: {round_id}")
+        runs_by_id = {run.id: run for run in project.runs}
+        nodes_by_id = {node.id: node for node in campaign.nodes}
+        cells: list[ExperimentCell] = []
+        for node_id in current.node_ids:
+            node = nodes_by_id.get(node_id)
+            node_runs = [
+                runs_by_id[run_id]
+                for run_id in (node.run_ids if node else [])
+                if run_id in runs_by_id
+            ]
+            if node is None or node.iteration < 2 or not node_runs:
+                continue
+            if any(run.status != RunStatus.QUEUED for run in node_runs):
+                continue
+            reference = node_runs[0]
+            cells.append(
+                ExperimentCell(
+                    category=reference.category,
+                    shots=reference.shots,
+                    seed=reference.seed,
+                )
+            )
+        return cells
+
     def apply_midpoint_guidance(
         self,
         project: ResearchProject,
         *,
         proposal: ExperimentFeedbackProposal,
         summary: dict[str, Any],
+        round_id: str | None = None,
     ) -> list[ExperimentRun]:
         """Schedule iterations 2 and 3 inside the same innovation Round."""
 
         campaign = self._campaign(project)
-        current = campaign.rounds[-1]
+        current = next(
+            (item for item in campaign.rounds if item.id == round_id),
+            campaign.rounds[-1],
+        )
         if campaign.status != "awaiting_guidance" or current.status != "awaiting_guidance":
             raise ValueError("The current round is not waiting for midpoint guidance")
+
+        if campaign.execution_mode == "parallel":
+            # All three iterations already exist in the frozen parallel queue.
+            # Guidance can choose their order, but never adds a new run or
+            # changes the registered treatment/control/metric contract.
+            runs_by_id = {run.id: run for run in project.runs}
+            nodes_by_id = {node.id: node for node in campaign.nodes}
+            remaining_nodes = []
+            for node_id in current.node_ids:
+                node = nodes_by_id.get(node_id)
+                node_runs = [
+                    runs_by_id[run_id]
+                    for run_id in (node.run_ids if node else [])
+                    if run_id in runs_by_id
+                ]
+                if node is None or node.iteration < 2 or not node_runs:
+                    continue
+                if any(run.status != RunStatus.QUEUED for run in node_runs):
+                    continue
+                remaining_nodes.append((node, node_runs))
+            if len(remaining_nodes) != 2:
+                raise ValueError(
+                    "并行 Round 的预注册队列必须保留第 2、3 次迭代"
+                )
+            node_by_cell = {
+                (
+                    node_runs[0].category,
+                    node_runs[0].shots,
+                    node_runs[0].seed,
+                ): (node, node_runs)
+                for node, node_runs in remaining_nodes
+            }
+            ordered: list[tuple[ExperimentNodeRecord, list[ExperimentRun]]] = []
+            used_keys: set[tuple[str, int, int]] = set()
+            for cell in proposal.recommended_cells:
+                key = (cell.category, cell.shots, cell.seed)
+                item = node_by_cell.get(key)
+                if item is not None and key not in used_keys:
+                    ordered.append(item)
+                    used_keys.add(key)
+            for item in remaining_nodes:
+                node, node_runs = item
+                key = (node_runs[0].category, node_runs[0].shots, node_runs[0].seed)
+                if key not in used_keys:
+                    ordered.append(item)
+                    used_keys.add(key)
+            for iteration, (node, node_runs) in enumerate(ordered, start=2):
+                node.iteration = iteration
+                for run in node_runs:
+                    run.iteration = iteration
+            current.node_ids = [
+                node_id
+                for node, _ in ordered
+                for node_id in [node.id]
+            ] + [
+                node_id
+                for node_id in current.node_ids
+                if node_id not in {node.id for node, _ in ordered}
+            ]
+            current.run_ids = [
+                run.id
+                for node, node_runs in ordered
+                for run in node_runs
+            ] + [
+                run_id
+                for run_id in current.run_ids
+                if run_id not in {
+                    run.id for _, node_runs in ordered for run in node_runs
+                }
+            ]
+            current.completed_iterations = 1
+            current.guidance_received = True
+            current.feedback = proposal
+            current.result_summary = summary
+            current.status = "planned"
+            current.efficiency["planned_runs"] = len(current.run_ids)
+            # This Round now has queued work (iterations 2–3).  Mark the
+            # campaign active so the caller can immediately dispatch only its
+            # guided queue; other Rounds remain individually paused at their
+            # own guidance gates and are not selected by ``queued_runs``.
+            campaign.status = "active"
+            campaign.next_action = "execute_parallel_batch"
+            campaign.current_round = current.index
+            self._refresh_efficiency(campaign, project=project)
+            return [run for _, node_runs in ordered for run in node_runs]
+
         allowed = self.allowed_next_cells(project)
         allowed_by_key = {
             (item.category, item.shots, item.seed): item for item in allowed
@@ -621,9 +755,25 @@ class AdaptiveExperimentPlanner:
 
         if campaign.execution_mode == "parallel":
             # Parallel campaigns have one pre-registered Round per selected
-            # innovation.  Every Round already contains its three iterations,
-            # so completion of one Round must not block other Rounds.
+            # innovation.  The first iteration of every Round runs in parallel;
+            # after those results arrive each Round pauses once for human
+            # guidance before its queued iterations 2–3 are dispatched.
             by_id = {run.id: run for run in project.runs}
+
+            def completed_iteration_count(round_runs: list[ExperimentRun]) -> int:
+                completed = 0
+                for iteration in (1, 2, 3):
+                    iteration_runs = [
+                        run for run in round_runs if run.iteration == iteration
+                    ]
+                    if not iteration_runs or not all(
+                        run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                        for run in iteration_runs
+                    ):
+                        break
+                    completed = iteration
+                return completed
+
             for experiment_round in campaign.rounds:
                 round_runs = [
                     by_id[run_id]
@@ -655,15 +805,31 @@ class AdaptiveExperimentPlanner:
 
                 if not round_runs:
                     continue
+                first_iteration_runs = [
+                    run for run in round_runs if run.iteration == 1
+                ]
+                first_iteration_terminal = bool(first_iteration_runs) and all(
+                    run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                    for run in first_iteration_runs
+                )
                 terminal = all(
                     run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
                     for run in round_runs
                 )
-                if terminal:
-                    experiment_round.completed_iterations = min(
-                        experiment_round.iteration_target,
-                        max((run.iteration for run in round_runs), default=0),
+                running = any(run.status == RunStatus.RUNNING for run in round_runs)
+                experiment_round.completed_iterations = completed_iteration_count(
+                    round_runs
+                )
+                if not experiment_round.guidance_received and first_iteration_terminal:
+                    # Persist the first-iteration evidence immediately so the
+                    # UI can explain what was observed while waiting for the
+                    # user's one midpoint instruction for this Round.
+                    experiment_round.result_summary = self.summarize_round(
+                        project,
+                        round_id=experiment_round.id,
                     )
+                    experiment_round.status = "awaiting_guidance"
+                elif terminal and experiment_round.guidance_received:
                     experiment_round.completed_at = experiment_round.completed_at or utc_now()
                     # Persist the deterministic metric summary as soon as a
                     # Round becomes terminal.  The streaming UI can therefore
@@ -674,31 +840,39 @@ class AdaptiveExperimentPlanner:
                         project,
                         round_id=experiment_round.id,
                     )
-                    # Parallel mode deliberately removes the midpoint human
-                    # gate: ranking is the only required user action and the
-                    # three pre-registered iterations run automatically.
-                    experiment_round.guidance_received = True
                     if experiment_round.status != "completed":
                         experiment_round.status = "ready_for_feedback"
-                elif any(run.status == RunStatus.RUNNING for run in round_runs):
+                elif running:
                     experiment_round.status = "running"
                     experiment_round.started_at = experiment_round.started_at or utc_now()
                 else:
                     experiment_round.status = "planned"
 
+            pending_guidance = [
+                item for item in campaign.rounds
+                if item.status == "awaiting_guidance"
+            ]
             unfinished_rounds = [
                 item
                 for item in campaign.rounds
-                if item.status not in {"ready_for_feedback", "completed", "failed"}
+                if item.status in {"planned", "running"}
             ]
-            if unfinished_rounds:
+            ready_rounds = [
+                item for item in campaign.rounds
+                if item.status == "ready_for_feedback"
+            ]
+            if pending_guidance:
+                campaign.status = "awaiting_guidance"
+                campaign.next_action = "collect_midpoint_guidance"
+                campaign.current_round = min(item.index for item in pending_guidance)
+            elif unfinished_rounds:
                 campaign.status = "active"
                 campaign.next_action = "execute_parallel_batch"
                 campaign.current_round = min(item.index for item in unfinished_rounds)
-            elif any(item.status == "ready_for_feedback" for item in campaign.rounds):
+            elif ready_rounds:
                 campaign.status = "awaiting_feedback"
                 campaign.next_action = "review_parallel_rounds"
-                campaign.current_round = max(item.index for item in campaign.rounds)
+                campaign.current_round = max(item.index for item in ready_rounds)
             else:
                 campaign.status = "completed"
                 campaign.next_action = "analyze_verified_results"

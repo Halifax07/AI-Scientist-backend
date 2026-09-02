@@ -587,6 +587,7 @@ class ExperimentProgressEvent(BaseModel):
         "run_queued",
         "run_started",
         "run_finished",
+        "round_guidance_required",
         "round_ready",
         "round_completed",
         "batch_completed",

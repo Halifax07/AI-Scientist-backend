@@ -387,6 +387,21 @@ class ResearchWorkflow:
         if campaign.status != "active":
             raise InvalidTransitionError("The parallel campaign is not accepting runs")
         candidates = self.experiment_planner.queued_runs(project)
+        # Before every innovation Round receives its one midpoint decision,
+        # only its first pre-registered iteration may be dispatched.  This
+        # prevents a client from accidentally running iterations 2–3 before
+        # the human-in-the-loop gate is shown.
+        pending_round_ids = {
+            item.id
+            for item in campaign.rounds
+            if not item.guidance_received
+        }
+        if pending_round_ids:
+            candidates = [
+                item
+                for item in candidates
+                if item.round_id not in pending_round_ids or item.iteration == 1
+            ]
         if run_ids is not None:
             requested = set(run_ids)
             unknown = requested - {item.id for item in candidates}
@@ -1799,34 +1814,98 @@ class ResearchWorkflow:
         project_id: str,
         *,
         user_guidance: str | None = None,
+        round_id: str | None = None,
     ) -> ResearchProject:
         project = self.repository.get(project_id)
         campaign = project.experiment_campaign
         if campaign is None:
             raise InvalidTransitionError("The project has no experiment campaign")
+        if campaign.execution_mode == "parallel" and campaign.status == "awaiting_feedback":
+            # Parallel Rounds are reviewed together after their midpoint gates
+            # have all been completed; there is no second human approval gate.
+            return await self.complete_parallel_campaign(project_id)
         if campaign.status not in {"awaiting_guidance", "awaiting_feedback"}:
             raise ResultsRequiredError("The current experiment round is not ready for feedback")
 
-        summary = self.experiment_planner.summarize_current_round(project)
-        allowed_cells = self.experiment_planner.allowed_next_cells(project)
-        proposal = await self.runtime.recommend_next_experiments(
+        guidance_rounds = [
+            item for item in campaign.rounds
+            if item.status == "awaiting_guidance"
+        ]
+        if campaign.execution_mode == "parallel":
+            if round_id is not None:
+                current = next(
+                    (item for item in guidance_rounds if item.id == round_id),
+                    None,
+                )
+                if current is None:
+                    raise InvalidTransitionError(
+                        "The requested parallel Round is not waiting for guidance"
+                    )
+            else:
+                current = guidance_rounds[0] if guidance_rounds else None
+            if current is None:
+                raise ResultsRequiredError("No parallel Round is waiting for guidance")
+        else:
+            current = campaign.rounds[-1]
+        guidance = (user_guidance or "").strip()
+        if campaign.status == "awaiting_guidance" and not guidance:
+            raise InvalidTransitionError("每个 Round 中途必须提交一次用户指导")
+        summary = self.experiment_planner.summarize_round(
             project,
-            round_summary=summary,
-            allowed_cells=allowed_cells,
+            round_id=current.id,
         )
+        allowed_cells = (
+            self.experiment_planner.remaining_round_cells(
+                project,
+                round_id=current.id,
+            )
+            if campaign.execution_mode == "parallel"
+            else self.experiment_planner.allowed_next_cells(
+                project,
+                hypothesis_id=current.hypothesis_id,
+            )
+        )
+        advisor_project = project
+        if campaign.execution_mode == "parallel":
+            # The campaign keeps a stable primary hypothesis for summaries,
+            # while the advisor must receive the exact innovation represented
+            # by the Round whose guidance form was submitted.
+            advisor_project = project.model_copy(deep=True)
+            advisor_campaign = advisor_project.experiment_campaign
+            if advisor_campaign is not None:
+                advisor_campaign.hypothesis_id = current.hypothesis_id
+                advisor_campaign.treatment = current.treatment
+                advisor_campaign.control = current.control
+                advisor_campaign.metric = current.metric
+        try:
+            proposal = await self.runtime.recommend_next_experiments(
+                advisor_project,
+                round_summary=summary,
+                allowed_cells=allowed_cells,
+                user_guidance=guidance or None,
+            )
+        except TypeError as exc:
+            # Keep compatibility with test/custom runtimes that implement the
+            # pre-guidance advisor contract.  Built-in Qwen and mock runtimes
+            # accept the explicit guidance field above; only an unexpected
+            # keyword is retried without it.
+            if "user_guidance" not in str(exc):
+                raise
+            proposal = await self.runtime.recommend_next_experiments(
+                advisor_project,
+                round_summary=summary,
+                allowed_cells=allowed_cells,
+            )
         if campaign.status == "awaiting_guidance":
-            guidance = (user_guidance or "").strip()
-            if not guidance:
-                raise InvalidTransitionError("每个 Round 中途必须提交一次用户指导")
             try:
                 new_runs = self.experiment_planner.apply_midpoint_guidance(
                     project,
                     proposal=proposal,
                     summary=summary,
+                    round_id=current.id,
                 )
             except ValueError as exc:
                 raise InvalidTransitionError(str(exc)) from exc
-            current = campaign.rounds[-1]
             record = UserGuidanceRecord(
                 scope="round_iteration",
                 target_action="continue_round_iterations",
@@ -1847,7 +1926,10 @@ class ResearchWorkflow:
                 ],
             )
             project.guidance_records.append(record)
-            project.runs.extend(new_runs)
+            existing_run_ids = {run.id for run in project.runs}
+            project.runs.extend(
+                run for run in new_runs if run.id not in existing_run_ids
+            )
             project.status = ProjectStatus.WAITING_EXTERNAL
             project.next_action = campaign.next_action
             project.record_event(

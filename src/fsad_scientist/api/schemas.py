@@ -133,6 +133,7 @@ class ExecuteNextExperimentRequest(BaseModel):
 class ReviewExperimentRoundRequest(BaseModel):
     """One human decision gate between iteration 1 and iterations 2–3."""
 
+    round_id: str | None = Field(default=None, min_length=1, max_length=120)
     user_guidance: str | None = Field(default=None, min_length=2, max_length=3000)
 
 

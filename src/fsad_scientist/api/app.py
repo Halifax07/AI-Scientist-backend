@@ -782,6 +782,7 @@ def create_app(
         return await workflow.review_experiment_round(
             project_id,
             user_guidance=body.user_guidance if body else None,
+            round_id=body.round_id if body else None,
         )
 
     @app.post(
@@ -983,6 +984,7 @@ async def _stream_parallel_execution(
         event_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         state_lock = asyncio.Lock()
         round_ready_emitted: set[str] = set()
+        round_guidance_emitted: set[str] = set()
         embedding_cache: dict[str, DinoEmbeddingManifest] = {}
         embedding_locks: dict[str, asyncio.Lock] = {}
 
@@ -1104,8 +1106,26 @@ async def _stream_parallel_execution(
                                 refreshed = workflow.repository.get(project_id)
                                 refreshed_campaign = refreshed.experiment_campaign
                                 ready_rounds = []
+                                guidance_rounds = []
                                 if refreshed_campaign is not None:
                                     for experiment_round in refreshed_campaign.rounds:
+                                        if (
+                                            experiment_round.status == "awaiting_guidance"
+                                            and experiment_round.id not in round_guidance_emitted
+                                        ):
+                                            round_guidance_emitted.add(experiment_round.id)
+                                            guidance_rounds.append(
+                                                (
+                                                    experiment_round.id,
+                                                    experiment_round.index,
+                                                    experiment_round.hypothesis_id,
+                                                    experiment_round.status,
+                                                    workflow.experiment_planner.summarize_round(
+                                                        refreshed,
+                                                        round_id=experiment_round.id,
+                                                    ),
+                                                )
+                                            )
                                         if (
                                             experiment_round.status == "ready_for_feedback"
                                             and experiment_round.id not in round_ready_emitted
@@ -1123,6 +1143,24 @@ async def _stream_parallel_execution(
                                                     ),
                                                 )
                                             )
+                            for (
+                                guidance_round_id,
+                                guidance_round_index,
+                                guidance_hypothesis_id,
+                                guidance_status,
+                                guidance_summary,
+                            ) in guidance_rounds:
+                                await emit(
+                                    "round_guidance_required",
+                                    (
+                                        f"Round {guidance_round_index} 的第 1 次迭代已完成，"
+                                        "请提交一次指导后继续第 2、3 次迭代。"
+                                    ),
+                                    round_id=guidance_round_id,
+                                    hypothesis_id=guidance_hypothesis_id,
+                                    status=guidance_status,
+                                    payload={"summary": guidance_summary},
+                                )
                             for (
                                 ready_round_id,
                                 ready_round_index,

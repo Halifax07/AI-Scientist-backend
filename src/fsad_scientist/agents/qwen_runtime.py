@@ -320,6 +320,7 @@ class QwenScientistRuntime(MockScientistRuntime):
         *,
         round_summary: dict[str, Any],
         allowed_cells: list[ExperimentCell],
+        user_guidance: str | None = None,
     ) -> ExperimentFeedbackProposal:
         """Use Qwen as a scientific advisor inside a deterministic action boundary."""
 
@@ -331,7 +332,11 @@ class QwenScientistRuntime(MockScientistRuntime):
                     "你的输出必须包含完整的推理过程，让非专业用户也能理解决策逻辑。\n\n"
                     "【当前实验语义】一个 Round 只验证一个创新点，固定包含 3 次预注册迭代。"
                     "默认执行模式是 parallel：多个已选创新点各自拥有独立 Round，三次迭代由本机"
-                    "并行调度，不能要求用户逐 Run 或逐 Round 批准，也不能把不同创新点的结果合并。"
+                    "并行调度；每个 Round 的第 1 次迭代完成后必须等待一次用户指导，"
+                    "再自动执行第 2、3 次迭代。"
+                    "不能要求用户逐 Run 批准，也不能把不同创新点的结果合并。"
+                    "用户在首轮后提交的指导意见是本 Round 后续两次迭代的软约束；应尽量采纳，"
+                    "但不得突破预注册的创新点、数据隔离、三次迭代和测试标签隔离约束。"
                     "兼容旧 sequential 模式时，completed_iterations=1 才允许一次中途指导；"
                     "completed_iterations=3 时只汇总当前 Round。\n\n"
                     "【决策类型】你可以给出以下决策：\n"
@@ -384,12 +389,13 @@ class QwenScientistRuntime(MockScientistRuntime):
                             else "sequential"
                         ),
                         "human_guidance_gate": (
-                            "none_for_parallel"
+                            "after_iteration_1_per_round"
                             if project.experiment_campaign is not None
                             and project.experiment_campaign.execution_mode == "parallel"
                             else "after_iteration_1_only"
                         ),
                     },
+                    "user_guidance": user_guidance or "",
                     "recent_human_guidance": [
                         item.model_dump(mode="json")
                         for item in project.guidance_records[-8:]
@@ -456,6 +462,7 @@ class QwenScientistRuntime(MockScientistRuntime):
                 project,
                 round_summary=round_summary,
                 allowed_cells=allowed_cells,
+                user_guidance=user_guidance,
             )
             fallback.advisor = f"{self.name}:deterministic-fallback"
             fallback.observed_patterns.append(

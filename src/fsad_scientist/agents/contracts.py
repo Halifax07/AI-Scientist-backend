@@ -49,6 +49,7 @@ class ScientistRuntime(Protocol):
         *,
         round_summary: dict[str, Any],
         allowed_cells: list[ExperimentCell],
+        user_guidance: str | None = None,
     ) -> ExperimentFeedbackProposal: ...
 
     async def interpret_experiment_guidance(
