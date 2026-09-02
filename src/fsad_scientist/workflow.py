@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from itertools import product
@@ -21,9 +22,12 @@ from fsad_scientist.domain.models import (
     ArtifactRecord,
     DatasetAuditRecord,
     EvidenceRecord,
+    ExperimentFeedbackProposal,
     ExperimentGuidanceDecision,
+    ExperimentProgressEvent,
     ExperimentRun,
     Hypothesis,
+    HypothesisRanking,
     MethodImplementation,
     ProjectSpec,
     ResearchProject,
@@ -93,6 +97,454 @@ class ResearchWorkflow:
             action="create_project",
             summary="用户提供研究领域、数据、现实约束和计算预算。",
         )
+        return self.repository.save(project)
+
+    async def advance_to_hypothesis_ranking(self, project_id: str) -> ResearchProject:
+        """Run all machine-only discovery stages and stop at the ranking gate.
+
+        Problem formalisation, evidence retrieval, gap discovery and candidate
+        generation are deterministic workflow transitions from the user's point
+        of view.  The only intentional pause is after candidates exist, where a
+        human can review and score them before any experiment budget is spent.
+        """
+
+        project = self.repository.get(project_id)
+        automatic_stages = {
+            ResearchStage.CREATED,
+            ResearchStage.SCOPE_FORMALIZED,
+            ResearchStage.EVIDENCE_READY,
+            ResearchStage.GAPS_DISCOVERED,
+        }
+        while project.stage in automatic_stages:
+            project = await self.advance(project.id)
+        if project.stage not in {
+            ResearchStage.HYPOTHESES_PROPOSED,
+            ResearchStage.HYPOTHESES_REVIEWED,
+            ResearchStage.AWAITING_EXPERIMENT_APPROVAL,
+            ResearchStage.EXPERIMENTS_QUEUED,
+            ResearchStage.RESULTS_READY,
+            ResearchStage.RESULTS_ANALYZED,
+            ResearchStage.INNOVATION_REVIEWED,
+            ResearchStage.REPORT_READY,
+        }:
+            raise InvalidTransitionError(
+                f"The project cannot enter hypothesis ranking from {project.stage}"
+            )
+        if project.stage == ResearchStage.HYPOTHESES_PROPOSED:
+            project = await self._ensure_hypothesis_review(project)
+        return project
+
+    async def rank_hypotheses(
+        self,
+        project_id: str,
+        *,
+        rankings: list[HypothesisRanking],
+        auto_preregister: bool = True,
+    ) -> ResearchProject:
+        """Apply a human ranking and optionally generate the preregistration.
+
+        The skeptic/meta-review agent still supplies machine scores, but those
+        scores are shown as advice.  User selection and priority are persisted
+        separately and become the sole source of the experiment portfolio.
+        """
+
+        project = self.repository.get(project_id)
+        if project.stage == ResearchStage.HYPOTHESES_PROPOSED:
+            project = await self._ensure_hypothesis_review(project)
+        elif project.stage != ResearchStage.HYPOTHESES_REVIEWED:
+            raise InvalidTransitionError(
+                "Hypothesis ranking is only available after automatic candidate generation"
+            )
+
+        if not rankings:
+            raise InvalidTransitionError("At least one hypothesis ranking is required")
+        by_id = {item.id: item for item in project.hypotheses}
+        unknown = [item.hypothesis_id for item in rankings if item.hypothesis_id not in by_id]
+        if unknown:
+            raise InvalidTransitionError(
+                "Unknown hypothesis ids in ranking: " + ", ".join(unknown)
+            )
+        ranking_by_id = {item.hypothesis_id: item for item in rankings}
+        if len(ranking_by_id) != len(rankings):
+            raise InvalidTransitionError("Each hypothesis may appear only once in a ranking")
+        selected = [item for item in rankings if item.selected]
+        if not selected:
+            raise InvalidTransitionError("Select at least one innovation for validation")
+
+        for hypothesis in project.hypotheses:
+            ranking = ranking_by_id.get(hypothesis.id)
+            hypothesis.user_selected = bool(ranking and ranking.selected)
+            hypothesis.user_priority = ranking.priority if ranking else None
+            hypothesis.user_score = ranking.score if ranking else None
+            hypothesis.user_review_note = ranking.note if ranking else None
+            if hypothesis.user_selected:
+                hypothesis.status = HypothesisStatus.SHORTLISTED
+            elif hypothesis.status not in {
+                HypothesisStatus.SUPPORTED,
+                HypothesisStatus.REJECTED,
+                HypothesisStatus.REVISED,
+            }:
+                hypothesis.status = HypothesisStatus.CANDIDATE
+
+        selected_ids = [item.hypothesis_id for item in sorted(
+            selected,
+            key=lambda item: (item.priority, -item.score, item.hypothesis_id),
+        )]
+        unselected = [
+            item
+            for item in project.hypotheses
+            if item.id not in set(selected_ids)
+        ]
+        unselected.sort(key=lambda item: -(item.score.elo if item.score else 0.0))
+        project.hypotheses = [
+            *(by_id[item_id] for item_id in selected_ids),
+            *unselected,
+        ]
+        # The ranking gate is the only user interaction before execution.  If a
+        # selected candidate names a custom selection strategy, generate and
+        # validate that adapter in the background now; the user should not have
+        # to leave the ranking screen and perform a separate implementation step.
+        self._ensure_executable_hypotheses(project)
+        self.repository.save(project)
+        project = await self._prepare_selected_hypothesis_implementations(
+            project.id,
+            selected_ids=selected_ids,
+        )
+        self._move(
+            project,
+            stage=ResearchStage.HYPOTHESES_REVIEWED,
+            status=ProjectStatus.ACTIVE,
+            next_action="design_preregistered_experiment",
+            actor="human_hypothesis_reviewer",
+            summary=(
+                f"用户已完成假设审阅与优先级筛选，选择 {len(selected_ids)} 个创新点进入验证。"
+            ),
+            payload={
+                "selected_hypothesis_ids": selected_ids,
+                "ranking_count": len(rankings),
+                "human_gate": "ranking_only",
+            },
+        )
+        project = self.repository.save(project)
+        if auto_preregister:
+            project = await self.advance(project.id)
+        return project
+
+    async def _ensure_hypothesis_review(
+        self,
+        project: ResearchProject,
+    ) -> ResearchProject:
+        """Materialize machine scores before showing the human ranking table."""
+
+        if project.hypotheses and all(item.score is not None for item in project.hypotheses):
+            return project
+        project.hypotheses = await self.runtime.review_hypotheses(project)
+        project.record_event(
+            actor="skeptic_and_meta_review_agents",
+            action="automatic_hypothesis_review",
+            summary="候选假设已由后台反驳与元审查智能体自动评分，等待用户排序筛选。",
+            payload={
+                "hypothesis_count": len(project.hypotheses),
+                "human_gate": "ranking_only",
+            },
+        )
+        return self.repository.save(project)
+
+    async def _prepare_selected_hypothesis_implementations(
+        self,
+        project_id: str,
+        *,
+        selected_ids: list[str],
+    ) -> ResearchProject:
+        """Make every user-selected innovation executable before planning.
+
+        Built-in ``random``/``k_center`` comparisons need no generation.  For a
+        custom strategy, the runtime creates a pure function and the existing
+        static-validation plus smoke-test gates register it as ``validated``.
+        A failed adapter is surfaced at the ranking request instead of being
+        silently dropped from the user's selected portfolio.
+        """
+
+        project = self.repository.get(project_id)
+        for hypothesis_id in selected_ids:
+            project = self.repository.get(project_id)
+            hypothesis = next(
+                (item for item in project.hypotheses if item.id == hypothesis_id),
+                None,
+            )
+            if hypothesis is None or hypothesis.analysis_contract is None:
+                raise InvalidTransitionError(
+                    f"Selected innovation has no analysis contract: {hypothesis_id}"
+                )
+            contract = hypothesis.analysis_contract
+            if contract.kind not in {"selection_main_effect", "query_adaptation"}:
+                raise InvalidTransitionError(
+                    f"Selected innovation {hypothesis_id} is not supported by the current "
+                    "experiment executor"
+                )
+            missing = [
+                name
+                for name in (contract.treatment, contract.control)
+                if name not in BUILTIN_STRATEGIES
+                and not any(
+                    implementation.hypothesis_id == hypothesis_id
+                    and implementation.kind == "selection_strategy"
+                    and implementation.name == name
+                    and implementation.status in {"validated", "approved"}
+                    for implementation in project.method_implementations
+                )
+            ]
+            if not missing:
+                continue
+            try:
+                project = await self.implement_experiment_method(
+                    project_id,
+                    hypothesis_id=hypothesis_id,
+                )
+            except (InvalidTransitionError, ValueError) as exc:
+                raise InvalidTransitionError(
+                    f"创新点 {hypothesis_id} 的自动方法实现失败：{exc}"
+                ) from exc
+            refreshed = self.repository.get(project_id)
+            refreshed_hypothesis = next(
+                (item for item in refreshed.hypotheses if item.id == hypothesis_id),
+                None,
+            )
+            if refreshed_hypothesis is None or refreshed_hypothesis.analysis_contract is None:
+                raise InvalidTransitionError(
+                    f"自动方法实现后找不到创新点：{hypothesis_id}"
+                )
+            unresolved = [
+                name
+                for name in (
+                    refreshed_hypothesis.analysis_contract.treatment,
+                    refreshed_hypothesis.analysis_contract.control,
+                )
+                if name not in BUILTIN_STRATEGIES
+                and not any(
+                    implementation.hypothesis_id == hypothesis_id
+                    and implementation.kind == "selection_strategy"
+                    and implementation.name == name
+                    and implementation.status in {"validated", "approved"}
+                    for implementation in refreshed.method_implementations
+                )
+            ]
+            if unresolved:
+                raise InvalidTransitionError(
+                    f"创新点 {hypothesis_id} 仍缺少可执行策略：{', '.join(unresolved)}"
+                )
+            project = refreshed
+        return project
+
+    def record_experiment_progress(
+        self,
+        project_id: str,
+        *,
+        event_type: str,
+        message: str,
+        campaign_id: str | None = None,
+        round_id: str | None = None,
+        hypothesis_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        progress: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> ExperimentProgressEvent:
+        """Append one durable structured event for SSE/replay consumers."""
+
+        project = self.repository.get(project_id)
+        event = ExperimentProgressEvent(
+            sequence=(project.experiment_progress[-1].sequence + 1)
+            if project.experiment_progress
+            else 1,
+            event_type=event_type,  # type: ignore[arg-type]
+            message=message,
+            campaign_id=campaign_id,
+            round_id=round_id,
+            hypothesis_id=hypothesis_id,
+            run_id=run_id,
+            status=status,
+            progress=progress,
+            payload=payload or {},
+        )
+        project.experiment_progress.append(event)
+        self.repository.save(project)
+        return event
+
+    def select_parallel_runs(
+        self,
+        project_id: str,
+        *,
+        run_ids: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[ExperimentRun]:
+        """Select queued runs from all active parallel innovation Rounds."""
+
+        project = self.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            raise InvalidTransitionError("The project has no parallel experiment campaign")
+        if campaign.status != "active":
+            raise InvalidTransitionError("The parallel campaign is not accepting runs")
+        candidates = self.experiment_planner.queued_runs(project)
+        # Before every innovation Round receives its one midpoint decision,
+        # only its first pre-registered iteration may be dispatched.  This
+        # prevents a client from accidentally running iterations 2–3 before
+        # the human-in-the-loop gate is shown.
+        pending_round_ids = {
+            item.id
+            for item in campaign.rounds
+            if not item.guidance_received
+        }
+        if pending_round_ids:
+            candidates = [
+                item
+                for item in candidates
+                if item.round_id not in pending_round_ids or item.iteration == 1
+            ]
+        if run_ids is not None:
+            requested = set(run_ids)
+            unknown = requested - {item.id for item in candidates}
+            if unknown:
+                raise InvalidTransitionError(
+                    "Requested runs are not queued in the active campaign: "
+                    + ", ".join(sorted(unknown))
+                )
+            candidates = [item for item in candidates if item.id in requested]
+        if limit is not None:
+            candidates = candidates[:limit]
+        if not candidates:
+            raise ResultsRequiredError("No queued experiment is available in the parallel campaign")
+        project.record_event(
+            actor="parallel_experiment_scheduler",
+            action="select_parallel_runs",
+            summary=f"已选择 {len(candidates)} 个跨创新点实验运行并准备并行执行。",
+            payload={
+                "run_ids": [item.id for item in candidates],
+                "round_ids": sorted({item.round_id for item in candidates if item.round_id}),
+            },
+        )
+        self.repository.save(project)
+        return candidates
+
+    def fail_parallel_campaign(
+        self,
+        project_id: str,
+        *,
+        reason: str,
+    ) -> ResearchProject:
+        """Persist a fatal scheduler error without fabricating experiment results."""
+
+        project = self.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            raise InvalidTransitionError("The project has no parallel experiment campaign")
+        if campaign.status != "completed":
+            campaign.status = "failed"
+            campaign.termination_reason = f"parallel_stream_failed: {reason[:500]}"
+            campaign.next_action = "inspect_failed_parallel_campaign"
+            campaign.completed_at = utc_now()
+            project.status = ProjectStatus.WAITING_EXTERNAL
+            project.next_action = campaign.next_action
+            project.record_event(
+                actor="parallel_experiment_scheduler",
+                action="fail_parallel_campaign",
+                summary="并行实验调度发生致命错误；系统保留已完成结果并停止继续执行。",
+                payload={"reason": reason},
+            )
+            return self.repository.save(project)
+        return project
+
+    async def complete_parallel_campaign(self, project_id: str) -> ResearchProject:
+        """Analyze each completed parallel Round and close the campaign.
+
+        The advisor is invoked per innovation on an immutable project snapshot so
+        Qwen calls can run concurrently without races in the durable ledger.
+        """
+
+        project = self.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            raise InvalidTransitionError("The project has no parallel experiment campaign")
+        campaign_run_ids = {
+            run_id
+            for experiment_round in campaign.rounds
+            for run_id in experiment_round.run_ids
+        }
+        if any(
+            run.status not in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+            for run in project.runs
+            if run.id in campaign_run_ids
+        ):
+            raise ResultsRequiredError("Parallel campaign still has non-terminal runs")
+
+        ready = [
+            item
+            for item in campaign.rounds
+            if item.status in {"ready_for_feedback", "completed"}
+        ]
+        if not ready:
+            raise ResultsRequiredError("No completed parallel Round is ready for analysis")
+
+        async def review_one(experiment_round):
+            snapshot = project.model_copy(deep=True)
+            snapshot_campaign = snapshot.experiment_campaign
+            if snapshot_campaign is None:
+                raise InvalidTransitionError("The project has no experiment campaign")
+            snapshot_campaign.hypothesis_id = experiment_round.hypothesis_id
+            snapshot_campaign.treatment = experiment_round.treatment
+            snapshot_campaign.control = experiment_round.control
+            snapshot_campaign.metric = experiment_round.metric
+            summary = self.experiment_planner.summarize_round(
+                snapshot, round_id=experiment_round.id
+            )
+            try:
+                proposal = await self.runtime.recommend_next_experiments(
+                    snapshot,
+                    round_summary=summary,
+                    allowed_cells=[],
+                )
+            except Exception as exc:  # pragma: no cover - defensive runtime boundary
+                proposal = ExperimentFeedbackProposal(
+                    advisor=self.runtime.name,
+                    decision="diagnose",
+                    rationale=f"自动分析智能体暂不可用：{type(exc).__name__}: {exc}",
+                    next_phase="complete",
+                    stop=False,
+                )
+            return experiment_round.id, summary, proposal
+
+        reviews = await asyncio.gather(*(review_one(item) for item in ready))
+        for round_id, summary, proposal in reviews:
+            current = next(item for item in campaign.rounds if item.id == round_id)
+            current.result_summary = summary
+            current.feedback = proposal
+            current.status = "completed"
+            current.completed_at = current.completed_at or utc_now()
+            self.experiment_planner._update_nodes_for_round(
+                campaign, current, project, summary
+            )
+            project.record_event(
+                actor=proposal.advisor,
+                action="complete_parallel_round",
+                summary=(
+                    f"Round {current.index}（{current.hypothesis_id}）已完成统计汇总，"
+                    "结果已加入创新点审查队列。"
+                ),
+                payload={
+                    "round_id": current.id,
+                    "hypothesis_id": current.hypothesis_id,
+                    "summary": summary,
+                    "feedback": proposal.model_dump(mode="json"),
+                },
+            )
+        campaign.status = "completed"
+        campaign.current_round = max(item.index for item in campaign.rounds)
+        campaign.next_action = "analyze_verified_results"
+        campaign.termination_reason = "selected_innovations_completed_in_parallel"
+        campaign.completed_at = utc_now()
+        project.status = ProjectStatus.WAITING_EXTERNAL
+        project.next_action = campaign.next_action
         return self.repository.save(project)
 
     async def start_next_research_cycle(
@@ -1135,6 +1587,9 @@ class ResearchWorkflow:
         detector: str = "anomalydino",
         max_rounds: int = 3,
         max_runs: int = 24,
+        execution_mode: Literal["sequential", "parallel"] = "sequential",
+        parallelism: int | None = None,
+        selected_hypothesis_ids: list[str] | None = None,
     ) -> ResearchProject:
         project = self.repository.get(project_id)
         if project.stage != ResearchStage.EXPERIMENTS_QUEUED:
@@ -1187,6 +1642,9 @@ class ResearchWorkflow:
                 detector=detector,
                 max_rounds=max_rounds,
                 max_runs=max_runs,
+                execution_mode=execution_mode,
+                parallelism=parallelism,
+                selected_hypothesis_ids=selected_hypothesis_ids,
             )
         except ValueError as exc:
             raise InvalidTransitionError(str(exc)) from exc
@@ -1199,7 +1657,11 @@ class ResearchWorkflow:
             action="initialize_experiment_campaign",
             summary=(
                 "已建立创新点驱动的闭环实验队列；每个创新点对应一个 Round，"
-                "每个 Round 固定三次内部迭代，并在第 1 次迭代后接受一次用户指导。"
+                + (
+                    "多个 Round 已预注册并行执行，每个 Round 固定三次自动迭代。"
+                    if execution_mode == "parallel"
+                    else "每个 Round 固定三次内部迭代，并在第 1 次迭代后接受一次用户指导。"
+                )
             ),
             payload={
                 "campaign_id": campaign.id,
@@ -1209,9 +1671,69 @@ class ResearchWorkflow:
                 "max_rounds": campaign.max_rounds,
                 "max_runs": campaign.max_runs,
                 "exhaustive_run_count": campaign.exhaustive_run_count,
+                "execution_mode": campaign.execution_mode,
+                "parallelism": campaign.parallelism,
+                "selected_hypothesis_ids": campaign.selected_hypothesis_ids,
             },
         )
         return self.repository.save(project)
+
+    async def auto_start_parallel_campaign(
+        self,
+        project_id: str,
+        *,
+        dataset: DatasetManifest,
+        hypothesis_id: str,
+        selected_hypothesis_ids: list[str] | None = None,
+        device: str = "cuda:0",
+        detector: str = "anomalydino",
+        max_rounds: int = 20,
+        max_runs: int = 240,
+        parallelism: int | None = None,
+    ) -> ResearchProject:
+        """Automatically preregister and start a selected innovation portfolio."""
+
+        project = self.repository.get(project_id)
+        if project.stage == ResearchStage.HYPOTHESES_REVIEWED:
+            project = await self.advance(project_id)
+        if project.stage == ResearchStage.AWAITING_EXPERIMENT_APPROVAL:
+            project = self.approve_experiment_plan(
+                project_id,
+                approved_by="automatic_preregistration_after_human_ranking",
+            )
+        if project.stage != ResearchStage.EXPERIMENTS_QUEUED:
+            raise InvalidTransitionError(
+                "Rank hypotheses and complete dataset audit before starting the parallel campaign"
+            )
+        if project.experiment_campaign is not None:
+            if project.experiment_campaign.execution_mode == "parallel":
+                return project
+            if project.experiment_campaign.status != "completed":
+                raise InvalidTransitionError(
+                    "The project already has an active experiment campaign"
+                )
+        selected = selected_hypothesis_ids or [
+            item.id
+            for item in project.hypotheses
+            if item.user_selected is not False
+            and item.status in {HypothesisStatus.SHORTLISTED, HypothesisStatus.APPROVED}
+        ]
+        if not selected:
+            raise InvalidTransitionError(
+                "Select at least one innovation before starting experiments"
+            )
+        return self.initialize_experiment_campaign(
+            project_id,
+            dataset=dataset,
+            hypothesis_id=hypothesis_id,
+            device=device,
+            detector=detector,
+            max_rounds=max_rounds,
+            max_runs=max_runs,
+            execution_mode="parallel",
+            parallelism=parallelism,
+            selected_hypothesis_ids=selected,
+        )
 
     async def select_next_experiment(
         self,
@@ -1292,34 +1814,98 @@ class ResearchWorkflow:
         project_id: str,
         *,
         user_guidance: str | None = None,
+        round_id: str | None = None,
     ) -> ResearchProject:
         project = self.repository.get(project_id)
         campaign = project.experiment_campaign
         if campaign is None:
             raise InvalidTransitionError("The project has no experiment campaign")
+        if campaign.execution_mode == "parallel" and campaign.status == "awaiting_feedback":
+            # Parallel Rounds are reviewed together after their midpoint gates
+            # have all been completed; there is no second human approval gate.
+            return await self.complete_parallel_campaign(project_id)
         if campaign.status not in {"awaiting_guidance", "awaiting_feedback"}:
             raise ResultsRequiredError("The current experiment round is not ready for feedback")
 
-        summary = self.experiment_planner.summarize_current_round(project)
-        allowed_cells = self.experiment_planner.allowed_next_cells(project)
-        proposal = await self.runtime.recommend_next_experiments(
+        guidance_rounds = [
+            item for item in campaign.rounds
+            if item.status == "awaiting_guidance"
+        ]
+        if campaign.execution_mode == "parallel":
+            if round_id is not None:
+                current = next(
+                    (item for item in guidance_rounds if item.id == round_id),
+                    None,
+                )
+                if current is None:
+                    raise InvalidTransitionError(
+                        "The requested parallel Round is not waiting for guidance"
+                    )
+            else:
+                current = guidance_rounds[0] if guidance_rounds else None
+            if current is None:
+                raise ResultsRequiredError("No parallel Round is waiting for guidance")
+        else:
+            current = campaign.rounds[-1]
+        guidance = (user_guidance or "").strip()
+        if campaign.status == "awaiting_guidance" and not guidance:
+            raise InvalidTransitionError("每个 Round 中途必须提交一次用户指导")
+        summary = self.experiment_planner.summarize_round(
             project,
-            round_summary=summary,
-            allowed_cells=allowed_cells,
+            round_id=current.id,
         )
+        allowed_cells = (
+            self.experiment_planner.remaining_round_cells(
+                project,
+                round_id=current.id,
+            )
+            if campaign.execution_mode == "parallel"
+            else self.experiment_planner.allowed_next_cells(
+                project,
+                hypothesis_id=current.hypothesis_id,
+            )
+        )
+        advisor_project = project
+        if campaign.execution_mode == "parallel":
+            # The campaign keeps a stable primary hypothesis for summaries,
+            # while the advisor must receive the exact innovation represented
+            # by the Round whose guidance form was submitted.
+            advisor_project = project.model_copy(deep=True)
+            advisor_campaign = advisor_project.experiment_campaign
+            if advisor_campaign is not None:
+                advisor_campaign.hypothesis_id = current.hypothesis_id
+                advisor_campaign.treatment = current.treatment
+                advisor_campaign.control = current.control
+                advisor_campaign.metric = current.metric
+        try:
+            proposal = await self.runtime.recommend_next_experiments(
+                advisor_project,
+                round_summary=summary,
+                allowed_cells=allowed_cells,
+                user_guidance=guidance or None,
+            )
+        except TypeError as exc:
+            # Keep compatibility with test/custom runtimes that implement the
+            # pre-guidance advisor contract.  Built-in Qwen and mock runtimes
+            # accept the explicit guidance field above; only an unexpected
+            # keyword is retried without it.
+            if "user_guidance" not in str(exc):
+                raise
+            proposal = await self.runtime.recommend_next_experiments(
+                advisor_project,
+                round_summary=summary,
+                allowed_cells=allowed_cells,
+            )
         if campaign.status == "awaiting_guidance":
-            guidance = (user_guidance or "").strip()
-            if not guidance:
-                raise InvalidTransitionError("每个 Round 中途必须提交一次用户指导")
             try:
                 new_runs = self.experiment_planner.apply_midpoint_guidance(
                     project,
                     proposal=proposal,
                     summary=summary,
+                    round_id=current.id,
                 )
             except ValueError as exc:
                 raise InvalidTransitionError(str(exc)) from exc
-            current = campaign.rounds[-1]
             record = UserGuidanceRecord(
                 scope="round_iteration",
                 target_action="continue_round_iterations",
@@ -1340,7 +1926,10 @@ class ResearchWorkflow:
                 ],
             )
             project.guidance_records.append(record)
-            project.runs.extend(new_runs)
+            existing_run_ids = {run.id for run in project.runs}
+            project.runs.extend(
+                run for run in new_runs if run.id not in existing_run_ids
+            )
             project.status = ProjectStatus.WAITING_EXTERNAL
             project.next_action = campaign.next_action
             project.record_event(

@@ -78,7 +78,7 @@ def test_agent_runtime_failure_returns_readable_cors_error(tmp_path):
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
 
 
-def test_next_research_cycle_endpoint_requires_and_records_guidance(tmp_path):
+def test_next_research_cycle_endpoint_requires_evidence_for_revision(tmp_path):
     app = create_app(
         settings=Settings(runtime="mock"),
         storage_path=tmp_path / "cycle-ledger",
@@ -120,8 +120,9 @@ def test_next_research_cycle_endpoint_requires_and_records_guidance(tmp_path):
         f"/api/v1/projects/{project.id}/research-cycles/next",
         json={"user_guidance": "聚焦失败类别并缩小假设范围。"},
     )
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["research_cycle"] == 2
-    assert payload["guidance_records"][-1]["disposition"] == "applied"
-    assert payload["guidance_records"][-1]["affected_ids"]
+    # The latest workflow intentionally refuses a new cycle when all findings
+    # are ``not_tested`` because the run pair count is below the preregistered
+    # evidence threshold.  A user suggestion cannot turn missing evidence into
+    # a revision trigger.
+    assert response.status_code == 409
+    assert "evidence" in response.json()["detail"].lower()
