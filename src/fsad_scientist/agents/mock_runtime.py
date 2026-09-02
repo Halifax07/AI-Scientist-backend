@@ -383,6 +383,7 @@ class MockScientistRuntime:
                         for implementation in registered
                     )
                 )
+                and item.user_selected is not False
                 and item.status
                 in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
             ],
@@ -448,6 +449,7 @@ class MockScientistRuntime:
         *,
         round_summary: dict[str, Any],
         allowed_cells: list[ExperimentCell],
+        user_guidance: str | None = None,
     ) -> ExperimentFeedbackProposal:
         """Deterministic fallback for the result-to-next-plan decision."""
 
@@ -595,6 +597,38 @@ class MockScientistRuntime:
                 confidence="中",
             )
 
+        guidance_note = (user_guidance or "").strip()
+        guided_cells = list(allowed_cells)
+        if guidance_note and guided_cells:
+            normalized_guidance = guidance_note.casefold()
+
+            def guidance_score(cell: ExperimentCell) -> int:
+                score = 0
+                category = cell.category.casefold()
+                if category in normalized_guidance:
+                    score += 4
+                if (
+                    f"k={cell.shots}" in normalized_guidance
+                    or f"k {cell.shots}" in normalized_guidance
+                    or f"{cell.shots}-shot" in normalized_guidance
+                ):
+                    score += 2
+                if f"seed={cell.seed}" in normalized_guidance:
+                    score += 1
+                return score
+
+            guided_cells = [
+                cell
+                for _, cell in sorted(
+                    enumerate(guided_cells),
+                    key=lambda item: (-guidance_score(item[1]), item[0]),
+                )
+            ]
+            rationale += (
+                " 已记录用户指导，并在不改变预注册空间的前提下用于后续迭代排序："
+                f"{guidance_note[:120]}"
+            )
+
         return ExperimentFeedbackProposal(
             advisor=self.name,
             decision=decision,
@@ -610,7 +644,7 @@ class MockScientistRuntime:
                 f"主指标饱和 {primary_saturated}",
             ],
             next_phase=phase,
-            recommended_cells=[] if decision == "stop" else allowed_cells[:2],
+            recommended_cells=[] if decision == "stop" else guided_cells[:2],
             strategy_adjustment={},
             expected_information_gain=0.85 if decision == "diagnose" else 0.72,
             stop=decision == "stop",
@@ -794,7 +828,8 @@ class MockScientistRuntime:
                         hypothesis_id=hypothesis.id,
                         statement="尚无足够的预注册成对真实结果，当前证据不足。",
                         boundary_conditions=["需要相同数据、类别、检测器、K 和 seed 的配对运行"],
-                        claim_verdict="not_tested",  # 配对数不足时标记为 not_tested 而非 inconclusive，避免触发无限修订循环
+                        # 配对数不足时标记为 not_tested，避免触发无限修订循环。
+                        claim_verdict="not_tested",
                         verified=False,
                     )
                 )

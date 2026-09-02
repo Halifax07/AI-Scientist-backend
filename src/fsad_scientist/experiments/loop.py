@@ -76,6 +76,9 @@ class AdaptiveExperimentPlanner:
         detector: str = "anomalydino",
         max_rounds: int = 3,
         max_runs: int = 24,
+        execution_mode: Literal["sequential", "parallel"] = "sequential",
+        parallelism: int | None = None,
+        selected_hypothesis_ids: list[str] | None = None,
     ) -> tuple[ExperimentCampaign, list[ExperimentRun]]:
         plan = project.experiment_plan
         if plan is None or not plan.approved:
@@ -89,13 +92,29 @@ class AdaptiveExperimentPlanner:
             )
 
         hypothesis = self._select_hypothesis(project, hypothesis_id=hypothesis_id)
-        hypothesis_ids = [
+        eligible_hypothesis_ids = [
             hypothesis.id,
             *[
                 item.id
                 for item in self._eligible_hypotheses(project)
                 if item.id != hypothesis.id
             ],
+        ]
+        requested_ids = list(dict.fromkeys(selected_hypothesis_ids or eligible_hypothesis_ids))
+        if hypothesis.id not in requested_ids:
+            requested_ids.insert(0, hypothesis.id)
+        unknown_ids = [item for item in requested_ids if item not in eligible_hypothesis_ids]
+        if unknown_ids:
+            raise ValueError(
+                "Selected innovations are not approved or executable: "
+                + ", ".join(unknown_ids)
+            )
+        # Preserve the user's priority order for parallel campaigns.  The
+        # legacy sequential mode keeps the explicitly selected innovation first
+        # and then follows the preregistered order.
+        hypothesis_ids = requested_ids if execution_mode == "parallel" else [
+            hypothesis.id,
+            *[item for item in eligible_hypothesis_ids if item != hypothesis.id],
         ]
         contract = hypothesis.analysis_contract
         if contract is None:
@@ -142,14 +161,24 @@ class AdaptiveExperimentPlanner:
             effective_max_runs // 6,
         )
         hypothesis_ids = hypothesis_ids[: max(1, round_capacity)]
+        if not hypothesis_ids:
+            raise ValueError("At least one selected innovation is required")
         initial_k = 2 if 2 in shots else shots[0]
-        # A Round is one innovation.  Its first experimental iteration is
-        # executed before the single human midpoint-guidance gate.
+        # Sequential campaigns retain the original one-pair-at-a-time protocol.
+        # Parallel campaigns pre-register all three iterations for every
+        # selected innovation, allowing independent rounds to run concurrently
+        # without serially enumerating the full factorial space.
         initial_seeds = seeds[:1]
         initial_cells = [
             ExperimentCell(category=categories[0], shots=initial_k, seed=seed)
             for seed in initial_seeds
         ]
+        parallel_cells = [
+            ExperimentCell(category=category, shots=shot, seed=seed)
+            for category in categories
+            for shot in shots
+            for seed in seeds
+        ][:3]
         exhaustive_run_count = (
             len(hypothesis_ids) * len(categories) * len(shots) * len(seeds) * 2
         )
@@ -172,7 +201,56 @@ class AdaptiveExperimentPlanner:
             max_rounds=len(hypothesis_ids),
             max_runs=effective_max_runs,
             exhaustive_run_count=exhaustive_run_count,
+            execution_mode=execution_mode,
+            parallelism=max(
+                1,
+                min(
+                    parallelism or project.spec.budget.max_parallel_runs,
+                    project.spec.budget.max_parallel_runs,
+                    32,
+                ),
+            ),
+            selected_hypothesis_ids=hypothesis_ids,
         )
+        if execution_mode == "parallel":
+            all_runs: list[ExperimentRun] = []
+            for index, selected_id in enumerate(hypothesis_ids, start=1):
+                selected_hypothesis = self._hypothesis(project, selected_id)
+                selected_contract = selected_hypothesis.analysis_contract
+                if selected_contract is None:
+                    raise ValueError(f"Selected hypothesis has no analysis contract: {selected_id}")
+                experiment_round, nodes, round_runs = self._build_round(
+                    project,
+                    campaign=campaign,
+                    index=index,
+                    phase="feasibility",
+                    objective=f"验证创新点 H{index}：{selected_hypothesis.title}",
+                    rationale=(
+                        "并行预注册该创新点的三个独立迭代，比较 "
+                        f"{selected_contract.control} 与 {selected_contract.treatment}，"
+                        "并通过真实成对结果评估可证伪性。"
+                    ),
+                    cells=parallel_cells,
+                    information_gain=0.90,
+                    falsification_value=0.85,
+                    parent_id=None,
+                    hypothesis_id=selected_id,
+                )
+                campaign.rounds.append(experiment_round)
+                campaign.nodes.extend(nodes)
+                all_runs.extend(round_runs)
+            # _build_round keeps these fields useful for legacy clients.  Set
+            # them back to the first selected innovation for a stable summary.
+            campaign.hypothesis_id = hypothesis_ids[0]
+            first_contract = self._hypothesis(project, hypothesis_ids[0]).analysis_contract
+            if first_contract is not None:
+                campaign.treatment = first_contract.treatment
+                campaign.control = first_contract.control
+                campaign.metric = normalize_primary_metric(first_contract.metric)
+            campaign.next_action = "execute_parallel_batch"
+            self._refresh_efficiency(campaign)
+            return campaign, all_runs
+
         first_round, nodes, runs = self._build_round(
             project,
             campaign=campaign,
@@ -406,19 +484,153 @@ class AdaptiveExperimentPlanner:
             ),
         )
 
+    def remaining_round_cells(
+        self,
+        project: ResearchProject,
+        *,
+        round_id: str,
+    ) -> list[ExperimentCell]:
+        """Return queued, pre-registered cells for iterations 2–3 of a Round.
+
+        Parallel campaigns register all three iterations before execution.  A
+        midpoint guidance decision may reorder those frozen cells, but it must
+        not create new cells or silently expand the search space.
+        """
+
+        campaign = self._campaign(project)
+        current = next(
+            (item for item in campaign.rounds if item.id == round_id),
+            None,
+        )
+        if current is None:
+            raise ValueError(f"Unknown experiment round: {round_id}")
+        runs_by_id = {run.id: run for run in project.runs}
+        nodes_by_id = {node.id: node for node in campaign.nodes}
+        cells: list[ExperimentCell] = []
+        for node_id in current.node_ids:
+            node = nodes_by_id.get(node_id)
+            node_runs = [
+                runs_by_id[run_id]
+                for run_id in (node.run_ids if node else [])
+                if run_id in runs_by_id
+            ]
+            if node is None or node.iteration < 2 or not node_runs:
+                continue
+            if any(run.status != RunStatus.QUEUED for run in node_runs):
+                continue
+            reference = node_runs[0]
+            cells.append(
+                ExperimentCell(
+                    category=reference.category,
+                    shots=reference.shots,
+                    seed=reference.seed,
+                )
+            )
+        return cells
+
     def apply_midpoint_guidance(
         self,
         project: ResearchProject,
         *,
         proposal: ExperimentFeedbackProposal,
         summary: dict[str, Any],
+        round_id: str | None = None,
     ) -> list[ExperimentRun]:
         """Schedule iterations 2 and 3 inside the same innovation Round."""
 
         campaign = self._campaign(project)
-        current = campaign.rounds[-1]
+        current = next(
+            (item for item in campaign.rounds if item.id == round_id),
+            campaign.rounds[-1],
+        )
         if campaign.status != "awaiting_guidance" or current.status != "awaiting_guidance":
             raise ValueError("The current round is not waiting for midpoint guidance")
+
+        if campaign.execution_mode == "parallel":
+            # All three iterations already exist in the frozen parallel queue.
+            # Guidance can choose their order, but never adds a new run or
+            # changes the registered treatment/control/metric contract.
+            runs_by_id = {run.id: run for run in project.runs}
+            nodes_by_id = {node.id: node for node in campaign.nodes}
+            remaining_nodes = []
+            for node_id in current.node_ids:
+                node = nodes_by_id.get(node_id)
+                node_runs = [
+                    runs_by_id[run_id]
+                    for run_id in (node.run_ids if node else [])
+                    if run_id in runs_by_id
+                ]
+                if node is None or node.iteration < 2 or not node_runs:
+                    continue
+                if any(run.status != RunStatus.QUEUED for run in node_runs):
+                    continue
+                remaining_nodes.append((node, node_runs))
+            if len(remaining_nodes) != 2:
+                raise ValueError(
+                    "并行 Round 的预注册队列必须保留第 2、3 次迭代"
+                )
+            node_by_cell = {
+                (
+                    node_runs[0].category,
+                    node_runs[0].shots,
+                    node_runs[0].seed,
+                ): (node, node_runs)
+                for node, node_runs in remaining_nodes
+            }
+            ordered: list[tuple[ExperimentNodeRecord, list[ExperimentRun]]] = []
+            used_keys: set[tuple[str, int, int]] = set()
+            for cell in proposal.recommended_cells:
+                key = (cell.category, cell.shots, cell.seed)
+                item = node_by_cell.get(key)
+                if item is not None and key not in used_keys:
+                    ordered.append(item)
+                    used_keys.add(key)
+            for item in remaining_nodes:
+                node, node_runs = item
+                key = (node_runs[0].category, node_runs[0].shots, node_runs[0].seed)
+                if key not in used_keys:
+                    ordered.append(item)
+                    used_keys.add(key)
+            for iteration, (node, node_runs) in enumerate(ordered, start=2):
+                node.iteration = iteration
+                for run in node_runs:
+                    run.iteration = iteration
+            current.node_ids = [
+                node_id
+                for node, _ in ordered
+                for node_id in [node.id]
+            ] + [
+                node_id
+                for node_id in current.node_ids
+                if node_id not in {node.id for node, _ in ordered}
+            ]
+            current.run_ids = [
+                run.id
+                for node, node_runs in ordered
+                for run in node_runs
+            ] + [
+                run_id
+                for run_id in current.run_ids
+                if run_id not in {
+                    run.id for _, node_runs in ordered for run in node_runs
+                }
+            ]
+            current.completed_iterations = 1
+            current.guidance_received = True
+            current.feedback = proposal
+            current.result_summary = summary
+            current.status = "planned"
+            current.efficiency["planned_runs"] = len(current.run_ids)
+            # This Round now has queued work (iterations 2–3).  Mark the
+            # campaign active so the caller can immediately dispatch only its
+            # guided queue; other Rounds remain individually paused at their
+            # own guidance gates and are not selected by ``queued_runs``.
+            campaign.status = "active"
+            campaign.next_action = "execute_parallel_batch"
+            campaign.current_round = current.index
+            self._refresh_efficiency(campaign, project=project)
+            return [run for _, node_runs in ordered for run in node_runs]
+
         allowed = self.allowed_next_cells(project)
         allowed_by_key = {
             (item.category, item.shots, item.seed): item for item in allowed
@@ -540,6 +752,134 @@ class AdaptiveExperimentPlanner:
         campaign = project.experiment_campaign
         if campaign is None or campaign.status == "completed":
             return
+
+        if campaign.execution_mode == "parallel":
+            # Parallel campaigns have one pre-registered Round per selected
+            # innovation.  The first iteration of every Round runs in parallel;
+            # after those results arrive each Round pauses once for human
+            # guidance before its queued iterations 2–3 are dispatched.
+            by_id = {run.id: run for run in project.runs}
+
+            def completed_iteration_count(round_runs: list[ExperimentRun]) -> int:
+                completed = 0
+                for iteration in (1, 2, 3):
+                    iteration_runs = [
+                        run for run in round_runs if run.iteration == iteration
+                    ]
+                    if not iteration_runs or not all(
+                        run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                        for run in iteration_runs
+                    ):
+                        break
+                    completed = iteration
+                return completed
+
+            for experiment_round in campaign.rounds:
+                round_runs = [
+                    by_id[run_id]
+                    for run_id in experiment_round.run_ids
+                    if run_id in by_id
+                ]
+                for node in campaign.nodes:
+                    if node.id not in experiment_round.node_ids:
+                        continue
+                    node_runs = [
+                        by_id[run_id] for run_id in node.run_ids if run_id in by_id
+                    ]
+                    if any(run.status == RunStatus.RUNNING for run in node_runs):
+                        node.status = "running"
+                    elif node_runs and all(
+                        run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                        for run in node_runs
+                    ):
+                        node.status = (
+                            "succeeded"
+                            if all(
+                                run.status == RunStatus.SUCCEEDED and run.verified
+                                for run in node_runs
+                            )
+                            else "failed"
+                        )
+                    else:
+                        node.status = "pending"
+
+                if not round_runs:
+                    continue
+                first_iteration_runs = [
+                    run for run in round_runs if run.iteration == 1
+                ]
+                first_iteration_terminal = bool(first_iteration_runs) and all(
+                    run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                    for run in first_iteration_runs
+                )
+                terminal = all(
+                    run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}
+                    for run in round_runs
+                )
+                running = any(run.status == RunStatus.RUNNING for run in round_runs)
+                experiment_round.completed_iterations = completed_iteration_count(
+                    round_runs
+                )
+                if not experiment_round.guidance_received and first_iteration_terminal:
+                    # Persist the first-iteration evidence immediately so the
+                    # UI can explain what was observed while waiting for the
+                    # user's one midpoint instruction for this Round.
+                    experiment_round.result_summary = self.summarize_round(
+                        project,
+                        round_id=experiment_round.id,
+                    )
+                    experiment_round.status = "awaiting_guidance"
+                elif terminal and experiment_round.guidance_received:
+                    experiment_round.completed_at = experiment_round.completed_at or utc_now()
+                    # Persist the deterministic metric summary as soon as a
+                    # Round becomes terminal.  The streaming UI can therefore
+                    # show paired effects immediately, even while other
+                    # innovation Rounds are still running and before the
+                    # advisor performs the final innovation review.
+                    experiment_round.result_summary = self.summarize_round(
+                        project,
+                        round_id=experiment_round.id,
+                    )
+                    if experiment_round.status != "completed":
+                        experiment_round.status = "ready_for_feedback"
+                elif running:
+                    experiment_round.status = "running"
+                    experiment_round.started_at = experiment_round.started_at or utc_now()
+                else:
+                    experiment_round.status = "planned"
+
+            pending_guidance = [
+                item for item in campaign.rounds
+                if item.status == "awaiting_guidance"
+            ]
+            unfinished_rounds = [
+                item
+                for item in campaign.rounds
+                if item.status in {"planned", "running"}
+            ]
+            ready_rounds = [
+                item for item in campaign.rounds
+                if item.status == "ready_for_feedback"
+            ]
+            if pending_guidance:
+                campaign.status = "awaiting_guidance"
+                campaign.next_action = "collect_midpoint_guidance"
+                campaign.current_round = min(item.index for item in pending_guidance)
+            elif unfinished_rounds:
+                campaign.status = "active"
+                campaign.next_action = "execute_parallel_batch"
+                campaign.current_round = min(item.index for item in unfinished_rounds)
+            elif ready_rounds:
+                campaign.status = "awaiting_feedback"
+                campaign.next_action = "review_parallel_rounds"
+                campaign.current_round = max(item.index for item in ready_rounds)
+            else:
+                campaign.status = "completed"
+                campaign.next_action = "analyze_verified_results"
+                campaign.current_round = max(item.index for item in campaign.rounds)
+            self._refresh_efficiency(campaign, project=project)
+            return
+
         current = campaign.rounds[-1]
         runs = [run for run in project.runs if run.id in current.run_ids]
         for node in campaign.nodes:
@@ -641,17 +981,26 @@ class AdaptiveExperimentPlanner:
         campaign = project.experiment_campaign
         if campaign is None or campaign.status != "active":
             return []
-        current = campaign.rounds[-1]
         by_id = {run.id: run for run in project.runs}
+        rounds = campaign.rounds if campaign.execution_mode == "parallel" else campaign.rounds[-1:]
+        round_index = {
+            experiment_round.id: experiment_round.index
+            for experiment_round in campaign.rounds
+        }
         candidates = [
             by_id[run_id]
-            for run_id in current.run_ids
+            for experiment_round in rounds
+            for run_id in experiment_round.run_ids
             if run_id in by_id and by_id[run_id].status == RunStatus.QUEUED
         ]
         node_priority = {node.id: node.priority for node in campaign.nodes}
         return sorted(
             candidates,
-            key=lambda run: (-node_priority.get(run.node_id or "", 0.0), run.id),
+            key=lambda run: (
+                round_index.get(run.round_id or "", 0),
+                -node_priority.get(run.node_id or "", 0.0),
+                run.id,
+            ),
         )
 
     @classmethod
