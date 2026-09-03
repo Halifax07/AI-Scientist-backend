@@ -1,0 +1,24 @@
+title: 基于机器视觉的异常检测自主研究
+domain: 基于机器视觉的异常检测
+application_context: 在工业质检、医学影像、视频监控、遥感等机器视觉场景中,正常样本容易获得、异常样本稀缺或代价昂贵。
+objective: 围绕用户输入的研究方向与关键词,自主发现问题空白、提出可证伪的创新机制,并设计验证实验。
+preset: machine_vision_anomaly_detection
+
+datasets: []
+
+constraints:
+  shots: [1, 2, 4, 8]
+  no_real_anomalies_for_adaptation: true
+  require_image_level_score: true
+  require_pixel_localization: false
+  training_free_preferred: true
+  strict_k_shot_protocol: false
+  pool_compression_protocol: false
+  candidate_pool_size: 30
+  max_research_cycles: 3
+
+budget:
+  gpu_hours: 12
+  max_parallel_runs: 2
+  max_llm_calls: 300
+  max_experiments: 240

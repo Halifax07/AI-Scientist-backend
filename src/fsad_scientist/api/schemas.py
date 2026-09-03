@@ -13,7 +13,36 @@ from fsad_scientist.experiments.models import ExecutionRecord, PreparedRunArtifa
 
 
 class CreateProjectRequest(BaseModel):
+    """Create a project with optional custom research domain specification.
+
+    When ``preset`` is provided (e.g. ``"fsad"``), the platform uses
+    embedded demo content.  When ``preset`` is absent, the platform
+    operates in generic mode and all content is driven by the user's
+    ``objective`` and ``application_context``.
+    """
+
     spec: ProjectSpec = Field(default_factory=ProjectSpec)
+
+
+class CreateDemoRequest(BaseModel):
+    """Explicitly create a demo project pre-configured for few-shot industrial
+    anomaly detection (MVTec AD).  This is a shorthand for::
+
+        CreateProjectRequest(
+            spec=ProjectSpec(
+                preset="fsad",
+                title="少样本工业视觉异常检测自主研究",
+                domain="少样本工业视觉异常检测",
+                application_context="新产品上线时仅能获取极少量正常样本",
+                datasets=[
+                    DatasetSpec(name="MVTec AD", role="primary"),
+                    DatasetSpec(name="VisA", role="validation"),
+                ],
+            )
+        )
+    """
+
+    pass
 
 
 class ApprovalRequest(BaseModel):

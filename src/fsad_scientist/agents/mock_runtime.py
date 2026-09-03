@@ -180,29 +180,92 @@ class MockScientistRuntime:
 
     name = "mock-scientist-runtime"
 
+    # ------------------------------------------------------------------
+    # Preset detection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_fsad_preset(project: ResearchProject) -> bool:
+        """Return True when the project uses the few-shot anomaly detection
+        demonstration paths.
+
+        Both the canonical ``fsad`` demo and the broader
+        ``machine_vision_anomaly_detection`` default fall back to the FSAD
+        mock artefacts (FSAD-shaped evidence, gaps, hypotheses and design
+        contracts) so the offline runtime can still demonstrate the full
+        pipeline without an LLM. Real (Qwen-backed) runs branch on
+        ``project.spec.preset`` directly and follow the broader copy for
+        non-FSAD presets.
+        """
+        return project.spec.preset in {"fsad", "machine_vision_anomaly_detection"}
+
+    @staticmethod
+    def _effective_objective(project: ResearchProject) -> str:
+        """Return the user-visible research objective, falling back to the domain."""
+        obj = project.spec.objective.strip()
+        if obj:
+            return obj
+        return project.spec.domain
+
+    # ------------------------------------------------------------------
+    # Core workflow stages
+    # ------------------------------------------------------------------
+
     async def formalize_scope(self, project: ResearchProject) -> ArtifactRecord:
         constraints = project.spec.constraints
+        user_objective = self._effective_objective(project)
+
+        if self._is_fsad_preset(project):
+            problem_statement = (
+                "在仅有极少量正常参考图像、且适配阶段没有真实异常样本时，"
+                "自主发现能够改善工业异常检测性能或稳定性的机制。"
+            )
+            indep_vars = [
+                "参考样本数量 K",
+                "参考样本构成",
+                "检测器结构",
+                "正常类内部变化程度",
+            ]
+            dep_vars = [
+                "图像级检测性能",
+                "像素级定位性能",
+                "跨支持集重采样稳定性",
+            ]
+            integrity_rules = [
+                "测试异常标签不得用于参考样本选择",
+                "LLM 不得生成实验指标",
+                "创新结论必须链接真实 Run ID",
+            ]
+        else:
+            problem_statement = (
+                f"在用户定义的研究场景（{user_objective}）下，"
+                "自主发现问题空白、生成可证伪假设并设计验证实验。"
+            )
+            indep_vars = [
+                "用户研究场景的具体变量（参考用户 objective）",
+                "方法选择或参数设置",
+                "数据特征或领域特性",
+            ]
+            dep_vars = [
+                "任务相关性能指标",
+                "方法的泛化能力或稳定性",
+                "用户关心的核心指标",
+            ]
+            integrity_rules = [
+                "实验指标必须来自真实执行或明确标记的 Mock",
+                "AI 不得生成伪造结果",
+                "研究结论必须链接真实证据或实验记录",
+            ]
+
         return ArtifactRecord(
             kind="research_scope",
             title="结构化研究任务",
             verified=False,
             provenance=["user_scope", self.name],
             payload={
-                "problem_statement": (
-                    "在仅有极少量正常参考图像、且适配阶段没有真实异常样本时，"
-                    "自主发现能够改善工业异常检测性能或稳定性的机制。"
-                ),
-                "independent_variables": [
-                    "参考样本数量 K",
-                    "参考样本构成",
-                    "检测器结构",
-                    "正常类内部变化程度",
-                ],
-                "dependent_variables": [
-                    "图像级检测性能",
-                    "像素级定位性能",
-                    "跨支持集重采样稳定性",
-                ],
+                "problem_statement": problem_statement,
+                "independent_variables": indep_vars,
+                "dependent_variables": dep_vars,
                 "protocols": [
                     name
                     for enabled, name in [
@@ -211,60 +274,56 @@ class MockScientistRuntime:
                     ]
                     if enabled
                 ],
-                "integrity_rules": [
-                    "测试异常标签不得用于参考样本选择",
-                    "LLM 不得生成实验指标",
-                    "创新结论必须链接真实 Run ID",
-                ],
+                "integrity_rules": integrity_rules,
             },
         )
 
     async def gather_evidence(
         self, project: ResearchProject
     ) -> tuple[list[EvidenceRecord], ArtifactRecord]:
-        evidence = [
-            EvidenceRecord(
-                title="Towards Total Recall in Industrial Anomaly Detection",
-                source_type="paper",
-                url="https://arxiv.org/abs/2106.08265",
-                arxiv_id="2106.08265",
-                claims=["PatchCore 是局部 patch 记忆库类基线。"],
-                status=EvidenceStatus.UNVERIFIED,
-            ),
-            EvidenceRecord(
-                title="AnomalyDINO: Boosting Patch-based Few-shot Anomaly Detection with DINOv2",
-                source_type="paper",
-                url="https://arxiv.org/abs/2405.14529",
-                arxiv_id="2405.14529",
-                claims=["冻结 DINOv2 patch 特征可用于训练自由少样本异常检测。"],
-                status=EvidenceStatus.UNVERIFIED,
-            ),
-            EvidenceRecord(
-                title="SubspaceAD: Training-Free Few-Shot Anomaly Detection via Subspace Modeling",
-                source_type="paper",
-                url="https://arxiv.org/abs/2602.23013",
-                arxiv_id="2602.23013",
-                claims=["正常 patch 特征可通过子空间重建残差进行异常评分。"],
-                status=EvidenceStatus.UNVERIFIED,
-            ),
-            EvidenceRecord(
-                title=(
-                    "FastRef: Fast Prototype Refinement for Few-shot Industrial "
-                    "Anomaly Detection"
+        user_objective = self._effective_objective(project)
+        evidence: list[EvidenceRecord] = []
+        artifact_payload: dict[str, Any] = {}
+
+        if self._is_fsad_preset(project):
+            evidence = [
+                EvidenceRecord(
+                    title="Towards Total Recall in Industrial Anomaly Detection",
+                    source_type="paper",
+                    url="https://arxiv.org/abs/2106.08265",
+                    arxiv_id="2106.08265",
+                    claims=["PatchCore 是局部 patch 记忆库类基线。"],
+                    status=EvidenceStatus.UNVERIFIED,
                 ),
-                source_type="paper",
-                url="https://arxiv.org/abs/2506.21398",
-                arxiv_id="2506.21398",
-                claims=["查询图像统计可在测试时修正少样本正常原型。"],
-                status=EvidenceStatus.UNVERIFIED,
-            ),
-        ]
-        artifact = ArtifactRecord(
-            kind="evidence_search_plan",
-            title="文献检索与证据校验计划",
-            verified=False,
-            provenance=[self.name],
-            payload={
+                EvidenceRecord(
+                    title="AnomalyDINO: Boosting Patch-based Few-shot Anomaly Detection with DINOv2",
+                    source_type="paper",
+                    url="https://arxiv.org/abs/2405.14529",
+                    arxiv_id="2405.14529",
+                    claims=["冻结 DINOv2 patch 特征可用于训练自由少样本异常检测。"],
+                    status=EvidenceStatus.UNVERIFIED,
+                ),
+                EvidenceRecord(
+                    title="SubspaceAD: Training-Free Few-Shot Anomaly Detection via Subspace Modeling",
+                    source_type="paper",
+                    url="https://arxiv.org/abs/2602.23013",
+                    arxiv_id="2602.23013",
+                    claims=["正常 patch 特征可通过子空间重建残差进行异常评分。"],
+                    status=EvidenceStatus.UNVERIFIED,
+                ),
+                EvidenceRecord(
+                    title=(
+                        "FastRef: Fast Prototype Refinement for Few-shot Industrial "
+                        "Anomaly Detection"
+                    ),
+                    source_type="paper",
+                    url="https://arxiv.org/abs/2506.21398",
+                    arxiv_id="2506.21398",
+                    claims=["查询图像统计可在测试时修正少样本正常原型。"],
+                    status=EvidenceStatus.UNVERIFIED,
+                ),
+            ]
+            artifact_payload = {
                 "queries": [
                     "few-shot industrial anomaly detection support set selection",
                     "normal reference diversity anomaly detection stability",
@@ -276,154 +335,308 @@ class MockScientistRuntime:
                     "结论必须定位到原文段落或表格",
                     "与研究空白相关的负面结果也必须保留",
                 ],
-            },
+            }
+        else:
+            # Generic mode: generate placeholder evidence referencing the user's objective.
+            # In production this would be replaced by real arXiv / Crossref search results.
+            evidence = [
+                EvidenceRecord(
+                    title=f"相关领域研究现状（{user_objective}）",
+                    source_type="paper",
+                    claims=[
+                        f"与 {user_objective} 相关的基础方法",
+                    ],
+                    status=EvidenceStatus.UNVERIFIED,
+                ),
+                EvidenceRecord(
+                    title=f"{user_objective} 相关的前沿进展",
+                    source_type="paper",
+                    claims=[
+                        f"关于 {user_objective} 的最新研究成果",
+                    ],
+                    status=EvidenceStatus.UNVERIFIED,
+                ),
+            ]
+            artifact_payload = {
+                "queries": [
+                    user_objective,
+                    f"{user_objective} 基准数据集",
+                    f"{user_objective} 方法对比",
+                ],
+                "required_checks": [
+                    "检索结果必须与用户 objective 相关",
+                    "结论必须定位到原文",
+                    "负面结果也需保留",
+                ],
+                "note": (
+                    "当前为占位证据，真实检索需在配备 LLM API 后执行。"
+                ),
+            }
+
+        artifact = ArtifactRecord(
+            kind="evidence_search_plan",
+            title="文献检索与证据校验计划",
+            verified=False,
+            provenance=[self.name],
+            payload=artifact_payload,
         )
         return evidence, artifact
 
     async def discover_gaps(self, project: ResearchProject) -> list[ResearchGap]:
         evidence_ids = [item.id for item in project.evidence]
+        user_objective = self._effective_objective(project)
+
+        if self._is_fsad_preset(project):
+            fsad_gaps = [
+                ResearchGap(
+                    title="参考集质量与稳定性缺少系统研究",
+                    description=(
+                        "现有比较通常关注平均性能，较少把支持集重采样造成的方差和"
+                        "最坏情况表现作为主要研究对象。"
+                    ),
+                    why_unresolved="需要大规模配对重采样实验，而不是单次固定支持集。",
+                    evidence_ids=evidence_ids,
+                    expected_scientific_value=0.90,
+                    estimated_cost=0.45,
+                    status="selected",
+                ),
+                ResearchGap(
+                    title="代表性的定义可能依赖检测器结构",
+                    description=(
+                        "近邻记忆模型关注局部覆盖，子空间模型关注有效秩；统一的样本"
+                        "选择目标可能并不适用于所有检测器。"
+                    ),
+                    why_unresolved="需要 strategy × detector 的交互实验和机制指标。",
+                    evidence_ids=evidence_ids,
+                    expected_scientific_value=0.86,
+                    estimated_cost=0.55,
+                    status="selected",
+                ),
+                ResearchGap(
+                    title="测试时信息能否抵消劣质参考集",
+                    description="查询自适应原型可能降低模型对初始参考图像构成的敏感性。",
+                    why_unresolved="需要把 FastRef 类修正与多种参考集选择方法组合比较。",
+                    evidence_ids=evidence_ids,
+                    expected_scientific_value=0.78,
+                    estimated_cost=0.68,
+                ),
+                ResearchGap(
+                    title="从被动选样本扩展到主动采集",
+                    description="系统可以根据当前未覆盖区域决定下一张最值得采集的正常图像。",
+                    why_unresolved="公开基准通常没有连续采集动作和采集成本标签。",
+                    evidence_ids=evidence_ids,
+                    expected_scientific_value=0.92,
+                    estimated_cost=0.90,
+                ),
+            ]
+            return fsad_gaps
+
+        # Generic mode: generate placeholder gaps driven by the user's research objective.
         return [
             ResearchGap(
-                title="参考集质量与稳定性缺少系统研究",
+                title="方法效率与泛化能力的系统比较缺失",
                 description=(
-                    "现有比较通常关注平均性能，较少把支持集重采样造成的方差和"
-                    "最坏情况表现作为主要研究对象。"
+                    f"在 {user_objective} 场景下，现有方法通常只在单一数据集或条件下评估，"
+                    "缺少跨条件的大规模系统比较和稳定性分析。"
                 ),
-                why_unresolved="需要大规模配对重采样实验，而不是单次固定支持集。",
+                why_unresolved=f"需要针对 {user_objective} 的系统实验设计。",
                 evidence_ids=evidence_ids,
-                expected_scientific_value=0.90,
-                estimated_cost=0.45,
+                expected_scientific_value=0.88,
+                estimated_cost=0.50,
                 status="selected",
             ),
             ResearchGap(
-                title="代表性的定义可能依赖检测器结构",
+                title="领域特定假设缺乏可复现验证",
                 description=(
-                    "近邻记忆模型关注局部覆盖，子空间模型关注有效秩；统一的样本"
-                    "选择目标可能并不适用于所有检测器。"
+                    f"针对 {user_objective} 的改进假设通常缺少对照实验验证，"
+                    "无法区分真实改进与过拟合。"
                 ),
-                why_unresolved="需要 strategy × detector 的交互实验和机制指标。",
+                why_unresolved="需要预注册实验和配对统计分析。",
                 evidence_ids=evidence_ids,
-                expected_scientific_value=0.86,
-                estimated_cost=0.55,
-                status="selected",
+                expected_scientific_value=0.82,
+                estimated_cost=0.40,
             ),
             ResearchGap(
-                title="测试时信息能否抵消劣质参考集",
-                description="查询自适应原型可能降低模型对初始参考图像构成的敏感性。",
-                why_unresolved="需要把 FastRef 类修正与多种参考集选择方法组合比较。",
+                title="基准数据集与实际应用场景存在差异",
+                description=(
+                    f"现有基准可能不能完全反映 {user_objective} 的真实挑战，"
+                    "需要在实际数据上进行边界条件测试。"
+                ),
+                why_unresolved="需要获取或构建代表性实际数据集。",
                 evidence_ids=evidence_ids,
-                expected_scientific_value=0.78,
-                estimated_cost=0.68,
-            ),
-            ResearchGap(
-                title="从被动选样本扩展到主动采集",
-                description="系统可以根据当前未覆盖区域决定下一张最值得采集的正常图像。",
-                why_unresolved="公开基准通常没有连续采集动作和采集成本标签。",
-                evidence_ids=evidence_ids,
-                expected_scientific_value=0.92,
-                estimated_cost=0.90,
+                expected_scientific_value=0.75,
+                estimated_cost=0.60,
             ),
         ]
 
     async def propose_hypotheses(self, project: ResearchProject) -> list[Hypothesis]:
         gaps = {gap.title: gap for gap in project.gaps}
         evidence_ids = [item.id for item in project.evidence]
+        user_objective = self._effective_objective(project)
+
+        if self._is_fsad_preset(project):
+            return [
+                Hypothesis(
+                    gap_id=gaps["参考集质量与稳定性缺少系统研究"].id,
+                    title="覆盖感知选样优先改善最坏情况稳定性",
+                    claim=(
+                        "当 K≤4 时，k-center 正常参考集相较随机参考集对平均 AUROC 的"
+                        "提升可能有限，但会显著降低跨支持集重采样方差和最坏十分位损失。"
+                    ),
+                    null_hypothesis=(
+                        "在相同 K 和候选池下，k-center 与随机选择的稳定性指标没有差异。"
+                    ),
+                    rationale="极少样本下，未覆盖的正常模式会造成随机且严重的假阳性。",
+                    independent_variables=["K", "选择策略", "正常特征覆盖半径"],
+                    dependent_variables=["AUROC", "AUPRO", "跨重采样标准差", "最坏十分位"],
+                    predicted_direction="覆盖半径减小，方差和最坏情况损失下降。",
+                    falsification_conditions=[
+                        "配对置信区间包含零且效应量可忽略",
+                        "收益不能在至少三个类别上复现",
+                    ],
+                    evidence_ids=evidence_ids,
+                    analysis_contract=AnalysisContract(
+                        kind="selection_main_effect",
+                        metric="image_auroc",
+                        treatment="k_center",
+                        control="random",
+                        minimum_pairs=6,
+                    ),
+                ),
+                Hypothesis(
+                    gap_id=gaps["代表性的定义可能依赖检测器结构"].id,
+                    title="覆盖选样收益具有结构类与纹理类边界",
+                    claim=(
+                        "k-center 相对 random 的 Image AUROC 收益在结构异常类别上高于"
+                        "纹理异常类别，且该差异可由正常特征覆盖半径解释。"
+                    ),
+                    null_hypothesis="k-center 的成对收益在结构类和纹理类之间没有差异。",
+                    rationale="局部几何覆盖对结构变化和重复纹理的作用机制可能不同。",
+                    independent_variables=["类别类型", "选择策略", "覆盖半径", "K"],
+                    dependent_variables=["Image AUROC", "Pixel AUROC", "AUPRO"],
+                    predicted_direction="结构异常类别获得更高的成对收益。",
+                    falsification_conditions=[
+                        "类别组间效应差异的置信区间包含零",
+                        "差异不能跨至少三个类别复现",
+                    ],
+                    evidence_ids=evidence_ids,
+                    analysis_contract=AnalysisContract(
+                        kind="selection_main_effect",
+                        metric="image_auroc",
+                        treatment="k_center",
+                        control="random",
+                        minimum_pairs=12,
+                    ),
+                ),
+                Hypothesis(
+                    gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
+                    title="池压缩协议在极小支持集下保持可竞争性",
+                    claim=(
+                        "池压缩仅使用默认参考支持集的子集时，Image AUROC 随参考规模"
+                        "增加而上升并趋于饱和，但在极小规模下仍明显优于无参考的退化基线。"
+                    ),
+                    null_hypothesis="池压缩后的 AUROC 只由参考规模线性决定，与压缩排序无关。",
+                    rationale="显式自定义设计直接沿参考规模因子检验压缩协议的边际价值曲线。",
+                    independent_variables=["参考规模 K", "压缩排序"],
+                    dependent_variables=["Image AUROC", "AUPRO", "跨 seed 方差"],
+                    predicted_direction="AUROC 随 K 增加而上升并趋于饱和。",
+                    falsification_conditions=[
+                        "收益在 K 增大后显著倒挂",
+                        "极小参考规模下低于未采用该协议的基线",
+                    ],
+                    evidence_ids=evidence_ids,
+                    analysis_contract=AnalysisContract(
+                        kind="selection_main_effect",
+                        metric="image_auroc",
+                        design_mode="custom_design",
+                        minimum_pairs=6,
+                    ),
+                ),
+                Hypothesis(
+                    gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
+                    title="查询自适应原型降低初始支持集敏感度",
+                    claim=(
+                        "测试时原型修正对随机或低覆盖参考集的收益高于对高覆盖参考集的收益。"
+                    ),
+                    null_hypothesis="原型修正收益与初始参考集覆盖质量无关。",
+                    rationale="查询中的正常区域可以补足初始参考原型未覆盖的外观变化。",
+                    independent_variables=["原型修正", "参考集覆盖质量", "K"],
+                    dependent_variables=["AUROC", "AUPRO", "方差"],
+                    predicted_direction="低覆盖参考集获得更大的修正收益。",
+                    falsification_conditions=["修正收益不随参考集覆盖质量变化"],
+                    evidence_ids=evidence_ids,
+                    analysis_contract=AnalysisContract(
+                        kind="query_adaptation",
+                        metric="image_auroc",
+                        treatment="query_adaptive",
+                        control="no_adaptation",
+                        minimum_pairs=6,
+                    ),
+                ),
+            ]
+
+        # Generic mode: generate placeholder hypotheses driven by the user's research objective.
+        # These are deliberately generic placeholders that reference the user's stated objective.
+        # In production with a real LLM API, these would be replaced by actual generated content.
+        generic_gaps = {g.title: g for g in gaps.values()}
+        default_gap_id = (
+            list(gaps.values())[0].id if gaps else evidence_ids[0] if evidence_ids else ""
+        )
         return [
             Hypothesis(
-                gap_id=gaps["参考集质量与稳定性缺少系统研究"].id,
-                title="覆盖感知选样优先改善最坏情况稳定性",
+                gap_id=generic_gaps.get("方法效率与泛化能力的系统比较缺失", object()).id
+                if "方法效率" in generic_gaps
+                else default_gap_id,
+                title="方法 A 在核心指标上优于基线方法 B",
                 claim=(
-                    "当 K≤4 时，k-center 正常参考集相较随机参考集对平均 AUROC 的"
-                    "提升可能有限，但会显著降低跨支持集重采样方差和最坏十分位损失。"
+                    f"在 {user_objective} 场景下，所提出的方法 A 相比现有基线方法 B "
+                    "在核心性能指标上可能取得显著改进。"
                 ),
-                null_hypothesis=(
-                    "在相同 K 和候选池下，k-center 与随机选择的稳定性指标没有差异。"
-                ),
-                rationale="极少样本下，未覆盖的正常模式会造成随机且严重的假阳性。",
-                independent_variables=["K", "选择策略", "正常特征覆盖半径"],
-                dependent_variables=["AUROC", "AUPRO", "跨重采样标准差", "最坏十分位"],
-                predicted_direction="覆盖半径减小，方差和最坏情况损失下降。",
+                null_hypothesis=f"在 {user_objective} 场景下，方法 A 与方法 B 的性能没有显著差异。",
+                rationale=f"基于现有证据，针对 {user_objective} 的改进方向存在理论依据。",
+                independent_variables=["方法选择", "参数配置"],
+                dependent_variables=["核心性能指标", "稳定性指标"],
+                predicted_direction=f"{user_objective} 相关指标提升。",
                 falsification_conditions=[
-                    "配对置信区间包含零且效应量可忽略",
-                    "收益不能在至少三个类别上复现",
+                    "统计检验显示无显著差异",
+                    "改进效果在验证集上不能复现",
                 ],
                 evidence_ids=evidence_ids,
                 analysis_contract=AnalysisContract(
                     kind="selection_main_effect",
                     metric="image_auroc",
-                    treatment="k_center",
-                    control="random",
-                    minimum_pairs=6,
-                ),
-            ),
-            Hypothesis(
-                gap_id=gaps["代表性的定义可能依赖检测器结构"].id,
-                title="覆盖选样收益具有结构类与纹理类边界",
-                claim=(
-                    "k-center 相对 random 的 Image AUROC 收益在结构异常类别上高于"
-                    "纹理异常类别，且该差异可由正常特征覆盖半径解释。"
-                ),
-                null_hypothesis="k-center 的成对收益在结构类和纹理类之间没有差异。",
-                rationale="局部几何覆盖对结构变化和重复纹理的作用机制可能不同。",
-                independent_variables=["类别类型", "选择策略", "覆盖半径", "K"],
-                dependent_variables=["Image AUROC", "Pixel AUROC", "AUPRO"],
-                predicted_direction="结构异常类别获得更高的成对收益。",
-                falsification_conditions=[
-                    "类别组间效应差异的置信区间包含零",
-                    "差异不能跨至少三个类别复现",
-                ],
-                evidence_ids=evidence_ids,
-                analysis_contract=AnalysisContract(
-                    kind="selection_main_effect",
-                    metric="image_auroc",
-                    treatment="k_center",
-                    control="random",
-                    minimum_pairs=12,
-                ),
-            ),
-            Hypothesis(
-                gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
-                title="池压缩协议在极小支持集下保持可竞争性",
-                claim=(
-                    "池压缩仅使用默认参考支持集的子集时，Image AUROC 随参考规模"
-                    "增加而上升并趋于饱和，但在极小规模下仍明显优于无参考的退化基线。"
-                ),
-                null_hypothesis="池压缩后的 AUROC 只由参考规模线性决定，与压缩排序无关。",
-                rationale="显式自定义设计直接沿参考规模因子检验压缩协议的边际价值曲线。",
-                independent_variables=["参考规模 K", "压缩排序"],
-                dependent_variables=["Image AUROC", "AUPRO", "跨 seed 方差"],
-                predicted_direction="AUROC 随 K 增加而上升并趋于饱和。",
-                falsification_conditions=[
-                    "收益在 K 增大后显著倒挂",
-                    "极小参考规模下低于未采用该协议的基线",
-                ],
-                evidence_ids=evidence_ids,
-                analysis_contract=AnalysisContract(
-                    kind="selection_main_effect",
-                    metric="image_auroc",
+                    treatment="method_a",
+                    control="baseline_b",
                     design_mode="custom_design",
                     minimum_pairs=6,
                 ),
             ),
             Hypothesis(
-                gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
-                title="查询自适应原型降低初始支持集敏感度",
+                gap_id=generic_gaps.get("领域特定假设缺乏可复现验证", object()).id
+                if "领域特定" in generic_gaps
+                else default_gap_id,
+                title="假设在不同条件下具有复现性",
                 claim=(
-                    "测试时原型修正对随机或低覆盖参考集的收益高于对高覆盖参考集的收益。"
+                    f"在 {user_objective} 场景下，观察到的性能改进在不同条件（数据集、"
+                    "参数设置）下具有一定的复现性和稳定性。"
                 ),
-                null_hypothesis="原型修正收益与初始参考集覆盖质量无关。",
-                rationale="查询中的正常区域可以补足初始参考原型未覆盖的外观变化。",
-                independent_variables=["原型修正", "参考集覆盖质量", "K"],
-                dependent_variables=["AUROC", "AUPRO", "方差"],
-                predicted_direction="低覆盖参考集获得更大的修正收益。",
-                falsification_conditions=["修正收益不随参考集覆盖质量变化"],
+                null_hypothesis=f"在 {user_objective} 场景下，性能改进不能跨条件复现。",
+                rationale="科研结论需要跨条件的复现验证才能被认为是可靠的。",
+                independent_variables=["条件变化", "数据子集"],
+                dependent_variables=["性能指标", "方差"],
+                predicted_direction="效应方向一致，方差可控。",
+                falsification_conditions=[
+                    "效应方向在多次实验间不一致",
+                    "置信区间包含零",
+                ],
                 evidence_ids=evidence_ids,
                 analysis_contract=AnalysisContract(
-                    kind="query_adaptation",
+                    kind="selection_main_effect",
                     metric="image_auroc",
-                    treatment="query_adaptive",
-                    control="no_adaptation",
-                    minimum_pairs=6,
+                    treatment="method_a",
+                    control="baseline_b",
+                    design_mode="custom_design",
+                    minimum_pairs=8,
                 ),
             ),
         ]

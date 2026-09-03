@@ -112,6 +112,55 @@ class QwenScientistRuntime(MockScientistRuntime):
         self.client = AgentScopeJsonClient(model=model, api_key=api_key)
 
     @staticmethod
+    def _project_context_block(project: ResearchProject) -> str:
+        """Render the user-supplied research context for LLM system prompts.
+
+        The platform default is the broad ``machine_vision_anomaly_detection``
+        preset, where prompts must talk about the user's ``objective`` and
+        ``domain`` rather than any specific dataset. Only when the user
+        explicitly opts into ``fsad`` (or ``generic``) does the prompt narrow
+        its scope to the embedded demo content.
+        """
+        spec = project.spec
+        domain = (spec.domain or "").strip() or "用户自定义研究领域"
+        objective = (spec.objective or "").strip()
+        application_context = (spec.application_context or "").strip()
+        if spec.preset == "fsad":
+            default_objective = (
+                "在仅有极少量正常参考图像、且适配阶段没有真实异常样本时,"
+                "自主发现能够改善工业异常检测性能或稳定性的机制。"
+            )
+            return (
+                "【平台选题】少样本工业视觉异常检测演示（MVTec AD 风格的少样本 "
+                "正常参考样本场景,平台内置演示证据与空白候选）。\n"
+                f"【研究领域】{domain}\n"
+                f"【研究目标】{objective or default_objective}\n"
+                f"【应用上下文】{application_context or '用户提供的研究场景和约束条件'}"
+            )
+        if spec.preset == "generic" or spec.preset is None:
+            return (
+                "【平台选题】用户通过通用科研工作台自定义的研究领域;"
+                "不预设任何特定数据集或方法;所有 AI 生成内容必须围绕"
+                "用户在 objective 中给出的研究方向与关键词。\n"
+                f"【研究领域】{domain}\n"
+                f"【研究目标】{objective or domain}\n"
+                f"【应用上下文】{application_context or '用户提供的研究场景和约束条件'}"
+            )
+        # 平台默认:machine_vision_anomaly_detection 等宽泛方向。
+        default_objective = (
+            "围绕用户输入的研究方向与关键词,自主发现问题空白、"
+            "提出可证伪的创新机制,并设计验证实验。"
+        )
+        return (
+            "【平台选题】基于机器视觉的异常检测,平台默认宽泛方向;"
+            "不预设任何特定数据集或方法;所有 AI 生成内容必须围绕"
+            "用户在 objective 与 user_guidance 中给出的研究方向与关键词。\n"
+            f"【研究领域】{domain}\n"
+            f"【研究目标】{objective or default_objective}\n"
+            f"【应用上下文】{application_context or '用户提供的研究场景和约束条件'}"
+        )
+
+    @staticmethod
     def _design_failure_plan(
         plan: ExperimentPlan,
         reason: str,
@@ -160,6 +209,9 @@ class QwenScientistRuntime(MockScientistRuntime):
                 system_prompt=(
                     "你是自主科研项目经理。用户只提供研究领域、数据、现实约束和预算。"
                     "把它转化为结构化研究范围，但不要替用户预设最终创新结论。"
+                    "始终根据用户在 ProjectSpec.objective / domain 中提供的"
+                    "研究领域与关键词展开，不得偷换为与用户输入无关的方向。"
+                    f"\n{self._project_context_block(project)}\n"
                     "除论文标题和标准技术名词外，所有自然语言字段使用简体中文。"
                 ),
                 payload={
@@ -196,8 +248,11 @@ class QwenScientistRuntime(MockScientistRuntime):
         response = await self.client.complete(
             role_name="GapDiscoveryAgent",
             system_prompt=(
-                "你负责从已有证据候选、工业数据约束和方法差异中发现研究空白。"
+                "你负责从已有证据候选、用户研究场景与方法差异中发现研究空白。"
                 "提出 3 至 6 个互不重复的空白。不得把未经校验的文献候选视为事实。"
+                "必须严格围绕用户在 ProjectSpec 中给出的 objective 与"
+                "domain 展开，禁止偷换为与用户输入无关的工业视觉或异常检测话题。"
+                f"\n{self._project_context_block(project)}\n"
                 "除论文标题和标准技术名词外，所有自然语言字段使用简体中文。"
             ),
             payload={
@@ -226,7 +281,12 @@ class QwenScientistRuntime(MockScientistRuntime):
         response = await self.client.complete(
             role_name="HypothesisAgent",
             system_prompt=(
-                "你负责把研究空白转化为可证伪科学假设。每个假设必须包含零假设、"
+                "你负责把研究空白转化为可证伪科学假设。"
+                "所有假设必须围绕用户在 ProjectSpec.objective / domain 中给出的"
+                "研究领域与关键词展开；不要回到少样本工业视觉异常检测、"
+                "MVTec AD 或 PatchCore 等与用户输入无关的默认话题。"
+                f"\n{self._project_context_block(project)}\n\n"
+                "每个假设必须包含零假设、"
                 "变量、预测方向和明确的证伪条件；从不同机制提出 3 至 6 个候选，"
                 "不要写成模糊的工程目标。analysis_contract.kind 可为 selection_main_effect、"
                 "detector_interaction 或 query_adaptation；它只是兼容旧流程和安全边界，"
@@ -438,6 +498,10 @@ class QwenScientistRuntime(MockScientistRuntime):
                 role_name="ExperimentDesignAgent",
                 system_prompt=(
                     "你负责为已批准的科学假设生成轻量通用实验设计。"
+                    "所有设计必须服务于用户在 ProjectSpec 中给出的研究领域与目标；"
+                    "若该课题不是少样本工业视觉异常检测，请不要硬编码 FSAD"
+                    "默认场景或默认检测器列表。"
+                    f"\n{self._project_context_block(project)}\n"
                     "必须为每个假设自主选择 design_mode=paired_comparison 或 custom_design；"
                     "paired_comparison 才能使用 treatment/control，custom_design 不得依赖它们。"
                     "设计必须绑定现有 Run 字段 selection_strategy、detector、category、"
@@ -680,12 +744,15 @@ class QwenScientistRuntime(MockScientistRuntime):
             response = await self.client.complete(
                 role_name="AdaptiveExperimentPlanner",
                 system_prompt=(
-                    "你是少样本工业视觉异常检测的自适应实验规划智能体。"
-                    "你的输出必须包含完整的推理过程，让非专业用户也能理解决策逻辑。\n\n"
+                    "你是自主科研平台的自适应实验规划智能体。"
+                    "所有分析与建议都必须围绕用户在 ProjectSpec 中声明的研究领域与目标；"
+                    "若该课题不是少样本工业视觉异常检测，请不要沿用 FSAD 演示的"
+                    "默认语境或硬编码工业视觉假设。\n"
+                    f"{self._project_context_block(project)}\n\n"
                     "【当前实验语义】一个 Round 只验证一个创新点，固定包含 3 次预注册迭代。"
                     "默认执行模式是 parallel：多个已选创新点各自拥有独立 Round，三次迭代由本机"
                     "并行调度；每个 Round 的第 1 次迭代完成后必须等待一次用户指导，"
-                    "再自动执行第 2、3 次迭代。"
+                    "再自动执行第二 2、3 次迭代。"
                     "不能要求用户逐 Run 批准，也不能把不同创新点的结果合并。"
                     "用户在首轮后提交的指导意见是本 Round 后续两次迭代的软约束；应尽量采纳，"
                     "但不得突破预注册的创新点、数据隔离、三次迭代和测试标签隔离约束。"
@@ -854,7 +921,11 @@ class QwenScientistRuntime(MockScientistRuntime):
             response = await self.client.complete(
                 role_name="AdaptiveExperimentPlanner",
                 system_prompt=(
-                    "你是少样本工业视觉异常检测的实验结果规划智能体。"
+                    "你是自主科研平台的实验结果规划智能体。"
+                    "所有分析与建议都必须围绕用户在 ProjectSpec 中声明的研究领域与目标；"
+                    "若该课题不是少样本工业视觉异常检测，请不要沿用 FSAD 演示的"
+                    "默认语境或硬编码工业视觉假设。\n"
+                    f"{self._project_context_block(project)}\n\n"
                     "当前 Round 使用已批准的显式实验设计；只能在该设计的因素、条件和预算边界内"
                     "提出建议。\n"
                     "请依据 analysis_mode、condition_statistics、condition_effects、"
@@ -1050,7 +1121,8 @@ class QwenScientistRuntime(MockScientistRuntime):
         validation_issues: list[str] = []
         try:
             system_prompt = (
-                "你是少样本异常检测的支持集选样策略实现专家。"
+                "你是支持集选样策略实现专家，负责为当前研究领域生成候选样本选择函数。"
+                f"\n{self._project_context_block(project)}\n\n"
                 f"为策略 {strategy_name}（对照 {control_name}）编写实现。"
                 "只返回一个纯 Python 函数，必须恰好是一个模块级 def select；"
                 "函数体不得包含 import 语句，不得定义嵌套函数或类（运行模板已导入"
@@ -1144,16 +1216,21 @@ class QwenScientistRuntime(MockScientistRuntime):
         validation_issues: list[str] = []
         try:
             system_prompt = (
-                "你是工业异常检测方法实现专家。为以下假设实现一个新检测器的核心打分"
-                "逻辑。优先使用 numpy、math、statistics 等轻量纯计算；不要构造或加载"
+                "你是当前研究领域的检测器/评分函数实现专家。"
+                f"\n{self._project_context_block(project)}\n\n"
+                "为以下假设实现一个新评分逻辑的核心函数，"
+                "保持与用户研究领域一致（少样本工业异常检测仍是内置演示场景，"
+                "其他领域请按用户提供的 objective 调整）。"
+                "优先使用 numpy、math、statistics 等轻量纯计算；不要构造或加载"
                 "任何运行时模型、预训练权重或网络资源，不要调用 torchvision/transformers"
                 "模型，也不要下载。只允许模块级 import（白名单：math/random/numpy/"
                 "scipy/sklearn/PIL/cv2/torch/torchvision/transformers/timm）与顶层普通函数；"
                 "辅助函数名不得以下划线开头，不得定义嵌套函数或类；必须恰好包含一个函数"
-                "def anomaly_score(image, support_images, seed) -> float，单图调用必须轻量。"
-                "分数越高表示越异常：核心必须计算测试图与正常支持图之间的非负偏离距离，"
-                "并直接返回随偏离增大的统计量；禁止对距离取负、取倒数或转换成相似度。"
-                "应把支持图缩放到测试图尺寸，计算对齐像素的 RGB 绝对或平方距离，"
+                "def anomaly_score(image, support_images, seed) -> float（异常/不相似度评分，"
+                "分数越高表示越异常；其他领域可保留相同签名）。单图调用必须轻量。"
+                "在少样本工业异常检测场景下，分数越高越异常：核心必须计算测试图与正常支持图"
+                "之间的非负偏离距离，并直接返回随偏离增大的统计量；禁止对距离取负、取倒数或"
+                "转换成相似度。应把支持图缩放到测试图尺寸，计算对齐像素的 RGB 绝对或平方距离，"
                 "对多个支持图逐像素取最小距离，再用 95% 到 99% 高分位聚合为图像分数。"
                 "禁止只用全图均值、标准差或直方图，因为局部缺陷会被平均掉。"
                 "必须保证局部明显颜色/纹理缺陷得到高于正常图的分数。"
