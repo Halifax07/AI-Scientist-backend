@@ -12,7 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from fsad_scientist import __version__
-from fsad_scientist.agents.agentscope_client import AgentScopeUnavailableError
+from fsad_scientist.agents.agentscope_client import (
+    AgentOutputValidationError,
+    AgentScopeUnavailableError,
+)
 from fsad_scientist.agents.contracts import ScientistRuntime
 from fsad_scientist.agents.evidence_runtime import EvidenceEnabledRuntime
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
@@ -71,7 +74,12 @@ from fsad_scientist.experiments.strategy_runner import GeneratedStrategyRunner
 from fsad_scientist.experiments.support_selection import plan_support_set
 from fsad_scientist.features.dinov2 import DinoEmbeddingManifest, DinoV2Embedder
 from fsad_scientist.repository import JsonProjectRepository, ProjectNotFoundError
-from fsad_scientist.workflow import ResearchWorkflow, WorkflowError
+from fsad_scientist.workflow import (
+    InvalidTransitionError,
+    ResearchWorkflow,
+    ResultsRequiredError,
+    WorkflowError,
+)
 
 
 def _get_workflow(request: Request) -> ResearchWorkflow:
@@ -137,6 +145,10 @@ def create_app(
     @app.exception_handler(AgentScopeUnavailableError)
     async def agent_runtime_unavailable(_: Request, exc: AgentScopeUnavailableError):
         return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+
+    @app.exception_handler(AgentOutputValidationError)
+    async def agent_output_invalid(_: Request, exc: AgentOutputValidationError):
+        return _error_response(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
 
     @app.get("/health", response_model=HealthResponse)
     async def health(request: Request) -> HealthResponse:
@@ -444,6 +456,16 @@ def create_app(
         workflow: WorkflowDependency,
     ) -> ResearchProject:
         return workflow.approve_experiment_plan(project_id, approved_by=body.approved_by)
+
+    @app.post(
+        "/api/v1/projects/{project_id}/experiment-plan/regenerate",
+        response_model=ResearchProject,
+    )
+    async def regenerate_experiment_plan(
+        project_id: str,
+        workflow: WorkflowDependency,
+    ) -> ResearchProject:
+        return await workflow.regenerate_experiment_plan(project_id)
 
     @app.post(
         "/api/v1/projects/{project_id}/experiment-methods/generate",
@@ -959,17 +981,23 @@ async def _stream_parallel_execution(
     async with lock:
         project = workflow.repository.get(project_id)
         campaign = project.experiment_campaign
+        # 这里不能像普通端点那样抛 HTTPException: StreamingResponse 在生成器
+        # 真正产出帧之前就已发出 headers, 之后抛出的任何异常都无法再转成 JSON
+        # 错误响应 —— Starlette 只会记录 "response already started" 并掐断连接,
+        # 浏览器表现为 ERR_INCOMPLETE_CHUNKED_ENCODING, 用户完全看不到错误。
+        # 因此生成器内的异常状态一律改为: 尽力恢复, 然后发完整事件帧干净收尾,
+        # 让前端拿到最新 project 快照自行刷新 (端点层 722 行已做过常规 409 校验,
+        # 这里只兜端点校验与生成器启动之间的竞态窗口)。
         if campaign is None or campaign.execution_mode != "parallel":
-            raise HTTPException(409, "The project has no parallel experiment campaign")
-        if campaign.status != "active":
-            raise HTTPException(409, "The parallel campaign is not accepting runs")
-
-        selected = workflow.select_parallel_runs(
-            project_id,
-            run_ids=body.run_ids,
-        )
-        total = len(selected)
-        selected_run_ids = {item.id for item in selected}
+            yield _sse_data(
+                {
+                    "event_type": "stream_completed",
+                    "message": "该项目当前没有可继续的并行实验队列，请刷新后查看最新状态。",
+                    "progress": 1.0,
+                    "payload": {"project": project.model_dump(mode="json")},
+                }
+            )
+            return
         campaign_run_ids = {
             run_id
             for experiment_round in campaign.rounds
@@ -1029,6 +1057,67 @@ async def _stream_parallel_execution(
 
         async def producer() -> None:
             try:
+                selected: list[ExperimentRun] = []
+                try:
+                    selected = workflow.select_parallel_runs(
+                        project_id,
+                        run_ids=body.run_ids,
+                    )
+                except (ResultsRequiredError, InvalidTransitionError):
+                    # 队列为空 (例如上一次执行流被浏览器关闭/断网打断, 遗留的
+                    # RUNNING 孤儿运行让 campaign 永远停在 active, 但没有任何
+                    # 可排队运行; 每次重试都会在 headers 已发出的生成器里抛错,
+                    # 表现为前端 ERR_INCOMPLETE_CHUNKED_ENCODING 的静默死锁)。
+                    # 先清理孤儿运行, 让 refresh_after_run 把状态机推到真实位置,
+                    # 再给 select 一次机会; 仍无运行则干净地结束本批。
+                    workflow.recover_stale_parallel_runs(project_id)
+                    current_campaign = workflow.repository.get(
+                        project_id
+                    ).experiment_campaign
+                    if (
+                        current_campaign is not None
+                        and current_campaign.status == "active"
+                    ):
+                        try:
+                            selected = workflow.select_parallel_runs(
+                                project_id,
+                                run_ids=body.run_ids,
+                            )
+                        except (ResultsRequiredError, InvalidTransitionError):
+                            selected = []
+                total = len(selected)
+                selected_run_ids = {item.id for item in selected}
+                if not selected:
+                    final = workflow.repository.get(project_id)
+                    final_campaign = final.experiment_campaign
+                    await emit(
+                        "batch_completed",
+                        (
+                            "当前没有排队等待的实验运行；若上一次执行曾中断，"
+                            "遗留的运行状态已清理。请按界面提示继续"
+                            "（提交指导、汇总结果或重新执行失败实验）。"
+                        ),
+                        status=final_campaign.status if final_campaign else None,
+                        progress=progress_for(campaign_run_ids),
+                        payload={
+                            "campaign_status": (
+                                final_campaign.status if final_campaign else None
+                            ),
+                            "next_action": (
+                                final_campaign.next_action if final_campaign else None
+                            ),
+                            "batch_run_count": 0,
+                            "campaign_run_count": len(campaign_run_ids),
+                        },
+                    )
+                    await emit(
+                        "stream_completed",
+                        "实验流已结束；所有状态均已写入 Research Ledger。",
+                        status=final.stage.value,
+                        progress=progress_for(campaign_run_ids),
+                        payload={"project_id": project_id, "batch_completed": True},
+                    )
+                    return
                 await emit(
                     "campaign_started",
                     f"已启动 {total} 个实验运行，最多同时执行 {parallelism} 个。",

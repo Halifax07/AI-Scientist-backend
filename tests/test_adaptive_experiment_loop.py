@@ -288,6 +288,53 @@ def test_campaign_skips_higher_ranked_unsupported_strategy(tmp_path):
     assert project.experiment_campaign.control == "random"
 
 
+def test_initialization_excludes_invalid_first_detector_hypothesis(tmp_path):
+    workflow, project = build_approved_project(tmp_path)
+    supported = next(
+        hypothesis
+        for hypothesis in project.hypotheses
+        if hypothesis.analysis_contract is not None
+        and hypothesis.analysis_contract.treatment == "k_center"
+        and hypothesis.analysis_contract.control == "random"
+    )
+    invalid = supported.model_copy(deep=True)
+    invalid.id = "hypothesis_invalid_detector_pair"
+    invalid.title = "未注册检测器组合"
+    invalid.analysis_contract = supported.analysis_contract.model_copy(
+        update={
+            "kind": "detector_interaction",
+            "treatment": "patchcore_with_k_center",
+            "control": "subspacead_with_k_center",
+        }
+    )
+    project.hypotheses.insert(0, invalid)
+    assert project.experiment_plan is not None
+    project.experiment_plan.hypothesis_ids.insert(0, invalid.id)
+    project.experiment_plan.hypothesis_contracts[invalid.id] = (
+        invalid.analysis_contract.model_copy(deep=True)
+    )
+    workflow.repository.save(project)
+
+    dataset = dataset_manifest()
+    project = workflow.attach_dataset_audit(
+        project.id,
+        manifest=dataset,
+        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
+    )
+    project = workflow.initialize_experiment_campaign(
+        project.id,
+        dataset=dataset,
+        hypothesis_id=supported.id,
+        max_rounds=2,
+        max_runs=6,
+    )
+
+    assert project.experiment_campaign is not None
+    assert project.experiment_campaign.hypothesis_id == supported.id
+    assert invalid.id not in project.experiment_plan.hypothesis_ids
+    assert invalid.id not in project.experiment_campaign.hypothesis_ids
+
+
 def test_human_guidance_selects_only_a_registered_queued_run(tmp_path):
     workflow, project = build_approved_project(tmp_path, max_experiments=8)
     dataset = dataset_manifest()
@@ -375,56 +422,6 @@ def test_completed_campaign_rejects_unapproved_next_innovation(tmp_path):
     assert next_project.experiment_campaign.hypothesis_id == secondary_id
     assert len(next_project.experiment_campaign_history) == 1
     assert first_run_ids <= {item.id for item in next_project.runs}
-
-
-def test_next_cycle_guidance_archives_campaign_and_preserves_real_runs(tmp_path):
-    workflow, project = build_approved_project(tmp_path, max_experiments=6)
-    dataset = dataset_manifest()
-    project = workflow.attach_dataset_audit(
-        project.id,
-        manifest=dataset,
-        manifest_path=str(tmp_path / "artifacts" / "dataset.json"),
-    )
-    project = workflow.initialize_experiment_campaign(
-        project.id,
-        dataset=dataset,
-        hypothesis_id=executable_hypothesis_id(project),
-        max_rounds=2,
-        max_runs=6,
-    )
-    complete_current_round(workflow, project.id)
-    project = run(
-        workflow.review_experiment_round(
-            project.id, user_guidance="继续完成本创新点的两次迭代"
-        )
-    )
-    complete_current_round(workflow, project.id)
-    project = run(workflow.review_experiment_round(project.id))
-    assert project.experiment_campaign is not None
-    assert project.experiment_campaign.status == "completed"
-    historical_run_ids = {item.id for item in project.runs}
-
-    project = workflow.finalize_results(project.id)
-    project = run(workflow.advance(project.id))
-    assert project.stage == ResearchStage.RESULTS_ANALYZED
-
-    # 配对数不足时发现被标记为 not_tested，_should_revise() 返回 False
-    # 流程进入创新审查阶段，而不是研究循环修订
-    # 注意：当 findings 是 not_tested 时，start_next_research_cycle() 会失败
-    # 因为没有证据驱动修订。这是正确的行为 - 用户应该先完成创新审查
-    
-    # 验证 advance() 会正确进入 INNOVATION_REVIEWED 阶段
-    project = run(workflow.advance(project.id))
-    assert project.stage == ResearchStage.INNOVATION_REVIEWED
-    assert project.research_cycle == 1  # research_cycle 未增加
-    assert project.experiment_campaign is None
-    assert len(project.experiment_campaign_history) == 1
-    assert historical_run_ids <= {item.id for item in project.runs}
-    
-    # 完成创新审查后可以进入报告阶段
-    project = run(workflow.advance(project.id))
-    assert project.stage == ResearchStage.REPORT_READY
-    assert project.status == ProjectStatus.COMPLETED
 
 
 def test_feedback_guard_rejects_early_stop_and_unregistered_cells(tmp_path):

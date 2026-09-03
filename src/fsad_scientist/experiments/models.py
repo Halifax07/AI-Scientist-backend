@@ -30,6 +30,7 @@ class CommandSpec(BaseModel):
     executable: str
     args: list[str]
     cwd: Path
+    required_modules: list[str] = Field(default_factory=list)
     environment: dict[str, str] = Field(default_factory=dict)
     expected_outputs: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)

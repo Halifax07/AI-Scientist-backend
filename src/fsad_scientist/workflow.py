@@ -25,6 +25,7 @@ from fsad_scientist.domain.models import (
     ExperimentFeedbackProposal,
     ExperimentGuidanceDecision,
     ExperimentProgressEvent,
+    ExperimentPlan,
     ExperimentRun,
     Hypothesis,
     HypothesisRanking,
@@ -42,6 +43,7 @@ from fsad_scientist.experiments.code_safety import (
     validate_detector_source,
     validate_strategy_source,
 )
+from fsad_scientist.experiments.design import compile_design, validate_design
 from fsad_scientist.experiments.detector_runner import (
     assemble_detector_file,
     run_detector_smoke,
@@ -204,12 +206,20 @@ class ResearchWorkflow:
         # selected candidate names a custom selection strategy, generate and
         # validate that adapter in the background now; the user should not have
         # to leave the ranking screen and perform a separate implementation step.
-        self._ensure_executable_hypotheses(project)
         self.repository.save(project)
         project = await self._prepare_selected_hypothesis_implementations(
             project.id,
             selected_ids=selected_ids,
         )
+        # Run the pool-level executability gate *after* the automatic adapter
+        # generation: selected custom strategies now carry validated
+        # implementations and count as executable.  Comparisons that cannot be
+        # made executable here (e.g. detector interactions over unregistered
+        # detectors) were already rejected one-by-one by
+        # _prepare_selected_hypothesis_implementations above, which lets the UI
+        # drop the offending innovation and retry instead of dead-locking the
+        # whole ranking gate over a fully custom pool.
+        self._ensure_executable_hypotheses(project)
         self._move(
             project,
             stage=ResearchStage.HYPOTHESES_REVIEWED,
@@ -263,6 +273,10 @@ class ResearchWorkflow:
         static-validation plus smoke-test gates register it as ``validated``.
         A failed adapter is surfaced at the ranking request instead of being
         silently dropped from the user's selected portfolio.
+
+        Custom-design innovations and detector-interaction comparisons over
+        approved detectors bind their Run fields in the preregistered design
+        generated right after ranking, so nothing is generated for them here.
         """
 
         project = self.repository.get(project_id)
@@ -277,6 +291,30 @@ class ResearchWorkflow:
                     f"Selected innovation has no analysis contract: {hypothesis_id}"
                 )
             contract = hypothesis.analysis_contract
+            if contract.design_mode == "custom_design":
+                # Execution is bound through the design's conditions later; there
+                # is no treatment/control adapter to generate at the ranking gate.
+                continue
+            if contract.kind == "detector_interaction":
+                # treatment/control are detector names.  Approved detectors need
+                # no code at the ranking gate; detector code is generated through
+                # the dedicated detector endpoint, not this strategy interface.
+                approved_detectors = BUILTIN_DETECTORS | {
+                    item.name
+                    for item in project.method_implementations
+                    if item.kind == "detector" and item.status in {"validated", "approved"}
+                }
+                unresolved_detectors = [
+                    name
+                    for name in (contract.treatment, contract.control)
+                    if name not in approved_detectors
+                ]
+                if unresolved_detectors:
+                    raise InvalidTransitionError(
+                        f"创新点 {hypothesis_id} 引用的检测器 {', '.join(unresolved_detectors)} "
+                        "尚未注册实现，无法进入实验；请先调用检测器生成端点"
+                    )
+                continue
             if contract.kind not in {"selection_main_effect", "query_adaptation"}:
                 raise InvalidTransitionError(
                     f"Selected innovation {hypothesis_id} is not supported by the current "
@@ -426,6 +464,70 @@ class ResearchWorkflow:
         )
         self.repository.save(project)
         return candidates
+
+    def recover_stale_parallel_runs(self, project_id: str) -> ResearchProject:
+        """Fail Runs orphaned by a disconnected execute-stream and refresh state.
+
+        The execute-stream endpoint keeps streaming until the client tab is
+        closed or the network drops.  A Run that had been marked RUNNING when
+        the stream died can never receive its result record, so it stays
+        RUNNING forever: ``refresh_after_run`` still sees an unfinished Round,
+        the campaign therefore remains "active", yet ``select_parallel_runs``
+        finds nothing queued — and every new execute-stream click fails
+        without any progress (visible in the UI only as a truncated SSE
+        stream).  This recovery pass fails such orphaned Runs with an explicit
+        reason so the normal per-result refresh can move the campaign to its
+        real next state (awaiting guidance / awaiting feedback / a queue that
+        is dispatchable again).
+        """
+        project = self.repository.get(project_id)
+        campaign = project.experiment_campaign
+        if campaign is None or campaign.execution_mode != "parallel":
+            return project
+        if campaign.status != "active":
+            # A review/rebuild already took over; nothing here is mid-flight.
+            return project
+        campaign_run_ids = {
+            run_id
+            for experiment_round in campaign.rounds
+            for run_id in experiment_round.run_ids
+        }
+        stale = [
+            item
+            for item in project.runs
+            if item.id in campaign_run_ids and item.status == RunStatus.RUNNING
+        ]
+        for run in stale:
+            self.record_run_result(
+                project_id,
+                run_id=run.id,
+                metrics={},
+                artifact_paths=[],
+                code_revision=None,
+                environment_digest=None,
+                success=False,
+                verified=False,
+                result_source="real_executor",
+                error=(
+                    "execution_stream_interrupted: 上一次执行流的连接已断开，"
+                    "该运行未能收到执行结果，已标记失败并释放队列。"
+                ),
+            )
+        if stale:
+            # 必须重新读取: record_run_result 每次都会 save 一份全新状态,
+            # 继续用循环前的旧快照 record_event+save 会把已修复的运行又盖回去。
+            project = self.repository.get(project_id)
+            project.record_event(
+                actor="experiment_executor",
+                action="recover_stale_parallel_runs",
+                summary=(
+                    f"已清理 {len(stale)} 个因执行流断连而遗留的运行，"
+                    "campaign 状态已按真实结果刷新。"
+                ),
+                payload={"run_ids": [item.id for item in stale]},
+            )
+            self.repository.save(project)
+        return self.repository.get(project_id)
 
     def fail_parallel_campaign(
         self,
@@ -651,7 +753,12 @@ class ResearchWorkflow:
 
         elif project.stage == ResearchStage.HYPOTHESES_PROPOSED:
             project.hypotheses = await self.runtime.review_hypotheses(project)
-            self._ensure_executable_hypotheses(project)
+            # The review gate only scores and shortlists candidates.  A pool that
+            # needs adapters is allowed to reach the human ranking screen; the
+            # ranking request auto-generates those adapters for the innovations
+            # the user actually selects.  Raising here would strand a fully
+            # custom pool in HYPOTHESES_PROPOSED forever.
+            self._ensure_executable_hypotheses(project, defer_unimplemented_raise=True)
             self._move(
                 project,
                 stage=ResearchStage.HYPOTHESES_REVIEWED,
@@ -735,7 +842,7 @@ class ResearchWorkflow:
             )
             revised = (
                 await self.runtime.revise_hypotheses(project)
-                if self._should_revise(project)
+                if self._should_revise(project) or cycle_guidance_id is not None
                 else []
             )
             if revised:
@@ -841,10 +948,15 @@ class ResearchWorkflow:
             raise InvalidTransitionError("Project is not waiting for experiment approval")
         if project.experiment_plan is None:
             raise InvalidTransitionError("Project has no experiment plan")
-
         excluded_hypothesis_ids = self._scope_experiment_plan_to_primary_hypothesis(
             project
         )
+        if project.experiment_plan.design_generation_status == "needs_correction":
+            raise InvalidTransitionError(
+                "实验设计需要修正后才能批准："
+                f"{project.experiment_plan.design_generation_fallback_reason or '未提供原因'}"
+            )
+
         if excluded_hypothesis_ids:
             self.repository.save(project)
             raise InvalidTransitionError(
@@ -876,6 +988,31 @@ class ResearchWorkflow:
         )
         return self.repository.save(project)
 
+    async def regenerate_experiment_plan(self, project_id: str) -> ResearchProject:
+        project = self.repository.get(project_id)
+        if project.stage != ResearchStage.AWAITING_EXPERIMENT_APPROVAL:
+            raise InvalidTransitionError("Project is not waiting for experiment approval")
+        if project.experiment_plan is None:
+            raise InvalidTransitionError("Project has no experiment plan")
+        if project.experiment_plan.design_generation_status != "needs_correction":
+            raise InvalidTransitionError(
+                "只有需要修正的实验设计才能重新生成"
+            )
+
+        project.experiment_plan_history.append(project.experiment_plan.model_copy(deep=True))
+        project.experiment_plan = await self.runtime.design_experiments(project)
+        self._scope_experiment_plan_to_primary_hypothesis(project)
+        project.record_event(
+            actor="experiment_planner",
+            action="regenerate_preregistered_experiment",
+            summary="原预注册计划未通过校验，系统已重新生成并等待人工复核。",
+            payload={
+                "plan_id": project.experiment_plan.id,
+                "design_generation_status": project.experiment_plan.design_generation_status,
+            },
+        )
+        return self.repository.save(project)
+
     async def implement_experiment_method(
         self,
         project_id: str,
@@ -900,6 +1037,10 @@ class ResearchWorkflow:
         contract = hypothesis.analysis_contract
         if contract is None:
             raise InvalidTransitionError("The hypothesis has no analysis contract")
+        if contract.design_mode == "custom_design":
+            raise InvalidTransitionError(
+                "custom_design 不使用 treatment/control 方法生成接口；请先生成预注册实验设计"
+            )
         canonical_treatment = _strategy_alias(contract.treatment) or contract.treatment
         canonical_control = _strategy_alias(contract.control) or contract.control
         replacement_names = {
@@ -1167,18 +1308,76 @@ class ResearchWorkflow:
         if generated_detectors:
             plan.detectors = list(dict.fromkeys(item.name for item in generated_detectors))
         supported_hypothesis_ids: list[str] = []
+        legal_design_hypothesis_ids: set[str] = set()
         normalized_contracts: dict[str, AnalysisContract] = {}
         for hypothesis_id in plan.hypothesis_ids:
             hypothesis = hypotheses.get(hypothesis_id)
             contract = hypothesis.analysis_contract if hypothesis is not None else None
+            design = next(
+                (
+                    item
+                    for item in plan.designs
+                    if item.hypothesis_id == hypothesis_id
+                ),
+                next((item for item in plan.designs if item.hypothesis_id is None), None),
+            )
+            has_legal_design = False
+            if design is not None:
+                try:
+                    validate_design(
+                        design,
+                        plan,
+                        allowed_categories=set(plan.categories),
+                        allowed_detectors=BUILTIN_DETECTORS
+                        | {
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "detector" and item.status in {"validated", "approved"}
+                        },
+                        allowed_strategies=BUILTIN_STRATEGIES
+                        | {
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "selection_strategy" and item.status in {"validated", "approved"}
+                        },
+                    )
+                except ValueError:
+                    pass
+                else:
+                    has_legal_design = is_supported_primary_metric(
+                        design.analysis.primary_metric or ""
+                    )
+                    if has_legal_design and design.hypothesis_id is not None:
+                        legal_design_hypothesis_ids.add(design.hypothesis_id)
+            if contract is None:
+                continue
             if (
-                contract is None
-                or contract.kind not in {"selection_main_effect", "query_adaptation"}
-                or not is_supported_primary_metric(contract.metric)
+                not has_legal_design
+                and not self._contract_is_experimentable(project, hypothesis)
+                and not (
+                    design is None
+                    and
+                    contract.design_mode == "paired_comparison"
+                    and contract.kind in {"selection_main_effect", "query_adaptation"}
+                    and any(
+                        name not in BUILTIN_STRATEGIES
+                        for name in (contract.treatment, contract.control)
+                    )
+                )
             ):
                 continue
+            if not has_legal_design and not is_supported_primary_metric(contract.metric):
+                continue
             normalized_metric = normalize_primary_metric(contract.metric)
-            if generated_detectors and (
+            custom_design_uses_shared_detector = (
+                contract.design_mode == "custom_design"
+                and design is not None
+                and all(
+                    (factor.field or factor.run_field) != "detector"
+                    for factor in design.factors
+                )
+            )
+            if generated_detectors and not custom_design_uses_shared_detector and (
                 hypothesis_id not in generated_detector_hypothesis_ids
                 or normalized_metric not in {"image_auroc", "image_ap"}
             ):
@@ -1186,13 +1385,19 @@ class ResearchWorkflow:
             normalized_contract = contract.model_copy(
                 update={"metric": normalized_metric}
             )
+            if not is_supported_primary_metric(contract.metric) and has_legal_design:
+                normalized_contract = contract.model_copy(deep=True)
             hypothesis.analysis_contract = normalized_contract
             planned_contract = plan.hypothesis_contracts.get(hypothesis_id)
             if planned_contract is not None:
                 if not is_supported_primary_metric(planned_contract.metric):
                     continue
-                normalized_contract = planned_contract.model_copy(
-                    update={"metric": normalize_primary_metric(planned_contract.metric)}
+                normalized_contract = (
+                    planned_contract.model_copy(
+                        update={"metric": normalize_primary_metric(planned_contract.metric)}
+                    )
+                    if is_supported_primary_metric(planned_contract.metric)
+                    else planned_contract.model_copy(deep=True)
                 )
             supported_hypothesis_ids.append(hypothesis_id)
             normalized_contracts[hypothesis_id] = normalized_contract.model_copy(deep=True)
@@ -1200,10 +1405,22 @@ class ResearchWorkflow:
             raise InvalidTransitionError(
                 "预注册计划没有当前执行器可支持的创新点，请重新设计实验计划"
             )
+        scoped_designs = [
+            design
+            for design in plan.designs
+            if design.hypothesis_id is None
+            or design.hypothesis_id in supported_hypothesis_ids
+        ]
+        self._refresh_design_generation_status_after_scope(
+            plan,
+            retained_hypothesis_ids=supported_hypothesis_ids,
+            legal_design_hypothesis_ids=legal_design_hypothesis_ids,
+        )
         if (
             plan.hypothesis_ids == supported_hypothesis_ids
             and plan.hypothesis_contracts == normalized_contracts
             and requested_detectors == plan.detectors
+            and plan.designs == scoped_designs
         ):
             return []
 
@@ -1214,6 +1431,7 @@ class ResearchWorkflow:
         ]
         plan.hypothesis_ids = supported_hypothesis_ids
         plan.hypothesis_contracts = normalized_contracts
+        plan.designs = scoped_designs
         plan.preregistration_digest = self._plan_preregistration_digest(plan)
         project.record_event(
             actor="experiment_plan_scope_guard",
@@ -1227,6 +1445,29 @@ class ResearchWorkflow:
         return excluded_hypothesis_ids
 
     @staticmethod
+    def _refresh_design_generation_status_after_scope(
+        plan: ExperimentPlan,
+        *,
+        retained_hypothesis_ids: list[str],
+        legal_design_hypothesis_ids: set[str],
+    ) -> None:
+        """Clear stale generation blocking after scope removes invalid designs.
+
+        When scoping excluded hypotheses the correction signal must survive:
+        silently rewriting needs_correction to ai_selected would approve a
+        portfolio that no longer matches the design agent's coverage verdict.
+        """
+
+        if (
+            plan.design_generation_status == "needs_correction"
+            and set(retained_hypothesis_ids) == set(plan.hypothesis_ids)
+            and retained_hypothesis_ids
+            and set(retained_hypothesis_ids) <= legal_design_hypothesis_ids
+        ):
+            plan.design_generation_status = "ai_selected"
+            plan.design_generation_fallback_reason = None
+
+    @staticmethod
     def _contract_is_supported_primary(contract: AnalysisContract | None) -> bool:
         if contract is None or contract.kind not in {
             "selection_main_effect",
@@ -1235,6 +1476,8 @@ class ResearchWorkflow:
             return False
         if not is_supported_primary_metric(contract.metric):
             return False
+        if contract.design_mode == "custom_design":
+            return True
         protocol_markers = (
             "compression ratio",
             "compression rate",
@@ -1244,6 +1487,8 @@ class ResearchWorkflow:
             "候选池",
             "池大小",
         )
+        if not contract.treatment or not contract.control:
+            return False
         names = (contract.treatment.casefold(), contract.control.casefold())
         return not any(
             marker in name for name in names for marker in protocol_markers
@@ -1255,15 +1500,68 @@ class ResearchWorkflow:
         hypothesis: Hypothesis,
     ) -> bool:
         contract = hypothesis.analysis_contract
-        if contract is None or contract.kind not in {
+        if contract is None:
+            return False
+        if contract.design_mode == "custom_design":
+            return project.experiment_plan is not None and any(
+                design.hypothesis_id in {None, hypothesis.id}
+                for design in project.experiment_plan.designs
+            )
+        if project.experiment_plan is not None:
+            design = next(
+                (
+                    item
+                    for item in project.experiment_plan.designs
+                    if item.hypothesis_id == hypothesis.id
+                ),
+                next(
+                    (
+                        item
+                        for item in project.experiment_plan.designs
+                        if item.hypothesis_id is None
+                    ),
+                    None,
+                ),
+            )
+            if design is not None:
+                try:
+                    validate_design(
+                        design,
+                        project.experiment_plan,
+                        allowed_categories=set(project.experiment_plan.categories),
+                        allowed_detectors=BUILTIN_DETECTORS
+                        | {
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "detector" and item.status in {"validated", "approved"}
+                        },
+                        allowed_strategies=BUILTIN_STRATEGIES
+                        | {
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "selection_strategy" and item.status in {"validated", "approved"}
+                        },
+                    )
+                except ValueError:
+                    return False
+                return is_supported_primary_metric(design.analysis.primary_metric or "")
+        if contract.kind not in {
             "selection_main_effect",
+            "detector_interaction",
             "query_adaptation",
         }:
             return False
+        if contract.kind == "detector_interaction":
+            approved = BUILTIN_DETECTORS | {
+                item.name
+                for item in project.method_implementations
+                if item.kind == "detector" and item.status in {"validated", "approved"}
+            }
+            return contract.treatment in approved and contract.control in approved
         approved = BUILTIN_STRATEGIES | {
             item.name
             for item in project.method_implementations
-            if item.kind == "selection_strategy" and item.status == "approved"
+                if item.kind == "selection_strategy" and item.status in {"validated", "approved"}
         }
         return contract.treatment in approved and contract.control in approved
 
@@ -1287,7 +1585,7 @@ class ResearchWorkflow:
         custom_names = [
             name
             for name in (contract.treatment, contract.control)
-            if name not in BUILTIN_STRATEGIES
+            if name is not None and name not in BUILTIN_STRATEGIES
         ]
         if not custom_names:
             return 1
@@ -1350,6 +1648,25 @@ class ResearchWorkflow:
         for name in (treatment_name, control_name):
             if name not in plan.selection_strategies:
                 plan.selection_strategies.append(name)
+        for design in plan.designs:
+            strategy_factors = {
+                factor.name
+                for factor in design.factors
+                if factor.field == "selection_strategy"
+                or factor.run_field == "selection_strategy"
+            }
+            for factor in design.factors:
+                if factor.name in strategy_factors:
+                    factor.levels = [replacements.get(level, level) for level in factor.levels]
+            for condition in design.conditions:
+                condition.factor_values = {
+                    name: (
+                        replacements.get(value, value)
+                        if name in strategy_factors
+                        else value
+                    )
+                    for name, value in condition.factor_values.items()
+                }
         for original_name, replacement_name in replacements.items():
             if original_name != replacement_name:
                 plan.method_implementation_digests.pop(original_name, None)
@@ -1603,6 +1920,7 @@ class ResearchWorkflow:
                 project.experiment_campaign.model_copy(deep=True)
             )
             project.experiment_campaign = None
+        self._scope_experiment_plan_to_primary_hypothesis(project)
         if project.experiment_plan is None:
             raise InvalidTransitionError("The project has no current experiment plan")
         current_plan_id = project.experiment_plan.id
@@ -1706,12 +2024,16 @@ class ResearchWorkflow:
                 "Rank hypotheses and complete dataset audit before starting the parallel campaign"
             )
         if project.experiment_campaign is not None:
-            if project.experiment_campaign.execution_mode == "parallel":
-                return project
             if project.experiment_campaign.status != "completed":
+                if project.experiment_campaign.execution_mode == "parallel":
+                    # 并行 campaign 仍在执行/等待汇总时保持幂等, 不重复建立队列。
+                    return project
                 raise InvalidTransitionError(
                     "The project already has an active experiment campaign"
                 )
+            # 已完成的 campaign(含并行)允许重新建立队列: 当全部 run 失败且没有任何
+            # 成功核验结果时, finalize 会拒绝锁定(不把失败当结果), 用户需要"重新执行
+            # 失败实验"。旧 campaign 由 initialize 移入 history, 保留失败痕迹。
         selected = selected_hypothesis_ids or [
             item.id
             for item in project.hypotheses
@@ -1854,6 +2176,7 @@ class ResearchWorkflow:
             project,
             round_id=current.id,
         )
+        explicit_design = bool(current.design_id)
         allowed_cells = (
             self.experiment_planner.remaining_round_cells(
                 project,
@@ -1896,6 +2219,8 @@ class ResearchWorkflow:
                 round_summary=summary,
                 allowed_cells=allowed_cells,
             )
+        if explicit_design and proposal.presentation_spec is not None:
+            current.presentation_spec = proposal.presentation_spec.model_copy(deep=True)
         if campaign.status == "awaiting_guidance":
             try:
                 new_runs = self.experiment_planner.apply_midpoint_guidance(
@@ -1914,14 +2239,21 @@ class ResearchWorkflow:
                 round_id=current.id,
                 advisor=proposal.advisor,
                 interpretation=(
-                    "该建议用于调整本 Round 第 2、3 次迭代的类别、K 与随机种子优先级。"
+                    "该建议用于调整本 Round 后续迭代的类别、K 与随机种子优先级；"
+                    "因素、条件数量和分析模式保持注册设计不变。"
+                    if explicit_design
+                    else "该建议用于调整本 Round 第 2、3 次迭代的类别、K 与随机种子优先级。"
                 ),
                 disposition="applied",
                 rationale=proposal.rationale,
                 affected_ids=[run.id for run in new_runs],
                 protected_constraints=[
                     "创新点与分析契约不变",
-                    "固定三次迭代",
+                    (
+                        "因素、条件数量和分析模式不变"
+                        if explicit_design
+                        else "固定三次迭代"
+                    ),
                     "测试标签不参与支持集选择",
                 ],
             )
@@ -1937,11 +2269,18 @@ class ResearchWorkflow:
                 action="continue_round_iterations",
                 summary=(
                     f"用户已在 Round {current.index} 中途提交唯一一次指导；"
-                    "系统已据此排定第 2、3 次自动迭代。"
+                    f"系统按 {summary.get('analysis_mode')} 分析，继续排定"
+                    f" {len(summary.get('condition_statistics', []))} 条件的后续迭代。"
+                    if explicit_design
+                    else (
+                        f"用户已在 Round {current.index} 中途提交唯一一次指导；"
+                        "系统已据此排定第 2、3 次自动迭代。"
+                    )
                 ),
                 payload={
                     "guidance_id": record.id,
                     "guidance": guidance,
+                    "feedback": proposal.model_dump(mode="json"),
                     "new_run_ids": [run.id for run in new_runs],
                 },
             )
@@ -1963,7 +2302,12 @@ class ResearchWorkflow:
             action="review_experiment_round",
             summary=(
                 f"Round {summary['round_index']} 的三次迭代已汇总；"
-                f"决策={proposal.decision}，下一创新点新增 {len(new_runs)} 次初始运行。"
+                + (
+                    f"设计分析已完成，决策={proposal.decision}，"
+                    f"下一创新点新增 {len(new_runs)} 次初始运行。"
+                    if campaign.design_id
+                    else f"决策={proposal.decision}，下一创新点新增 {len(new_runs)} 次初始运行。"
+                )
             ),
             payload={
                 "round_summary": summary,
@@ -1982,6 +2326,17 @@ class ResearchWorkflow:
             raise KeyError(f"Unknown run id: {run_id}")
         if run.status != RunStatus.QUEUED:
             raise InvalidTransitionError(f"Run {run_id} is not queued")
+        campaign = project.experiment_campaign
+        if campaign is not None:
+            # 并行预注册会一次性登记多个 Round，未开跑的 Round 也在
+            # campaign.rounds 中；因此“当前”的定义是：运行必须隶属于本
+            # campaign 的某个已预注册 Round，不能是游离的孤儿运行。
+            campaign_round_ids = {item.id for item in campaign.rounds}
+            if run.round_id not in campaign_round_ids:
+                raise InvalidTransitionError(
+                    f"Run {run.id} is not part of the current experiment Round "
+                    f"(round_id={run.round_id})"
+                )
         run.status = RunStatus.RUNNING
         run.started_at = utc_now()
         self.experiment_planner.refresh_after_run(project)
@@ -2107,6 +2462,7 @@ class ResearchWorkflow:
             return []
 
         hypothesis_ids = plan.hypothesis_ids
+        hypotheses_by_id = {item.id: item for item in project.hypotheses}
         datasets = plan.datasets[:1]
         categories = plan.categories[:3]
         detectors = plan.detectors
@@ -2119,6 +2475,40 @@ class ResearchWorkflow:
             "strict_k_shot": ["random"],
             "pool_compression_m30": ["random", "k_center"],
         }
+        custom_specs: dict[str, tuple[Any, list[Any], dict[str, str], str]] = {}
+        for hypothesis_id in hypothesis_ids:
+            hypothesis = hypotheses_by_id.get(hypothesis_id)
+            contract = hypothesis.analysis_contract if hypothesis is not None else None
+            if contract is None or contract.design_mode != "custom_design":
+                continue
+            design = next(
+                (
+                    item
+                    for item in plan.designs
+                    if item.hypothesis_id == hypothesis_id
+                ),
+                next((item for item in plan.designs if item.hypothesis_id is None), None),
+            )
+            if design is None:
+                raise ValueError(
+                    f"custom_design requires an explicit design for hypothesis {hypothesis_id}"
+                )
+            conditions = compile_design(design)
+            factor_fields = {
+                factor.name: factor.field or factor.run_field
+                for factor in design.factors
+            }
+            default_strategy = (
+                design.support_selection_strategy
+                or design.default_selection_strategy
+                or "random"
+            )
+            custom_specs[hypothesis_id] = (
+                design,
+                conditions,
+                factor_fields,
+                default_strategy,
+            )
         for protocol in plan.protocols:
             # Interleave hypotheses so a bounded legacy feasibility queue still
             # contains at least one evidence item for every approved innovation.
@@ -2129,6 +2519,49 @@ class ResearchWorkflow:
                     None,
                 )
                 contract = hypothesis.analysis_contract if hypothesis is not None else None
+                custom_spec = custom_specs.get(hypothesis_id)
+                if custom_spec is not None:
+                    _, conditions, factor_fields, default_strategy = custom_spec
+                    bound_fields = set(factor_fields.values())
+                    if (
+                        ("protocol" in bound_fields and protocol != plan.protocols[0])
+                        or ("category" in bound_fields and category != categories[0])
+                        or ("detector" in bound_fields and detector != detectors[0])
+                        or ("shots" in bound_fields and shot != shots[0])
+                        or ("seed" in bound_fields and seed != seeds[0])
+                    ):
+                        continue
+                    for condition in conditions:
+                        run_values: dict[str, Any] = {
+                            "protocol": protocol,
+                            "dataset": dataset,
+                            "category": category,
+                            "detector": detector,
+                            "selection_strategy": default_strategy,
+                            "shots": shot,
+                            "seed": seed,
+                        }
+                        for factor_name, value in condition.factor_values.items():
+                            run_values[factor_fields[factor_name]] = value
+                        if len(runs) >= max_runs:
+                            return runs
+                        runs.append(
+                            ExperimentRun(
+                                plan_id=plan.id,
+                                hypothesis_id=hypothesis_id,
+                                protocol=run_values["protocol"],
+                                dataset=run_values["dataset"],
+                                category=run_values["category"],
+                                detector=run_values["detector"],
+                                selection_strategy=run_values["selection_strategy"],
+                                shots=run_values["shots"],
+                                seed=run_values["seed"],
+                                condition_id=condition.id,
+                                factor_values=dict(condition.factor_values),
+                                status=RunStatus.QUEUED,
+                            )
+                        )
+                    continue
                 strategies = (
                     [contract.control, contract.treatment]
                     if contract is not None
@@ -2182,6 +2615,8 @@ class ResearchWorkflow:
             if hypothesis is None or hypothesis.analysis_contract is None:
                 continue
             contract = hypothesis.analysis_contract
+            if contract.design_mode == "custom_design":
+                continue
             planned_contract = plan.hypothesis_contracts.get(hypothesis_id)
             if planned_contract is not None and planned_contract != contract:
                 raise InvalidTransitionError(
@@ -2299,12 +2734,48 @@ class ResearchWorkflow:
             )
 
     @staticmethod
-    def _ensure_executable_hypotheses(project: ResearchProject) -> None:
-        """Normalize every supported innovation without inventing a replacement claim."""
+    def _ensure_executable_hypotheses(
+        project: ResearchProject,
+        *,
+        defer_unimplemented_raise: bool = False,
+    ) -> None:
+        """Normalize every supported innovation without inventing a replacement claim.
+
+        ``defer_unimplemented_raise`` lets the review gate hand a pool whose
+        adapters are still missing over to the human ranking screen (where
+        selection triggers adapter auto-generation) instead of rejecting the
+        whole pool.
+        """
+
+        invalid_contract_ids: list[str] = []
+        for hypothesis in project.hypotheses:
+            contract = hypothesis.analysis_contract
+            if contract is None or _has_distinct_analysis_conditions(contract):
+                continue
+            invalid_contract_ids.append(hypothesis.id)
+            hypothesis.analysis_contract = None
+            hypothesis.status = HypothesisStatus.CANDIDATE
+            project.record_event(
+                actor="research_brief_operationalizer",
+                action="reject_invalid_analysis_contract",
+                summary=(
+                    "已排除无法执行的假设对照：实验组与对照组相同，"
+                    "不能比较方法与自身。"
+                ),
+                payload={
+                    "hypothesis_id": hypothesis.id,
+                    "treatment": contract.treatment,
+                    "control": contract.control,
+                },
+            )
 
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
-            if contract is None or contract.kind != "query_adaptation":
+            if (
+                contract is None
+                or contract.design_mode == "custom_design"
+                or contract.kind != "query_adaptation"
+            ):
                 continue
             control = _strategy_alias(contract.control)
             if control == "random" and contract.control != "random":
@@ -2324,7 +2795,11 @@ class ResearchWorkflow:
 
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
-            if contract is None or contract.kind != "selection_main_effect":
+            if (
+                contract is None
+                or contract.design_mode == "custom_design"
+                or contract.kind != "selection_main_effect"
+            ):
                 continue
             treatment = _strategy_alias(contract.treatment)
             control = _strategy_alias(contract.control)
@@ -2349,10 +2824,21 @@ class ResearchWorkflow:
                     )
                 continue
 
+        approved_detectors = BUILTIN_DETECTORS | {
+            implementation.name
+            for implementation in project.method_implementations
+            if implementation.kind == "detector" and implementation.status == "approved"
+        }
         executable = [
             hypothesis
             for hypothesis in project.hypotheses
             if hypothesis.execution_readiness == "executable"
+            or (
+                hypothesis.analysis_contract is not None
+                and hypothesis.analysis_contract.kind == "detector_interaction"
+                and hypothesis.analysis_contract.treatment in approved_detectors
+                and hypothesis.analysis_contract.control in approved_detectors
+            )
             or any(
                 implementation.hypothesis_id == hypothesis.id
                 and implementation.kind == "selection_strategy"
@@ -2360,10 +2846,34 @@ class ResearchWorkflow:
                 for implementation in project.method_implementations
             )
         ]
-        if not executable:
-            raise InvalidTransitionError(
-                "当前创新点都需要先实现方法适配器；系统不会替换成无关假设。"
+        if not any(
+            hypothesis.status == HypothesisStatus.SHORTLISTED for hypothesis in executable
+        ):
+            replacement = max(
+                executable,
+                key=lambda item: item.score.elo if item.score is not None else 0.0,
+                default=None,
             )
+            if replacement is not None:
+                replacement.status = HypothesisStatus.SHORTLISTED
+                project.record_event(
+                    actor="research_brief_operationalizer",
+                    action="promote_executable_hypothesis",
+                    summary="原入选假设的对照无效，已提升下一条可执行候选进入预注册。",
+                    payload={
+                        "hypothesis_id": replacement.id,
+                        "excluded_hypothesis_ids": invalid_contract_ids,
+                    },
+                )
+        if not executable:
+            if invalid_contract_ids:
+                raise InvalidTransitionError(
+                    "入选假设的实验组与对照组相同，无法生成实验；请重新生成研究假设。"
+                )
+            if not defer_unimplemented_raise:
+                raise InvalidTransitionError(
+                    "当前创新点都需要先实现方法适配器；系统不会替换成无关假设。"
+                )
 
 
 def _evidence_key(item: EvidenceRecord) -> str:
@@ -2375,6 +2885,8 @@ def _evidence_key(item: EvidenceRecord) -> str:
 
 
 def _strategy_alias(value: str) -> str | None:
+    if not value:
+        return None
     normalized = " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
     if (
         normalized == "random"
@@ -2414,3 +2926,13 @@ def _strategy_alias(value: str) -> str | None:
     if any(marker in normalized for marker in diversity_markers):
         return "k_center"
     return None
+
+
+def _has_distinct_analysis_conditions(contract: AnalysisContract) -> bool:
+    if contract.design_mode == "custom_design":
+        return True
+    return _comparison_key(contract.treatment) != _comparison_key(contract.control)
+
+
+def _comparison_key(value: str) -> str:
+    return " ".join(value.casefold().replace("_", " ").replace("-", " ").split())

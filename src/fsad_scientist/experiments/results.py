@@ -61,9 +61,12 @@ class ResultNormalizer:
         row = _category_row(rows, category, aliases=("Row Names", "Category"))
         mapping = {
             "Instance AUROC": "image_auroc",
+            "instance_auroc": "image_auroc",
             "Full Pixel AUROC": "pixel_auroc",
+            "full_pixel_auroc": "pixel_auroc",
             "Full PRO": "aupro",
             "Anomaly Pixel AUROC": "anomaly_pixel_auroc",
+            "anomaly_pixel_auroc": "anomaly_pixel_auroc",
             "Anomaly PRO": "anomaly_aupro",
         }
         return NormalizedExperimentResult(

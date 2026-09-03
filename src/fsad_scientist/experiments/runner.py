@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import platform
@@ -119,6 +120,13 @@ class ExperimentRunner:
 
         process: asyncio.subprocess.Process | None = None
         try:
+            missing_modules = _missing_python_modules(command.required_modules)
+            if missing_modules:
+                raise RuntimeError(
+                    f"{command.method} requires missing Python modules: "
+                    f"{', '.join(missing_modules)}. Install the project detector "
+                    "dependencies with `uv sync --extra vision --extra detectors`."
+                )
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 process = await asyncio.create_subprocess_exec(
                     *argv,
@@ -204,6 +212,7 @@ def _environment_digest() -> str:
         "numpy",
         "pillow",
         "scikit-learn",
+        "timm",
         "torch",
         "torchvision",
         "transformers",
@@ -256,3 +265,7 @@ def _is_within(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _missing_python_modules(modules: list[str]) -> list[str]:
+    return [module for module in modules if importlib.util.find_spec(module) is None]

@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from typing import Any
 
-from fsad_scientist.agents.agentscope_client import AgentScopeJsonClient
+from fsad_scientist.agents.agentscope_client import (
+    AgentOutputValidationError,
+    AgentScopeJsonClient,
+)
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
 from fsad_scientist.domain.enums import EvidenceStatus, HypothesisStatus
 from fsad_scientist.domain.models import (
     ArtifactRecord,
+    ExperimentCardPresentationSpec,
     ExperimentCell,
+    ExperimentDesignSpec,
     ExperimentFeedbackProposal,
     ExperimentGuidanceDecision,
+    ExperimentPlan,
     ExperimentRun,
     Hypothesis,
     HypothesisScore,
@@ -27,6 +34,12 @@ from fsad_scientist.experiments.code_safety import (
     sanitize_strategy_name,
     validate_detector_source,
     validate_strategy_source,
+)
+from fsad_scientist.experiments.design import (
+    normalize_design_conditions_payload,
+    normalize_presentation_spec_payload,
+    result_aware_presentation_spec,
+    validate_design,
 )
 from fsad_scientist.experiments.detector_runner import assemble_detector_file
 from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
@@ -98,25 +111,79 @@ class QwenScientistRuntime(MockScientistRuntime):
     ) -> None:
         self.client = AgentScopeJsonClient(model=model, api_key=api_key)
 
+    @staticmethod
+    def _design_failure_plan(
+        plan: ExperimentPlan,
+        reason: str,
+        errors: list[str] | None = None,
+        *,
+        status: str = "needs_correction",
+    ) -> ExperimentPlan:
+        payload = plan.model_dump(mode="json")
+        payload["design_generation_status"] = status
+        payload["design_generation_fallback_reason"] = reason
+        payload["design_generation_errors"] = list(errors or [reason])
+        payload.pop("preregistration_digest", None)
+        digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        return ExperimentPlan(**payload, preregistration_digest=digest)
+
+    @staticmethod
+    def _fallback_is_executable(plan: ExperimentPlan) -> bool:
+        """Only expose deterministic fallback when it covers the frozen portfolio."""
+
+        design_hypothesis_ids = {
+            design.hypothesis_id
+            for design in plan.designs
+            if design.hypothesis_id is not None
+        }
+        if not plan.designs or set(plan.hypothesis_ids) != design_hypothesis_ids:
+            return False
+        try:
+            for design in plan.designs:
+                validate_design(
+                    design,
+                    plan,
+                    allowed_categories=set(plan.categories),
+                    allowed_detectors=set(plan.detectors),
+                    allowed_strategies=set(plan.selection_strategies),
+                )
+        except ValueError:
+            return False
+        return True
+
     async def formalize_scope(self, project: ResearchProject) -> ArtifactRecord:
-        response = await self.client.complete(
-            role_name="Supervisor",
-            system_prompt=(
-                "你是自主科研项目经理。用户只提供研究领域、数据、现实约束和预算。"
-                "把它转化为结构化研究范围，但不要替用户预设最终创新结论。"
-                "除论文标题和标准技术名词外，所有自然语言字段使用简体中文。"
-            ),
-            payload={
-                "project_spec": project.spec.model_dump(mode="json"),
-                "required_keys": [
-                    "problem_statement",
-                    "independent_variables",
-                    "dependent_variables",
-                    "control_variables",
-                    "integrity_rules",
-                ],
-            },
-        )
+        try:
+            response = await self.client.complete(
+                role_name="Supervisor",
+                system_prompt=(
+                    "你是自主科研项目经理。用户只提供研究领域、数据、现实约束和预算。"
+                    "把它转化为结构化研究范围，但不要替用户预设最终创新结论。"
+                    "除论文标题和标准技术名词外，所有自然语言字段使用简体中文。"
+                ),
+                payload={
+                    "project_spec": project.spec.model_dump(mode="json"),
+                    "required_keys": [
+                        "problem_statement",
+                        "independent_variables",
+                        "dependent_variables",
+                        "control_variables",
+                        "integrity_rules",
+                    ],
+                },
+            )
+        except AgentOutputValidationError:
+            fallback = await super().formalize_scope(project)
+            return fallback.model_copy(
+                update={
+                    "provenance": [
+                        *fallback.provenance,
+                        self.name,
+                        "invalid_json_fallback",
+                    ]
+                }
+            )
         return ArtifactRecord(
             kind="research_scope",
             title="Qwen 生成的结构化研究范围",
@@ -161,13 +228,19 @@ class QwenScientistRuntime(MockScientistRuntime):
             system_prompt=(
                 "你负责把研究空白转化为可证伪科学假设。每个假设必须包含零假设、"
                 "变量、预测方向和明确的证伪条件；从不同机制提出 3 至 6 个候选，"
-                "不要写成模糊的工程目标。至少提出 3 个能够由当前工具链直接验证的创新假设："
-                "analysis_contract.kind 必须为 selection_main_effect，treatment 必须为 k_center，"
-                "control 必须为 random；不同创新点应通过机制主张、主指标、类别边界或 K 敏感性"
-                "形成真正不同的证伪问题。analysis_contract.metric 必须严格使用以下标识之一："
+                "不要写成模糊的工程目标。analysis_contract.kind 可为 selection_main_effect、"
+                "detector_interaction 或 query_adaptation；它只是兼容旧流程和安全边界，"
+                "不要要求所有假设固定两种 selection strategy，也不要固定 k_center/random。"
+                "treatment/control 可以描述方法、检测器或其他兼容字段；当前工具链可直接执行的"
+                "方法应使用已注册实现，尚未注册的方法可以作为 requires_implementation 候选。"
+                "后续 ExperimentDesignSpec 决定因素、条件、复现/探索方式和分析形式。"
+                "analysis_contract.metric 必须严格使用以下标识之一："
                 "image_auroc、pixel_auroc、image_ap、aupro；不要返回 Image AUROC、Pixel AUROC、"
-                "AUPRO 等展示标签或 Recall at FPR=5% 等执行器不支持的指标。可以补充需要新代码的"
-                "前瞻候选，但不能把它标成可执行。"
+                "AUPRO 等展示标签或 Recall at FPR=5% 等执行器不支持的指标。"
+                "analysis_contract.design_mode 可选择 paired_comparison 或 custom_design；"
+                "custom_design 可以不提供 treatment/control，由后续设计绑定 Run 字段。"
+                "paired_comparison 的 treatment 与 control 必须是两个不同的条件；"
+                "不得比较同一个方法、检测器或策略与自身。"
                 "除论文标题和标准技术名词外，"
                 "所有自然语言字段使用简体中文。"
             ),
@@ -177,13 +250,36 @@ class QwenScientistRuntime(MockScientistRuntime):
                     item.model_dump(mode="json") for item in project.evidence
                 ],
                 "execution_capabilities": {
-                    "implemented_intervention": "k_center",
-                    "implemented_control": "random",
-                    "implemented_kind": "selection_main_effect",
+                    "implemented_contract_kinds": [
+                        "selection_main_effect",
+                        "detector_interaction",
+                        "query_adaptation",
+                    ],
+                    "registered_selection_strategies": [
+                        "random",
+                        "k_center",
+                        *[
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "selection_strategy"
+                            and item.status in {"validated", "approved"}
+                        ],
+                    ],
+                    "registered_detectors": [
+                        "patchcore",
+                        "anomalydino",
+                        "subspacead",
+                        *[
+                            item.name
+                            for item in project.method_implementations
+                            if item.kind == "detector"
+                            and item.status in {"validated", "approved"}
+                        ],
+                    ],
                     "detectors": ["anomalydino", "patchcore", "subspacead"],
                     "datasets": ["MVTec AD"],
                     "shots": project.spec.constraints.shots,
-                    "rule": "只有上述干预和对照可以标记为当前可执行",
+                    "rule": "可执行性由已注册实现和后续合法 ExperimentDesignSpec 共同决定",
                 },
                 "required_fields": [
                     "gap_id",
@@ -214,10 +310,13 @@ class QwenScientistRuntime(MockScientistRuntime):
                             "evidence_ids": ["existing evidence id"],
                             "closest_prior_work": ["string"],
                             "analysis_contract": {
-                                "kind": "selection_main_effect",
+                                "kind": (
+                                    "selection_main_effect|detector_interaction|query_adaptation"
+                                ),
                                 "metric": "image_auroc|pixel_auroc|image_ap|aupro",
-                                "treatment": "k_center",
-                                "control": "random",
+                                "design_mode": "paired_comparison|custom_design",
+                                "treatment": "method_or_detector_name or null",
+                                "control": "method_or_detector_name or null",
                                 "alpha": 0.05,
                                 "minimum_pairs": 6,
                             },
@@ -236,6 +335,9 @@ class QwenScientistRuntime(MockScientistRuntime):
             normalized = _normalize_hypothesis_payload(item)
             if normalized.get("gap_id") not in valid_gap_ids:
                 continue
+            contract = normalized.get("analysis_contract")
+            if isinstance(contract, dict) and not _has_distinct_conditions(contract):
+                continue
             normalized["evidence_ids"] = [
                 evidence_id
                 for evidence_id in normalized["evidence_ids"]
@@ -243,7 +345,9 @@ class QwenScientistRuntime(MockScientistRuntime):
             ]
             hypotheses.append(Hypothesis.model_validate(normalized))
         if not hypotheses:
-            raise ValueError("Qwen returned no schema-valid hypotheses")
+            raise AgentOutputValidationError(
+                "Qwen 返回的假设没有形成两个不同的实验条件，请重新生成研究假设。"
+            )
         return hypotheses
 
     async def review_hypotheses(self, project: ResearchProject) -> list[Hypothesis]:
@@ -314,6 +418,236 @@ class QwenScientistRuntime(MockScientistRuntime):
             result[0].status = HypothesisStatus.SHORTLISTED
         return sorted(result, key=lambda item: item.score.elo if item.score else 0, reverse=True)
 
+    async def design_experiments(self, project: ResearchProject) -> ExperimentPlan:
+        """Generate structured conditions while keeping the local plan boundary authoritative."""
+
+        fallback = await super().design_experiments(project)
+        try:
+            response = await self.client.complete(
+                role_name="ExperimentDesignAgent",
+                system_prompt=(
+                    "你负责为已批准的科学假设生成轻量通用实验设计。"
+                    "必须为每个假设自主选择 design_mode=paired_comparison 或 custom_design；"
+                    "paired_comparison 才能使用 treatment/control，custom_design 不得依赖它们。"
+                    "设计必须绑定现有 Run 字段 selection_strategy、detector、category、"
+                    "shots、seed 或 protocol；"
+                    "每个条件必须给出完整 factor_values，条件 ID 唯一。"
+                    "允许 group_comparison、factor_effects、interaction_summary、ordered_trend、"
+                    "distribution_summary；interaction_summary 将归一化为 factor_effects；"
+                    "不要把设计限制为 k_center/random，所有值必须来自 allowed_values。"
+                    "必须同时生成 question、rationale 和受控 presentation_spec；"
+                    "根据因素与分析模式选择可读布局，不局限于五种固定模板。"
+                    "除技术名词外，自然语言使用简体中文。"
+                ),
+                payload={
+                    "research_context": {
+                        "objective": project.spec.objective,
+                        "application_context": project.spec.application_context,
+                        "user_guidance": project.spec.user_guidance,
+                        "budget": project.spec.budget.model_dump(mode="json"),
+                        "constraints": project.spec.constraints.model_dump(mode="json"),
+                    },
+                    "hypotheses": [
+                        item.model_dump(mode="json")
+                        for item in project.hypotheses
+                        if item.id in fallback.hypothesis_ids
+                    ],
+                    "allowed_values": {
+                        "selection_strategy": fallback.selection_strategies,
+                        "detector": fallback.detectors,
+                        "category": fallback.categories,
+                        "shots": fallback.shots,
+                        "seed": fallback.seeds,
+                        "protocol": fallback.protocols,
+                    },
+                    "output_schema": {
+                        "designs": [
+                            {
+                                "id": "design_id",
+                                "hypothesis_id": "hypothesis_id",
+                                "design_mode": "paired_comparison|custom_design",
+                                "support_selection_strategy": "allowed strategy or null",
+                                "question": "string",
+                                "rationale": "string",
+                                "factors": [
+                                    {
+                                        "name": "factor_name",
+                                        "field": (
+                                            "selection_strategy|detector|category|shots|seed|protocol"
+                                        ),
+                                        "levels": ["allowed value"],
+                                    }
+                                ],
+                                "conditions": [
+                                    {
+                                        "id": "condition_id",
+                                        "label": "string",
+                                        "factor_values": {"factor_name": "allowed value"},
+                                    }
+                                ],
+                                "analysis": {
+                                    "mode": (
+                                        "group_comparison|factor_effects|interaction_summary|ordered_trend|"
+                                        "distribution_summary"
+                                    ),
+                                    "primary_metric": "image_auroc|pixel_auroc|image_ap|aupro",
+                                    "minimum_pairs": 2,
+                                },
+                                "presentation_spec": {
+                                    "schema_version": 2,
+                                    "layout": "stack|split|grid|sequence",
+                                    "density": "compact|comfortable",
+                                    "blocks": [
+                                        {
+                                            "id": "block_id",
+                                            "kind": (
+                                                "narrative|progress|metrics|chart|table|runs|"
+                                                "evidence|decision|diagnostics|insight|callout|key_value|timeline"
+                                            ),
+                                            "source": (
+                                                "design|progress|condition_statistics|condition_effects|"
+                                                "factor_effects|interaction_summary|ordered_trend|"
+                                                "distribution_summary|runs|evidence|feedback|diagnostics"
+                                            ),
+                                            "chart_mark": "bar|line|point|heatmap|interval or null",
+                                            "span": "full|half|third",
+                                            "title": "string or null",
+                                            "content": "plain text or null",
+                                            "config": "JSON object with display data only",
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    },
+                },
+            )
+            designs: list[ExperimentDesignSpec] = []
+            design_errors: list[str] = []
+            for raw in response.get("designs", []):
+                if not isinstance(raw, dict):
+                    design_errors.append("AI returned a non-object experiment design")
+                    continue
+                try:
+                    raw_design = dict(raw)
+                    if "conditions" in raw_design:
+                        raw_design["conditions"] = normalize_design_conditions_payload(
+                            raw_design["conditions"]
+                        )
+                    raw_spec = raw_design.pop("presentation_spec", None)
+                    if raw_spec is None:
+                        raise ValueError(
+                            f"{raw_design.get('id', 'design')}: missing presentation_spec"
+                        )
+                    # Validate experiment semantics independently, then repair only
+                    # additive presentation omissions before strict DSL validation.
+                    design_without_spec = ExperimentDesignSpec.model_validate(raw_design)
+                    repaired_spec = normalize_presentation_spec_payload(
+                        raw_spec,
+                        analysis_mode=design_without_spec.analysis.mode,
+                    )
+                    design = ExperimentDesignSpec.model_validate(
+                        {**raw_design, "presentation_spec": repaired_spec}
+                    )
+                    if design.hypothesis_id not in fallback.hypothesis_ids:
+                        design_errors.append("AI design references an unknown hypothesis")
+                        continue
+                    validate_design(
+                        design,
+                        fallback,
+                        allowed_categories=set(fallback.categories),
+                        allowed_detectors=set(fallback.detectors),
+                        allowed_strategies=set(fallback.selection_strategies),
+                    )
+                except (TypeError, ValueError) as exc:
+                    design_errors.append(str(exc))
+                    continue
+                designs.append(design)
+            payload = fallback.model_dump(mode="json")
+            if not designs:
+                # No usable AI design at all: keep the deterministic portfolio so
+                # the approved plan never silently drops executable hypotheses.
+                return self._design_failure_plan(
+                    fallback,
+                    "AI did not return a valid executable experiment design; "
+                    "deterministic fallback designs were kept.",
+                    design_errors,
+                    status="fallback" if self._fallback_is_executable(fallback) else "needs_correction",
+                )
+            ai_by_hypothesis = {
+                item.hypothesis_id: item
+                for item in designs
+                if item.hypothesis_id is not None
+            }
+            expected_ids = set(fallback.hypothesis_ids)
+            actual_ids = set(ai_by_hypothesis)
+            if expected_ids - actual_ids:
+                # The deterministic fallback already carries one validated design
+                # per executable hypothesis; let it fill coverage the AI skipped
+                # instead of leaving the plan to be pruned at scoping time.
+                fallback_by_hypothesis = {
+                    item.hypothesis_id: item
+                    for item in fallback.designs
+                    if item.hypothesis_id is not None
+                }
+                missing = sorted(expected_ids - actual_ids)
+                covered = sorted(
+                    hypothesis_id
+                    for hypothesis_id in missing
+                    if hypothesis_id in fallback_by_hypothesis
+                )
+                if covered:
+                    design_errors.append(
+                        "以下假设由确定性兜底设计补齐（AI 未返回合法设计）："
+                        + ", ".join(covered)
+                    )
+                if covered:
+                    payload["design_generation_status"] = "ai_selected"
+                    payload["design_generation_fallback_reason"] = None
+                else:
+                    payload["design_generation_status"] = "needs_correction"
+                    payload["design_generation_fallback_reason"] = (
+                        "AI did not provide a valid design for every executable hypothesis."
+                    )
+                    design_errors.append(f"missing designs: {missing}")
+                ai_by_hypothesis.update(
+                    {
+                        hypothesis_id: fallback_by_hypothesis[hypothesis_id]
+                        for hypothesis_id in covered
+                    }
+                )
+            else:
+                payload["design_generation_status"] = "ai_selected"
+                payload["design_generation_fallback_reason"] = None
+            payload["design_generation_errors"] = design_errors
+            payload["designs"] = [
+                item.model_dump(mode="json")
+                for item in (
+                    ai_by_hypothesis[hypothesis_id]
+                    for hypothesis_id in fallback.hypothesis_ids
+                    if hypothesis_id in ai_by_hypothesis
+                )
+            ]
+            payload.pop("preregistration_digest", None)
+            digest = hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            return ExperimentPlan(**payload, preregistration_digest=digest)
+        except Exception as exc:
+            fallback_status = (
+                "fallback" if self._fallback_is_executable(fallback) else "needs_correction"
+            )
+            return self._design_failure_plan(
+                fallback,
+                (
+                    "Qwen 实验设计调用失败，已保留可执行的 deterministic fallback。"
+                    if fallback_status == "fallback"
+                    else "AI experiment design generation failed; correction is required."
+                ),
+                [str(exc)],
+                status=fallback_status,
+            )
+
     async def recommend_next_experiments(
         self,
         project: ResearchProject,
@@ -323,6 +657,13 @@ class QwenScientistRuntime(MockScientistRuntime):
         user_guidance: str | None = None,
     ) -> ExperimentFeedbackProposal:
         """Use Qwen as a scientific advisor inside a deterministic action boundary."""
+
+        if round_summary.get("design_id"):
+            return await self._recommend_explicit_design_feedback(
+                project,
+                round_summary=round_summary,
+                allowed_cells=allowed_cells,
+            )
 
         try:
             response = await self.client.complete(
@@ -449,13 +790,24 @@ class QwenScientistRuntime(MockScientistRuntime):
             )
             response["advisor"] = self.name
             proposal = ExperimentFeedbackProposal.model_validate(response)
-            if proposal.stop and int(round_summary.get("pair_count", 0)) < int(
-                round_summary.get("minimum_pairs", 6)
-            ):
-                proposal.stop = False
-                proposal.decision = "expand"
-                proposal.next_phase = "replication"
-                proposal.rationale += " 系统否决了提前停止：尚未达到预注册最小成对样本数。"
+            explicit_design = bool(round_summary.get("design_id"))
+            if proposal.stop:
+                if explicit_design:
+                    evidence_ready = round_summary.get("evidence_status") in {
+                        "sample_threshold_met",
+                        "sufficient",
+                    }
+                else:
+                    evidence_ready = int(round_summary.get("pair_count", 0)) >= int(
+                        round_summary.get("minimum_pairs", 6)
+                    )
+                if not evidence_ready:
+                    proposal.stop = False
+                    proposal.decision = "expand"
+                    proposal.next_phase = "replication"
+                    proposal.rationale += (
+                        " 系统否决了提前停止：尚未达到预注册最小证据量。"
+                    )
             return proposal
         except Exception as exc:
             fallback = await super().recommend_next_experiments(
@@ -467,6 +819,134 @@ class QwenScientistRuntime(MockScientistRuntime):
             fallback.advisor = f"{self.name}:deterministic-fallback"
             fallback.observed_patterns.append(
                 f"Qwen 规划调用未产生有效结构化结果：{type(exc).__name__}"
+            )
+            return fallback
+
+    async def _recommend_explicit_design_feedback(
+        self,
+        project: ResearchProject,
+        *,
+        round_summary: dict[str, Any],
+        allowed_cells: list[ExperimentCell],
+    ) -> ExperimentFeedbackProposal:
+        design_id = str(round_summary["design_id"])
+        plan = project.experiment_plan
+        design = next(
+            (item for item in plan.designs if item.id == design_id),
+            None,
+        ) if plan is not None else None
+        if design is None:
+            raise ValueError(f"Unknown experiment design: {design_id}")
+
+        fallback_spec = result_aware_presentation_spec(design, round_summary)
+        try:
+            response = await self.client.complete(
+                role_name="AdaptiveExperimentPlanner",
+                system_prompt=(
+                    "你是少样本工业视觉异常检测的实验结果规划智能体。"
+                    "当前 Round 使用已批准的显式实验设计；只能在该设计的因素、条件和预算边界内"
+                    "提出建议。\n"
+                    "请依据 analysis_mode、condition_statistics、condition_effects、"
+                    "factor_effects、"
+                    "interaction_summary、ordered_trend、distribution_summary、sample_size、"
+                    "evidence_status 和 failed_run_ids 判断下一步。推断统计尚未执行，"
+                    "不得声称统计检验、统计显著性或科学证据已经充分。\n"
+                    "同时选择一个受控 presentation_spec，反映真实结果：失败时包含"
+                    "runs、diagnostics、evidence；趋势有效点不足时使用 ordered_trend table；"
+                    "没有交互数据时不要使用空 heatmap，改用 condition_statistics 或 "
+                    "factor_effects table。"
+                    "只能使用给定 block kind/source/chart_mark；允许 insight、callout、key_value、timeline"
+                    "等纯语义组件，可通过 content/config 提供数据，不得输出可执行代码；"
+                    "不得输出 React、HTML、CSS 或 ECharts options。"
+                ),
+                payload={
+                    "design": design.model_dump(mode="json"),
+                    "round_summary": round_summary,
+                    "allowed_cells": [
+                        item.model_dump(mode="json") for item in allowed_cells[:100]
+                    ],
+                    "output_schema": {
+                        "advisor": self.name,
+                        "decision": (
+                            "expand|replicate|diagnose|stop|adapt_k|focus_category|ablate|early_stop"
+                        ),
+                        "rationale": "string",
+                        "reasoning_chain": "same structured list as the feedback contract",
+                        "observed_patterns": ["string"],
+                        "next_phase": (
+                            "sensitivity|main_study|replication|ablation|"
+                            "cross_dataset|complete"
+                        ),
+                        "recommended_cells": [
+                            {"category": "string", "shots": "integer", "seed": "integer"}
+                        ],
+                        "expected_information_gain": "0..1",
+                        "stop": "boolean",
+                        "presentation_spec": {
+                            "schema_version": 2,
+                            "layout": "stack|split|grid|sequence",
+                            "density": "compact|comfortable",
+                            "blocks": [
+                                {
+                                    "id": "string",
+                                    "kind": (
+                                        "narrative|progress|metrics|chart|table|runs|"
+                                        "evidence|decision|diagnostics|insight|callout|key_value|timeline"
+                                    ),
+                                    "source": (
+                                        "design|progress|condition_statistics|condition_effects|"
+                                        "factor_effects|interaction_summary|ordered_trend|"
+                                        "distribution_summary|runs|evidence|feedback|diagnostics"
+                                    ),
+                                    "chart_mark": "bar|line|point|heatmap|interval|null",
+                                    "span": "full|half|third",
+                                    "title": "string or null",
+                                    "content": "plain text or null",
+                                    "config": "JSON object with display data only",
+                                }
+                            ],
+                        },
+                    },
+                },
+            )
+            if not isinstance(response, dict):
+                raise ValueError("Qwen returned a non-object feedback result")
+            response = dict(response)
+            response["advisor"] = self.name
+            raw_spec = response.pop("presentation_spec", None)
+            proposal = ExperimentFeedbackProposal.model_validate(response)
+            if raw_spec is not None:
+                try:
+                    candidate_spec = ExperimentCardPresentationSpec.model_validate(
+                        raw_spec
+                    )
+                    merged_design = design.model_copy(
+                        update={"presentation_spec": candidate_spec}, deep=True
+                    )
+                    proposal.presentation_spec = result_aware_presentation_spec(
+                        merged_design,
+                        {**round_summary, "feedback": proposal.model_dump(mode="json")},
+                    )
+                except Exception:
+                    proposal.presentation_spec = fallback_spec
+            else:
+                proposal.presentation_spec = fallback_spec
+            if proposal.stop and round_summary.get("evidence_status") != "sample_threshold_met":
+                proposal.stop = False
+                proposal.decision = "expand"
+                proposal.next_phase = "replication"
+                proposal.rationale += " 系统否决了提前停止：尚未达到最小样本门槛。"
+            return proposal
+        except Exception as exc:
+            fallback = await super().recommend_next_experiments(
+                project,
+                round_summary=round_summary,
+                allowed_cells=allowed_cells,
+            )
+            fallback.advisor = f"{self.name}:deterministic-fallback"
+            fallback.presentation_spec = fallback_spec
+            fallback.observed_patterns.append(
+                f"Qwen 设计反馈调用未产生有效结构化结果：{type(exc).__name__}"
             )
             return fallback
 
@@ -806,3 +1286,15 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item is not None]
     return [str(value)]
+
+
+def _has_distinct_conditions(contract: dict[str, Any]) -> bool:
+    if contract.get("design_mode") == "custom_design":
+        return True
+    treatment = _comparison_key(contract.get("treatment"))
+    control = _comparison_key(contract.get("control"))
+    return bool(treatment and control and treatment != control)
+
+
+def _comparison_key(value: Any) -> str:
+    return " ".join(str(value).casefold().replace("_", " ").replace("-", " ").split())

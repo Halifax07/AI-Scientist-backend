@@ -13,7 +13,11 @@ from fsad_scientist.domain.models import (
     ArtifactRecord,
     EvidenceRecord,
     ExpectedImprovement,
+    ExperimentAnalysisSpec,
     ExperimentCell,
+    ExperimentConditionSpec,
+    ExperimentDesignSpec,
+    ExperimentFactorSpec,
     ExperimentFeedbackProposal,
     ExperimentGuidanceDecision,
     ExperimentPlan,
@@ -28,9 +32,12 @@ from fsad_scientist.domain.models import (
     new_id,
 )
 from fsad_scientist.experiments.code_safety import (
+    BUILTIN_DETECTORS,
+    BUILTIN_STRATEGIES,
     implementation_detector_name,
     sanitize_strategy_name,
 )
+from fsad_scientist.experiments.design import _canonical_metric, validate_design
 from fsad_scientist.experiments.detector_runner import assemble_detector_file
 from fsad_scientist.experiments.strategy_runner import assemble_strategy_file
 from fsad_scientist.science.statistics import compare_paired_runs
@@ -73,6 +80,94 @@ def _mock_strategy_source(strategy_name: str) -> str:
         "    rotated = ranked[offset:] + ranked[:offset]\n"
         "    return rotated[:k]\n"
     )
+
+
+def _design_allowed_sets(
+    registered: list[MethodImplementation],
+) -> tuple[set[str], set[str]]:
+    """Approved arm universes the deterministic design layer may bind."""
+    detectors = set(BUILTIN_DETECTORS) | {
+        item.name
+        for item in registered
+        if item.kind == "detector" and item.status in {"validated", "approved"}
+    }
+    strategies = set(BUILTIN_STRATEGIES) | {
+        item.name
+        for item in registered
+        if item.kind == "selection_strategy" and item.status in {"validated", "approved"}
+    }
+    return detectors, strategies
+
+
+def _deterministic_design(
+    hypothesis: Hypothesis,
+    *,
+    detectors: set[str],
+    strategies: set[str],
+    shots: list[int],
+) -> ExperimentDesignSpec | None:
+    """Deterministic preregistered design for one executable hypothesis.
+
+    Returns None when the contract cannot form two distinct condition
+    assignments with the approved method universes; such hypotheses must stay
+    out of the fallback plan instead of silently shrinking it later.
+    """
+    contract = hypothesis.analysis_contract
+    if contract is None:
+        return None
+    metric = _canonical_metric(contract.metric)
+    if contract.design_mode == "custom_design":
+        levels = list(dict.fromkeys(shots))
+        if len(levels) < 2:
+            return None
+        factor_name = "shots"
+        factor_field = "shots"
+        conditions = [
+            ExperimentConditionSpec(
+                id=f"condition_{index}",
+                factor_values={factor_name: level},
+            )
+            for index, level in enumerate(levels[:6], start=1)
+        ]
+    else:
+        treatment, control = contract.treatment, contract.control
+        if treatment is None or control is None or treatment == control:
+            return None
+        if treatment in detectors and control in detectors:
+            factor_name, factor_field = "detector", "detector"
+        elif treatment in strategies and control in strategies:
+            factor_name, factor_field = "strategy", "selection_strategy"
+        else:
+            # Arms span both universes (or an unregistered custom method):
+            # no legal pair cell can be built from them deterministically.
+            return None
+        conditions = [
+            ExperimentConditionSpec(id="control", factor_values={factor_name: control}),
+            ExperimentConditionSpec(id="treatment", factor_values={factor_name: treatment}),
+        ]
+    design = ExperimentDesignSpec(
+        id=f"det_{hypothesis.id}",
+        name="deterministic_arm_condition",
+        hypothesis_id=hypothesis.id,
+        design_type=contract.design_mode,
+        design_mode=contract.design_mode,
+        factors=[
+            ExperimentFactorSpec(
+                name=factor_name,
+                field=factor_field,
+                levels=[condition.factor_values[factor_name] for condition in conditions],
+            )
+        ],
+        conditions=conditions,
+        support_selection_strategy=None,
+        analysis=ExperimentAnalysisSpec(
+            mode="group_comparison",
+            primary_metric=metric,
+            minimum_pairs=contract.minimum_pairs,
+        ),
+        purpose="main_study",
+    )
+    return design
 
 
 class MockScientistRuntime:
@@ -288,23 +383,25 @@ class MockScientistRuntime:
             ),
             Hypothesis(
                 gap_id=gaps["测试时信息能否抵消劣质参考集"].id,
-                title="覆盖感知选样的收益随 K 增大而衰减",
+                title="池压缩协议在极小支持集下保持可竞争性",
                 claim=(
-                    "k-center 相对 random 的收益在 K=1/2 时最大，并随 K 增加到 4/8"
-                    "而显著衰减。"
+                    "池压缩仅使用默认参考支持集的子集时，Image AUROC 随参考规模"
+                    "增加而上升并趋于饱和，但在极小规模下仍明显优于无参考的退化基线。"
                 ),
-                null_hypothesis="k-center 与 random 的成对效应不随 K 改变。",
-                rationale="极低 K 下正常模式遗漏最严重，代表性选样的边际价值应更高。",
-                independent_variables=["K", "选择策略", "类别"],
-                dependent_variables=["Image AUROC", "跨 seed 方差"],
-                predicted_direction="选择策略与 K 呈负向交互。",
-                falsification_conditions=["成对收益不随 K 增大而下降"],
+                null_hypothesis="池压缩后的 AUROC 只由参考规模线性决定，与压缩排序无关。",
+                rationale="显式自定义设计直接沿参考规模因子检验压缩协议的边际价值曲线。",
+                independent_variables=["参考规模 K", "压缩排序"],
+                dependent_variables=["Image AUROC", "AUPRO", "跨 seed 方差"],
+                predicted_direction="AUROC 随 K 增加而上升并趋于饱和。",
+                falsification_conditions=[
+                    "收益在 K 增大后显著倒挂",
+                    "极小参考规模下低于未采用该协议的基线",
+                ],
                 evidence_ids=evidence_ids,
                 analysis_contract=AnalysisContract(
                     kind="selection_main_effect",
                     metric="image_auroc",
-                    treatment="k_center",
-                    control="random",
+                    design_mode="custom_design",
                     minimum_pairs=6,
                 ),
             ),
@@ -365,28 +462,22 @@ class MockScientistRuntime:
             for item in project.method_implementations
             if item.status in {"validated", "approved"}
         ]
+        detector_universe, strategy_universe = _design_allowed_sets(registered)
         hypothesis_contracts = {
             item.id: item.analysis_contract.model_dump(mode="json")
             for item in project.hypotheses
             if item.status == HypothesisStatus.SHORTLISTED
             and item.analysis_contract is not None
         }
+        eligible_hypotheses = [
+            item
+            for item in project.hypotheses
+            if item.user_selected is not False
+            and item.status
+            in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
+        ]
         payload = {
-            "hypothesis_ids": [
-                item.id
-                for item in project.hypotheses
-                if (
-                    item.execution_readiness == "executable"
-                    or any(
-                        implementation.hypothesis_id == item.id
-                        and implementation.kind == "selection_strategy"
-                        for implementation in registered
-                    )
-                )
-                and item.user_selected is not False
-                and item.status
-                in {HypothesisStatus.SHORTLISTED, HypothesisStatus.CANDIDATE}
-            ],
+            "hypothesis_ids": [],
             "hypothesis_contracts": hypothesis_contracts,
             "protocols": ["strict_k_shot", "pool_compression_m30"],
             "detectors": [
@@ -438,6 +529,34 @@ class MockScientistRuntime:
             ],
             "estimated_gpu_hours": min(project.spec.budget.gpu_hours, 12.0),
         }
+        skeleton_digest = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        plan = ExperimentPlan(**payload, preregistration_digest=skeleton_digest)
+        designs: list[ExperimentDesignSpec] = []
+        hypothesis_ids: list[str] = []
+        for item in eligible_hypotheses:
+            design = _deterministic_design(
+                item,
+                detectors=detector_universe,
+                strategies=strategy_universe,
+                shots=payload["shots"],
+            )
+            if design is None:
+                continue
+            try:
+                validate_design(
+                    design,
+                    plan,
+                    allowed_detectors=detector_universe,
+                    allowed_strategies=strategy_universe,
+                )
+            except (TypeError, ValueError):
+                continue
+            hypothesis_ids.append(item.id)
+            designs.append(design)
+        payload["hypothesis_ids"] = hypothesis_ids
+        payload["designs"] = [item.model_dump(mode="json") for item in designs]
         digest = hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -791,6 +910,100 @@ class MockScientistRuntime:
             status="draft",
         )
 
+    @staticmethod
+    def _latest_design_round_summary(
+        project: ResearchProject, hypothesis_id: str
+    ) -> dict[str, Any] | None:
+        """Return the newest persisted design-mode summary for a hypothesis.
+
+        显式自定义设计（factor_effects / ordered_trend 等）无法折叠成
+        treatment/control 配对，分析只能依据实验轮次里保存的描述性摘要。
+        遍历历史与当前 campaign 的最新轮次，优先取 result_summary 中的
+        ExperimentSummary dump；没有已验证观测的轮次直接跳过。
+        """
+        campaigns = list(project.experiment_campaign_history)
+        if project.experiment_campaign is not None:
+            campaigns.append(project.experiment_campaign)
+        for campaign in reversed(campaigns):
+            for round_item in reversed(campaign.rounds):
+                if round_item.hypothesis_id != hypothesis_id:
+                    continue
+                payload = (
+                    round_item.result_summary
+                    if isinstance(round_item.result_summary, dict)
+                    else {}
+                )
+                nested = payload.get("summary")
+                if not isinstance(nested, dict) and round_item.summary is not None:
+                    nested = round_item.summary.model_dump(mode="json")
+                if isinstance(nested, dict) and int(nested.get("sample_size", 0) or 0) > 0:
+                    return nested
+        return None
+
+    @staticmethod
+    def _descriptive_design_finding(
+        hypothesis: Hypothesis,
+        summary: dict[str, Any],
+        runs: list[ExperimentRun],
+    ) -> AnalysisFinding:
+        """构造显式设计轮次的描述性结论（不做推断统计）。"""
+        mode = str(summary.get("analysis_mode", "design") or "design")
+        n = int(summary.get("sample_size", 0) or 0)
+        source_ids = set(summary.get("source_run_ids") or [])
+        # 保持与项目运行记录一致的顺序，便于前端回链实验节点。
+        source_run_ids = [run.id for run in runs if run.id in source_ids]
+        if mode == "ordered_trend":
+            points = [
+                item
+                for item in summary.get("ordered_trend") or []
+                if item.get("mean") is not None
+            ]
+            if len(points) >= 2:
+                first, last = points[0], points[-1]
+                direction = (
+                    "首尾呈上升趋势"
+                    if last["mean"] > first["mean"]
+                    else "首尾呈下降趋势"
+                    if last["mean"] < first["mean"]
+                    else "首尾基本持平"
+                )
+                statement = (
+                    f"显式实验设计汇总了 {n} 次 verified 运行：有序因子水平 "
+                    f"{first['level']} 均值为 {first['mean']:.4f}，水平 "
+                    f"{last['level']} 均值为 {last['mean']:.4f}，{direction}；"
+                    "未执行推断统计，当前结果尚不能确认或推翻预注册主张。"
+                )
+                return AnalysisFinding(
+                    hypothesis_id=hypothesis.id,
+                    statement=statement,
+                    sample_size=n,
+                    analysis_method=f"descriptive_{mode}",
+                    claim_verdict="inconclusive",
+                    supporting_run_ids=source_run_ids,
+                    boundary_conditions=[
+                        "结论来自显式设计的描述性摘要，未执行推断统计",
+                        "需要在更大样本上按设计预注册的推断方法复核",
+                    ],
+                    verified=False,
+                )
+        statement = (
+            f"显式实验设计（{mode}）汇总了 {n} 次 verified 运行的描述性结果；"
+            "未执行推断统计，当前结果尚不能确认或推翻预注册主张。"
+        )
+        return AnalysisFinding(
+            hypothesis_id=hypothesis.id,
+            statement=statement,
+            sample_size=n,
+            analysis_method=f"descriptive_{mode}",
+            claim_verdict="inconclusive",
+            supporting_run_ids=source_run_ids,
+            boundary_conditions=[
+                "结论来自显式设计的描述性摘要，未执行推断统计",
+                "需要在更大样本上按设计预注册的推断方法复核",
+            ],
+            verified=False,
+        )
+
     async def analyze_results(self, project: ResearchProject) -> list[AnalysisFinding]:
         runs = [run for run in project.runs if run.status == RunStatus.SUCCEEDED and run.verified]
         if not runs:
@@ -799,19 +1012,28 @@ class MockScientistRuntime:
         findings: list[AnalysisFinding] = []
         for hypothesis in project.hypotheses:
             contract = hypothesis.analysis_contract
-            if contract is None or contract.kind not in {
-                "selection_main_effect",
-                "query_adaptation",
-            }:
-                findings.append(
-                    AnalysisFinding(
-                        hypothesis_id=hypothesis.id,
-                        statement="当前实验批次未直接识别该假设预注册的因果量。",
-                        boundary_conditions=["需要执行与 analysis_contract 匹配的实验节点"],
-                        claim_verdict="not_tested",
-                        verified=False,
+            paired_capable = (
+                contract is not None
+                and contract.kind in {"selection_main_effect", "query_adaptation"}
+                and contract.treatment is not None
+                and contract.control is not None
+            )
+            if not paired_capable:
+                summary = self._latest_design_round_summary(project, hypothesis.id)
+                if summary is not None:
+                    findings.append(
+                        self._descriptive_design_finding(hypothesis, summary, runs)
                     )
-                )
+                else:
+                    findings.append(
+                        AnalysisFinding(
+                            hypothesis_id=hypothesis.id,
+                            statement="当前实验批次未直接识别该假设预注册的因果量。",
+                            boundary_conditions=["需要执行与 analysis_contract 匹配的实验节点"],
+                            claim_verdict="not_tested",
+                            verified=False,
+                        )
+                    )
                 continue
             try:
                 comparison = compare_paired_runs(
@@ -823,16 +1045,24 @@ class MockScientistRuntime:
                     alpha=contract.alpha,
                 )
             except ValueError:
-                findings.append(
-                    AnalysisFinding(
-                        hypothesis_id=hypothesis.id,
-                        statement="尚无足够的预注册成对真实结果，当前证据不足。",
-                        boundary_conditions=["需要相同数据、类别、检测器、K 和 seed 的配对运行"],
-                        # 配对数不足时标记为 not_tested，避免触发无限修订循环。
-                        claim_verdict="not_tested",
-                        verified=False,
+                summary = self._latest_design_round_summary(project, hypothesis.id)
+                if summary is not None:
+                    # 该假设运行的是无法折叠成配对的显式设计：给出描述性结论，
+                    # 而不是用“配对不足”的措辞掩盖已经存在的运行结果。
+                    findings.append(
+                        self._descriptive_design_finding(hypothesis, summary, runs)
                     )
-                )
+                else:
+                    findings.append(
+                        AnalysisFinding(
+                            hypothesis_id=hypothesis.id,
+                            statement="尚无足够的预注册成对真实结果，当前证据不足。",
+                            boundary_conditions=["需要相同数据、类别、检测器、K 和 seed 的配对运行"],
+                            # 配对数不足时标记为 not_tested，避免触发无限修订循环。
+                            claim_verdict="not_tested",
+                            verified=False,
+                        )
+                    )
                 continue
 
             lower, upper = comparison.confidence_interval
@@ -983,10 +1213,16 @@ class MockScientistRuntime:
                     else ""
                 )
             )
-            updated.falsification_conditions = [
-                *hypothesis.falsification_conditions,
-                "修订后预注册的稳定性主终点仍未达到最小效应或重复要求",
-            ]
+            # 每次修订都继承父条件并追加本轮证伪条件; 同一文本只保留一条,
+            # 否则多次修订后条件列表出现重复句子(前端以内容为 key 渲染)。
+            updated.falsification_conditions = list(
+                dict.fromkeys(
+                    [
+                        *hypothesis.falsification_conditions,
+                        "修订后预注册的稳定性主终点仍未达到最小效应或重复要求",
+                    ]
+                )
+            )
             revised.append(updated)
         return revised
 

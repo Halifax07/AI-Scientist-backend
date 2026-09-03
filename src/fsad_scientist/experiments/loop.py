@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from statistics import fmean
+from itertools import combinations
+from statistics import fmean, median, pstdev
 from typing import Any, Literal
 
 from fsad_scientist.datasets.models import DatasetManifest
@@ -10,16 +11,32 @@ from fsad_scientist.domain.models import (
     DatasetAuditRecord,
     ExperimentCampaign,
     ExperimentCell,
+    ExperimentConditionEffectSummary,
+    ExperimentConditionSpec,
+    ExperimentConditionSummary,
+    ExperimentDesignSpec,
+    ExperimentDistributionSummary,
+    ExperimentFactorEffectSummary,
     ExperimentFeedbackProposal,
+    ExperimentInteractionSummary,
     ExperimentNodeRecord,
     ExperimentRound,
     ExperimentRun,
+    ExperimentSummary,
+    ExperimentTrendPoint,
     Hypothesis,
     ResearchProject,
     new_id,
     utc_now,
 )
 from fsad_scientist.experiments.code_safety import BUILTIN_DETECTORS, BUILTIN_STRATEGIES
+from fsad_scientist.experiments.design import (
+    compile_design,
+    default_presentation_spec,
+    normalize_design,
+    validate_design,
+    validate_plan_designs,
+)
 from fsad_scientist.science.experiment_tree import ExperimentNode, ExperimentPhase
 
 ExperimentPhaseName = Literal[
@@ -51,6 +68,14 @@ def normalize_primary_metric(metric: str) -> str:
 
 def is_supported_primary_metric(metric: str) -> bool:
     return normalize_primary_metric(metric) in SUPPORTED_PRIMARY_METRICS
+
+
+def _mean(observations: list[tuple[float, str]]) -> float | None:
+    return fmean(value for value, _ in observations) if observations else None
+
+
+def _ordered_value(value: Any) -> tuple[int, Any]:
+    return (0 if isinstance(value, (int, float)) and not isinstance(value, bool) else 1, value)
 
 
 class AdaptiveExperimentPlanner:
@@ -120,12 +145,24 @@ class AdaptiveExperimentPlanner:
         if contract is None:
             raise ValueError("The selected hypothesis has no analysis contract")
         approved_strategies = self._approved_strategies(project)
-        if contract.treatment not in approved_strategies:
+        explicit_design = self._explicit_design(plan, hypothesis.id)
+        if explicit_design is not None and explicit_design.design_mode != "custom_design":
+            explicit_design = None
+        if plan.design_generation_status == "needs_correction":
+            raise ValueError(
+                "Experiment design generation needs correction before execution: "
+                f"{plan.design_generation_fallback_reason or 'unknown reason'}"
+            )
+        if explicit_design is None and contract.design_mode == "custom_design":
+            raise ValueError(
+                "custom_design requires an explicit validated ExperimentDesignSpec"
+            )
+        if explicit_design is None and contract.treatment not in approved_strategies:
             raise ValueError(
                 f"Unsupported treatment strategy: {contract.treatment}"
                 "；自定义策略需先生成实现并获批准"
             )
-        if contract.control not in approved_strategies:
+        if explicit_design is None and contract.control not in approved_strategies:
             raise ValueError(
                 f"Unsupported control strategy: {contract.control}"
                 "；自定义策略需先生成实现并获批准"
@@ -138,53 +175,106 @@ class AdaptiveExperimentPlanner:
         seeds = sorted(set(plan.seeds))
         if not shots or not seeds:
             raise ValueError("The experiment plan must contain at least one K and one seed")
-        if len(categories) * len(shots) * len(seeds) < 3:
-            raise ValueError(
-                "Each innovation Round needs at least three distinct registered cells "
-                "for its three internal iterations"
-            )
-
         historical_campaign_runs = sum(
             run.round_id is not None and run.plan_id == plan.id for run in project.runs
         )
         remaining_run_budget = project.spec.budget.max_experiments - historical_campaign_runs
         effective_max_runs = min(max_runs, remaining_run_budget)
-        if effective_max_runs < 6:
+        validate_plan_designs(
+            plan,
+            budget=effective_max_runs,
+            allowed_categories=set(categories),
+            allowed_detectors=self._approved_detectors(project),
+            allowed_strategies=approved_strategies,
+        )
+        design_conditions = self._design_conditions(
+            project,
+            hypothesis_id=hypothesis.id,
+            categories=set(categories),
+            budget=effective_max_runs,
+        )
+        outer_cells_by_hypothesis = {
+            item.id: self._outer_cells(
+                plan,
+                hypothesis_id=item.id,
+                categories=categories,
+                shots=shots,
+                seeds=seeds,
+            )
+            for item in [
+                hypothesis,
+                *[
+                    candidate
+                    for candidate in self._eligible_hypotheses(project)
+                    if candidate.id != hypothesis.id
+                ],
+            ]
+        }
+        for candidate_id, outer_cells in outer_cells_by_hypothesis.items():
+            if len(outer_cells) < 3:
+                design = self._explicit_design(plan, candidate_id)
+                detail = (
+                    f"设计 {design.id} 的因素已占用 category/shots/seed 外层迭代轴；"
+                    if design is not None
+                    else "legacy 实验需要至少三个 category/K/seed 外层单元；"
+                )
+                raise ValueError(
+                    f"{detail}当前仅有 {len(outer_cells)} 个独立外层单元，"
+                    "无法支撑三次内部迭代"
+                )
+        condition_counts_by_hypothesis = {
+            candidate_id: len(
+                self._design_conditions(
+                    project,
+                    hypothesis_id=candidate_id,
+                    categories=set(categories),
+                    budget=effective_max_runs,
+                )
+            ) or 2
+            for candidate_id in hypothesis_ids
+        }
+        condition_count = condition_counts_by_hypothesis[hypothesis.id]
+        minimum_round_runs = condition_count * 3
+        if effective_max_runs < minimum_round_runs:
             raise ValueError(
-                "The remaining project budget cannot fund one innovation Round (6 runs)"
+                "The remaining project budget cannot fund one innovation Round"
             )
         # A complete Round consumes exactly three paired iterations.  Never
         # promise more innovation rounds than the frozen project budget can fund.
         round_capacity = min(
             len(hypothesis_ids),
             max_rounds,
-            effective_max_runs // 6,
+            effective_max_runs // minimum_round_runs,
         )
         hypothesis_ids = hypothesis_ids[: max(1, round_capacity)]
         if not hypothesis_ids:
             raise ValueError("At least one selected innovation is required")
-        initial_k = 2 if 2 in shots else shots[0]
-        # Sequential campaigns retain the original one-pair-at-a-time protocol.
+        # Sequential campaigns retain the original one-pair-at-a-time protocol;
+        # explicit designs may define the outer iteration cells.
+        initial_cells = outer_cells_by_hypothesis[hypothesis.id][:1]
         # Parallel campaigns pre-register all three iterations for every
         # selected innovation, allowing independent rounds to run concurrently
         # without serially enumerating the full factorial space.
-        initial_seeds = seeds[:1]
-        initial_cells = [
-            ExperimentCell(category=categories[0], shots=initial_k, seed=seed)
-            for seed in initial_seeds
-        ]
         parallel_cells = [
             ExperimentCell(category=category, shots=shot, seed=seed)
             for category in categories
             for shot in shots
             for seed in seeds
         ][:3]
-        exhaustive_run_count = (
-            len(hypothesis_ids) * len(categories) * len(shots) * len(seeds) * 2
+        # A Round is one innovation.  Its first experimental iteration is
+        # executed before the single human midpoint-guidance gate.
+        exhaustive_run_count = sum(
+            len(outer_cells_by_hypothesis[candidate_id])
+            * condition_counts_by_hypothesis[candidate_id]
+            for candidate_id in hypothesis_ids
         )
-        primary_metric = normalize_primary_metric(contract.metric)
+        primary_metric = normalize_primary_metric(
+            explicit_design.analysis.primary_metric
+            if explicit_design is not None
+            else contract.metric
+        )
         if primary_metric not in SUPPORTED_PRIMARY_METRICS:
-            raise ValueError(f"Unsupported primary metric: {contract.metric}")
+            raise ValueError(f"Unsupported primary metric: {primary_metric}")
         campaign = ExperimentCampaign(
             hypothesis_id=hypothesis.id,
             hypothesis_ids=hypothesis_ids,
@@ -194,8 +284,8 @@ class AdaptiveExperimentPlanner:
             protocol=f"pool_compression_m{project.spec.constraints.candidate_pool_size}",
             candidate_pool_size=project.spec.constraints.candidate_pool_size,
             detector=detector,
-            treatment=contract.treatment,
-            control=contract.control,
+            treatment=contract.treatment or "",
+            control=contract.control or "",
             metric=primary_metric,
             device=device,
             max_rounds=len(hypothesis_ids),
@@ -211,6 +301,7 @@ class AdaptiveExperimentPlanner:
                 ),
             ),
             selected_hypothesis_ids=hypothesis_ids,
+            design_id=explicit_design.id if explicit_design is not None else None,
         )
         if execution_mode == "parallel":
             all_runs: list[ExperimentRun] = []
@@ -244,8 +335,10 @@ class AdaptiveExperimentPlanner:
             campaign.hypothesis_id = hypothesis_ids[0]
             first_contract = self._hypothesis(project, hypothesis_ids[0]).analysis_contract
             if first_contract is not None:
-                campaign.treatment = first_contract.treatment
-                campaign.control = first_contract.control
+                # custom_design contracts have no arms: 顶层字段必须留空串,
+                # 否则持久化后 ResearchProject 重新校验会因 None 失败 (整库 500)。
+                campaign.treatment = first_contract.treatment or ""
+                campaign.control = first_contract.control or ""
                 campaign.metric = normalize_primary_metric(first_contract.metric)
             campaign.next_action = "execute_parallel_batch"
             self._refresh_efficiency(campaign)
@@ -256,11 +349,19 @@ class AdaptiveExperimentPlanner:
             campaign=campaign,
             index=1,
             phase="feasibility",
-            objective="验证真实数据、特征、支持集选择和检测器链路，并获得首批成对效应。",
+            objective=(
+                self._design_objective(explicit_design, len(design_conditions))
+                if explicit_design is not None
+                else "验证真实数据、特征、支持集选择和检测器链路，并获得首批成对效应。"
+            ),
             rationale=(
-                f"先在 bottle、K=2 和一个随机种子上比较 {contract.control} 与 "
-                f"{contract.treatment}，并使用 {detector} 执行检测；"
-                "用一组成对真实运行换取端到端可行性和初始效应信息。"
+                self._design_rationale(explicit_design, len(design_conditions), detector)
+                if explicit_design is not None
+                else (
+                    f"先在 bottle、K=2 和一个随机种子上比较 {contract.control} 与 "
+                    f"{contract.treatment}，并使用 {detector} 执行检测；"
+                    "用一组成对真实运行换取端到端可行性和初始效应信息。"
+                )
             ),
             cells=initial_cells,
             information_gain=0.90,
@@ -289,7 +390,23 @@ class AdaptiveExperimentPlanner:
             raise ValueError(f"Unknown experiment round: {round_id}")
         runs_by_id = {run.id: run for run in project.runs}
         runs = [runs_by_id[run_id] for run_id in current.run_ids if run_id in runs_by_id]
-        metric = normalize_primary_metric(current.metric)
+        explicit_design = self._explicit_design(project.experiment_plan, current.hypothesis_id)
+        if explicit_design is not None and explicit_design.design_mode != "custom_design":
+            explicit_design = None
+        metric = normalize_primary_metric(
+            explicit_design.analysis.primary_metric
+            if explicit_design is not None
+            else current.metric
+        )
+        if explicit_design is not None:
+            current.metric = metric
+            return self._summarize_design_round(
+                project,
+                current=current,
+                runs=runs,
+                design=explicit_design,
+                metric=metric,
+            )
         grouped: dict[tuple[str, int, int], dict[str, ExperimentRun]] = defaultdict(dict)
         failed_run_ids: list[str] = []
         duration_seconds = 0.0
@@ -431,6 +548,311 @@ class AdaptiveExperimentPlanner:
             "exhaustive_run_count": campaign.exhaustive_run_count,
         }
 
+    def _summarize_design_round(
+        self,
+        project: ResearchProject,
+        *,
+        current: ExperimentRound,
+        runs: list[ExperimentRun],
+        design: ExperimentDesignSpec,
+        metric: str,
+    ) -> dict[str, Any]:
+        conditions = self._design_conditions(
+            project,
+            hypothesis_id=current.hypothesis_id,
+            categories=self._campaign_categories(project),
+        )
+        values_by_condition: dict[str, list[tuple[float, str]]] = defaultdict(list)
+        failed_run_ids = [run.id for run in runs if run.status == RunStatus.FAILED]
+        duration_seconds = sum(run.duration_seconds or 0.0 for run in runs)
+        for run in runs:
+            if (
+                run.status != RunStatus.SUCCEEDED
+                or not run.verified
+                or metric not in run.metrics
+            ):
+                continue
+            condition_id = run.condition_id or run.selection_strategy
+            values_by_condition[condition_id].append((run.metrics[metric], run.id))
+
+        condition_statistics: list[ExperimentConditionSummary] = []
+        for condition in conditions:
+            observations = values_by_condition.get(condition.id, [])
+            numbers = [value for value, _ in observations]
+            condition_statistics.append(
+                ExperimentConditionSummary(
+                    condition_id=condition.id,
+                    label=condition.label,
+                    factor_values=condition.factor_values,
+                    sample_size=len(numbers),
+                    mean=round(fmean(numbers), 8) if numbers else None,
+                    standard_deviation=round(pstdev(numbers), 8) if len(numbers) > 1 else 0.0
+                    if numbers
+                    else None,
+                    minimum=round(min(numbers), 8) if numbers else None,
+                    maximum=round(max(numbers), 8) if numbers else None,
+                    median=round(median(numbers), 8) if numbers else None,
+                    source_run_ids=[run_id for _, run_id in observations],
+                )
+            )
+
+        effects: list[ExperimentConditionEffectSummary] = []
+        baseline_id = design.analysis.baseline_condition_id or (
+            conditions[0].id if conditions else None
+        )
+        baseline_mean = _mean(values_by_condition.get(baseline_id or "", []))
+        for condition in conditions:
+            if condition.id == baseline_id:
+                continue
+            condition_mean = _mean(values_by_condition.get(condition.id, []))
+            if condition_mean is None or baseline_mean is None:
+                continue
+            effects.append(
+                ExperimentConditionEffectSummary(
+                    condition_id=condition.id,
+                    baseline_condition_id=baseline_id,
+                    effect=round(condition_mean - baseline_mean, 8),
+                    sample_size=len(values_by_condition.get(condition.id, [])),
+                    source_run_ids=[
+                        run_id
+                        for _, run_id in values_by_condition.get(condition.id, [])
+                    ],
+                )
+            )
+
+        factor_effects: list[ExperimentFactorEffectSummary] = []
+        for factor in design.factors:
+            by_level: dict[str, list[tuple[float, str]]] = defaultdict(list)
+            for condition in conditions:
+                level = condition.factor_values.get(factor.name)
+                key = str(level)
+                by_level[key].extend(values_by_condition.get(condition.id, []))
+            level_means = {
+                level: round(fmean(value for value, _ in observations), 8)
+                for level, observations in sorted(by_level.items())
+                if observations
+            }
+            level_values = list(level_means.values())
+            factor_effects.append(
+                ExperimentFactorEffectSummary(
+                    factor=factor.name,
+                    level_means=level_means,
+                    effect=round(max(level_values) - min(level_values), 8)
+                    if len(level_values) > 1
+                    else None,
+                    sample_size=sum(len(item) for item in by_level.values()),
+                    source_run_ids=[
+                        run_id for observations in by_level.values() for _, run_id in observations
+                    ],
+                )
+            )
+
+        interaction_summaries: list[ExperimentInteractionSummary] = []
+        for factor_a, factor_b in combinations(design.factors, 2):
+            observations_by_cell: dict[tuple[Any, Any], list[tuple[float, str]]] = defaultdict(list)
+            for condition in conditions:
+                level_a = condition.factor_values.get(factor_a.name)
+                level_b = condition.factor_values.get(factor_b.name)
+                observations_by_cell[(level_a, level_b)].extend(
+                    values_by_condition.get(condition.id, [])
+                )
+            cell_means: dict[str, float] = {}
+            for (level_a, level_b), observations in observations_by_cell.items():
+                if observations:
+                    cell_means[
+                        f"{factor_a.name}={level_a}|{factor_b.name}={level_b}"
+                    ] = round(fmean(value for value, _ in observations), 8)
+
+            simple_effects: dict[str, float] = {}
+            for level_a in factor_a.levels:
+                means = [
+                    fmean(value for value, _ in observations_by_cell[(level_a, level_b)])
+                    for level_b in factor_b.levels
+                    if observations_by_cell[(level_a, level_b)]
+                ]
+                if len(means) > 1:
+                    simple_effects[str(level_a)] = round(max(means) - min(means), 8)
+
+            difference_in_differences: float | None = None
+            if len(factor_a.levels) == 2 and len(factor_b.levels) == 2:
+                first_a, second_a = factor_a.levels
+                first_b, second_b = factor_b.levels
+                cells = [
+                    observations_by_cell[(first_a, first_b)],
+                    observations_by_cell[(first_a, second_b)],
+                    observations_by_cell[(second_a, first_b)],
+                    observations_by_cell[(second_a, second_b)],
+                ]
+                if all(cells):
+                    means = [fmean(value for value, _ in cell) for cell in cells]
+                    difference_in_differences = round(
+                        (means[3] - means[2]) - (means[1] - means[0]), 8
+                    )
+
+            interaction_observations = [
+                item
+                for observations in observations_by_cell.values()
+                for item in observations
+            ]
+            interaction_summaries.append(
+                ExperimentInteractionSummary(
+                    factor_a=factor_a.name,
+                    factor_b=factor_b.name,
+                    levels={
+                        factor_a.name: list(factor_a.levels),
+                        factor_b.name: list(factor_b.levels),
+                    },
+                    cell_means=cell_means,
+                    simple_effects=simple_effects,
+                    difference_in_differences=difference_in_differences,
+                    sample_size=len(interaction_observations),
+                    source_run_ids=[
+                        run_id for _, run_id in interaction_observations
+                    ],
+                )
+            )
+
+        trend: list[ExperimentTrendPoint] = []
+        if design.analysis.mode == "ordered_trend":
+            ordered_factor = design.analysis.ordered_factor or design.factors[0].name
+            factor = next(item for item in design.factors if item.name == ordered_factor)
+            for level in sorted(factor.levels, key=_ordered_value):
+                observations = [
+                    item
+                    for condition in conditions
+                    if condition.factor_values.get(ordered_factor) == level
+                    for item in values_by_condition.get(condition.id, [])
+                ]
+                trend.append(
+                    ExperimentTrendPoint(
+                        level=level,
+                        mean=round(fmean(value for value, _ in observations), 8)
+                        if observations
+                        else None,
+                        sample_size=len(observations),
+                        source_run_ids=[run_id for _, run_id in observations],
+                    )
+                )
+
+        all_observations = [
+            item for observations in values_by_condition.values() for item in observations
+        ]
+        all_values = [value for value, _ in all_observations]
+        distribution = ExperimentDistributionSummary(
+            sample_size=len(all_values),
+            mean=round(fmean(all_values), 8) if all_values else None,
+            standard_deviation=round(pstdev(all_values), 8) if len(all_values) > 1 else 0.0
+            if all_values
+            else None,
+            minimum=round(min(all_values), 8) if all_values else None,
+            maximum=round(max(all_values), 8) if all_values else None,
+            median=round(median(all_values), 8) if all_values else None,
+        )
+        minimum_pairs = design.analysis.minimum_pairs
+        minimum_group_size = min(
+            (item.sample_size for item in condition_statistics), default=0
+        )
+        evidence_status = (
+            "sample_threshold_met"
+            if minimum_group_size >= minimum_pairs
+            else "below_threshold"
+            if all_values
+            else "not_ready"
+        )
+        summary = ExperimentSummary(
+            analysis_mode=design.analysis.mode,
+            primary_metric=metric,
+            sample_size=len(all_values),
+            evidence_status=evidence_status,
+            source_run_ids=[run_id for _, run_id in all_observations],
+            condition_statistics=condition_statistics,
+            condition_effects=effects,
+            factor_effects=factor_effects if design.analysis.mode == "factor_effects" else [],
+            interaction_summary=(
+                interaction_summaries if design.analysis.mode == "factor_effects" else []
+            ),
+            ordered_trend=trend,
+            distribution_summary=distribution,
+        )
+        current.summary = summary
+        self._campaign(project).summary = summary
+
+        pair_payload: dict[str, Any] = {}
+        if design.design_mode == "paired_comparison":
+            pair_differences: list[dict[str, Any]] = []
+            grouped: dict[
+                tuple[str, str, str, int, int], dict[str, ExperimentRun]
+            ] = defaultdict(dict)
+            for run in runs:
+                if (
+                    run.status == RunStatus.SUCCEEDED
+                    and run.verified
+                    and metric in run.metrics
+                ):
+                    key = (run.protocol, run.dataset, run.category, run.shots, run.seed)
+                    grouped[key][run.condition_id or run.selection_strategy] = run
+            first, second = conditions
+            for cell, pair in sorted(grouped.items()):
+                left, right = pair.get(first.id), pair.get(second.id)
+                if left is None or right is None:
+                    continue
+                pair_differences.append(
+                    {
+                        "category": cell[2],
+                        "shots": cell[3],
+                        "seed": cell[4],
+                        "treatment_run_id": right.id,
+                        "control_run_id": left.id,
+                        "difference": round(right.metrics[metric] - left.metrics[metric], 8),
+                    }
+                )
+            pair_payload = {
+                "pair_count": len(pair_differences),
+                "round_pair_count": len(pair_differences),
+                "pair_differences": pair_differences,
+                "mean_difference": (
+                    round(fmean(item["difference"] for item in pair_differences), 8)
+                    if pair_differences
+                    else None
+                ),
+            }
+        return {
+            "round_id": current.id,
+            "round_index": current.index,
+            "hypothesis_id": current.hypothesis_id,
+            "completed_iterations": current.completed_iterations,
+            "phase": current.phase,
+            "metric": metric,
+            "analysis_mode": design.analysis.mode,
+            "design_id": design.id,
+            "planned_runs": len(runs),
+            "terminal_runs": sum(
+                run.status in {RunStatus.SUCCEEDED, RunStatus.FAILED} for run in runs
+            ),
+            "successful_verified_runs": len(all_values),
+            "failed_run_ids": failed_run_ids,
+            "duration_seconds": round(duration_seconds, 3),
+            "minimum_pairs": minimum_pairs,
+            "condition_statistics": [item.model_dump(mode="json") for item in condition_statistics],
+            "condition_effects": [item.model_dump(mode="json") for item in effects],
+            "factor_effects": [item.model_dump(mode="json") for item in factor_effects],
+            "interaction_summary": [
+                item.model_dump(mode="json") for item in interaction_summaries
+            ],
+            "ordered_trend": [item.model_dump(mode="json") for item in trend],
+            "distribution_summary": distribution.model_dump(mode="json"),
+            "sample_size": len(all_values),
+            "evidence_status": evidence_status,
+            "inference_status": "not_performed",
+            "source_run_ids": [run_id for _, run_id in all_observations],
+            "summary": summary.model_dump(mode="json"),
+            "primary_metric_saturated": bool(all_values)
+            and all(value >= 0.995 for value in all_values),
+            "run_budget": self._campaign(project).max_runs,
+            "exhaustive_run_count": self._campaign(project).exhaustive_run_count,
+            **pair_payload,
+        }
+
     def allowed_next_cells(
         self,
         project: ResearchProject,
@@ -450,28 +872,43 @@ class AdaptiveExperimentPlanner:
         if audit is None:
             return []
         categories = [item for item in plan.categories if item in audit.categories]
+        shots = sorted(set(plan.shots) & set(project.spec.constraints.shots))
+        seeds = sorted(set(plan.seeds))
+        candidates = self._outer_cells(
+            plan,
+            hypothesis_id=target_hypothesis_id,
+            categories=categories,
+            shots=shots,
+            seeds=seeds,
+        )
+        target_round_ids = {
+            item.id
+            for item in campaign.rounds
+            if item.hypothesis_id == target_hypothesis_id
+        }
+        target_node_ids = {
+            item.id for item in campaign.nodes if item.round_id in target_round_ids
+        }
         used = {
-            (run.category, run.shots, run.seed)
-            for run in project.runs
-            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
+            (node.config.get("category"), node.config.get("shots"), node.config.get("seed"))
+            for node in campaign.nodes
+            if node.id in target_node_ids
         }
         candidates = [
-            ExperimentCell(category=category, shots=shots, seed=seed)
-            for category in categories
-            for shots in sorted(plan.shots)
-            for seed in sorted(plan.seeds)
-            if (category, shots, seed) not in used
+            cell
+            for cell in candidates
+            if (cell.category, cell.shots, cell.seed) not in used
         ]
         # Prefer replication breadth, then K sensitivity, before accumulating seeds.
         current_categories = {
-            run.category
-            for run in project.runs
-            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
+            node.config.get("category")
+            for node in campaign.nodes
+            if node.id in target_node_ids
         }
         current_shots = {
-            run.shots
-            for run in project.runs
-            if run.round_id is not None and run.hypothesis_id == target_hypothesis_id
+            node.config.get("shots")
+            for node in campaign.nodes
+            if node.id in target_node_ids
         }
         return sorted(
             candidates,
@@ -635,19 +1072,26 @@ class AdaptiveExperimentPlanner:
         allowed_by_key = {
             (item.category, item.shots, item.seed): item for item in allowed
         }
+        remaining_iterations = max(current.iteration_target - len(current.node_ids), 0)
+        condition_count = self._condition_count(project, current.hypothesis_id)
+        remaining_runs = max(campaign.max_runs - self._campaign_run_count(project), 0)
+        affordable_iterations = remaining_runs // condition_count
+        iterations_to_schedule = min(remaining_iterations, affordable_iterations)
+        if iterations_to_schedule != remaining_iterations:
+            raise ValueError("The remaining run budget cannot fund the rest of this round")
         selected: list[ExperimentCell] = []
         for item in proposal.recommended_cells:
             key = (item.category, item.shots, item.seed)
             if key in allowed_by_key and allowed_by_key[key] not in selected:
                 selected.append(allowed_by_key[key])
-            if len(selected) == 2:
+            if len(selected) >= iterations_to_schedule:
                 break
         for item in allowed:
-            if len(selected) >= 2:
+            if len(selected) >= iterations_to_schedule:
                 break
             if item not in selected:
                 selected.append(item)
-        if len(selected) != 2:
+        if len(selected) != iterations_to_schedule:
             raise ValueError("The preregistered search space cannot fund three iterations")
 
         _, nodes, runs = self._build_round(
@@ -707,19 +1151,21 @@ class AdaptiveExperimentPlanner:
             self._refresh_efficiency(campaign, project=project)
             return []
 
+        next_hypothesis_id = campaign.hypothesis_ids[next_index - 1]
+        next_condition_count = self._condition_count(project, next_hypothesis_id)
         remaining_runs = campaign.max_runs - self._campaign_run_count(project)
-        if remaining_runs < 6:
+        if remaining_runs < next_condition_count * 3:
             campaign.status = "completed"
             campaign.next_action = "analyze_verified_results"
             campaign.termination_reason = "run_budget_exhausted_before_next_innovation"
             campaign.completed_at = utc_now()
             self._refresh_efficiency(campaign, project=project)
             return []
-        next_hypothesis_id = campaign.hypothesis_ids[next_index - 1]
         next_hypothesis = self._hypothesis(project, next_hypothesis_id)
         next_contract = next_hypothesis.analysis_contract
         if next_contract is None:
             raise ValueError("The next innovation has no analysis contract")
+        next_design = self._explicit_design(project.experiment_plan, next_hypothesis_id)
         allowed = self.allowed_next_cells(project, hypothesis_id=next_hypothesis_id)
         if not allowed:
             raise ValueError("No experiment cell is available for the next innovation")
@@ -729,10 +1175,22 @@ class AdaptiveExperimentPlanner:
             campaign=campaign,
             index=next_index,
             phase="feasibility",
-            objective=f"验证创新点 H{next_index}：{next_hypothesis.title}",
+            objective=(
+                self._design_objective(next_design, next_condition_count)
+                if next_design is not None
+                else f"验证创新点 H{next_index}：{next_hypothesis.title}"
+            ),
             rationale=(
-                "上一创新点已完成三次自动迭代。现在切换到下一创新点，并先执行"
-                f"第 1 次迭代；比较 {next_contract.treatment} 与 {next_contract.control}。"
+                self._design_rationale(
+                    next_design,
+                    next_condition_count,
+                    campaign.detector,
+                )
+                if next_design is not None
+                else (
+                    "上一创新点已完成三次自动迭代。现在切换到下一创新点，并先执行"
+                    f"第 1 次迭代；比较 {next_contract.treatment} 与 {next_contract.control}。"
+                )
             ),
             cells=[allowed[0]],
             information_gain=0.9,
@@ -939,11 +1397,12 @@ class AdaptiveExperimentPlanner:
             raise ValueError("The current round has already started")
 
         existing_cells = len(current.node_ids)
-        remaining_pairs = max(
-            (campaign.max_runs - self._campaign_run_count(project)) // 2,
+        condition_count = self._condition_count(project, current.hypothesis_id)
+        remaining_cells = max(
+            (campaign.max_runs - self._campaign_run_count(project)) // condition_count,
             0,
         )
-        needed = min(max(target_cells - existing_cells, 0), remaining_pairs)
+        needed = min(max(target_cells - existing_cells, 0), remaining_cells)
         cells = self.allowed_next_cells(project)[:needed]
         if not cells:
             return []
@@ -1029,22 +1488,54 @@ class AdaptiveExperimentPlanner:
         round_hypothesis_id = hypothesis_id or campaign.hypothesis_id
         hypothesis = self._hypothesis(project, round_hypothesis_id)
         contract = hypothesis.analysis_contract
-        if contract is None or not self._contract_is_executable(project, contract):
+        if contract is None or not self._contract_is_executable(
+            project, contract, hypothesis_id=round_hypothesis_id
+        ):
             raise ValueError(f"Hypothesis is not executable: {round_hypothesis_id}")
-        primary_metric = normalize_primary_metric(contract.metric)
+        design = self._explicit_design(plan, round_hypothesis_id)
+        if design is not None and design.design_mode != "custom_design":
+            design = None
+        primary_metric = normalize_primary_metric(
+            design.analysis.primary_metric if design is not None else contract.metric
+        )
         if primary_metric not in SUPPORTED_PRIMARY_METRICS:
-            raise ValueError(f"Unsupported primary metric: {contract.metric}")
+            raise ValueError(f"Unsupported primary metric: {primary_metric}")
         campaign.hypothesis_id = round_hypothesis_id
-        campaign.treatment = contract.treatment
-        campaign.control = contract.control
+        campaign.treatment = contract.treatment or ""
+        campaign.control = contract.control or ""
         campaign.metric = primary_metric
+        runtime_design = design
+        presentation_spec = (
+            runtime_design.presentation_spec or default_presentation_spec(runtime_design)
+        ).model_copy(deep=True) if runtime_design is not None else None
+        condition_specs = (
+            self._design_conditions(
+                project,
+                hypothesis_id=round_hypothesis_id,
+                categories=self._campaign_categories(project),
+            )
+            if runtime_design is not None
+            else []
+        )
+        if runtime_design is not None and not condition_specs:
+            condition_specs = compile_design(runtime_design)
+        if design is not None:
+            campaign.design_id = design.id
         round_id = new_id("round")
         nodes: list[ExperimentNodeRecord] = []
         runs: list[ExperimentRun] = []
+        specs = condition_specs or [
+            ExperimentConditionSpec(
+                id="control", factor_values={"selection_strategy": campaign.control}
+            ),
+            ExperimentConditionSpec(
+                id="treatment", factor_values={"selection_strategy": campaign.treatment}
+            ),
+        ]
+        cost = float(len(specs))
         for cell_offset, cell in enumerate(cells):
             iteration = min(iteration_start + cell_offset, 3)
             node_id = new_id("experiment_node")
-            cost = 2.0
             priority_node = ExperimentNode(
                 id=node_id,
                 hypothesis_id=round_hypothesis_id,
@@ -1055,25 +1546,58 @@ class AdaptiveExperimentPlanner:
                 estimated_cost=cost,
                 novelty=0.2 if phase == "feasibility" else 0.5,
             )
-            node_runs = [
-                ExperimentRun(
-                    plan_id=plan.id,
-                    hypothesis_id=round_hypothesis_id,
-                    protocol=campaign.protocol,
-                    dataset="MVTec AD",
-                    category=cell.category,
-                    detector=campaign.detector,
-                    selection_strategy=strategy,
-                    shots=cell.shots,
-                    seed=cell.seed,
-                    iteration=iteration,
-                    round_id=round_id,
-                    node_id=node_id,
-                    phase=phase,
-                    status=RunStatus.QUEUED,
+            node_runs: list[ExperimentRun] = []
+            for condition in specs:
+                values = dict(condition.factor_values)
+                factor_fields = {
+                    factor.name: factor.field or factor.run_field
+                    for factor in runtime_design.factors
+                } if runtime_design is not None else {}
+                bound_values = {
+                    factor_fields.get(name, name): value for name, value in values.items()
+                }
+                default_selection_strategy = (
+                    (
+                        runtime_design.support_selection_strategy
+                        or runtime_design.default_selection_strategy
+                        if runtime_design is not None
+                        else values.get("selection_strategy")
+                    )
+                    or campaign.treatment
+                    or "random"
                 )
-                for strategy in (campaign.control, campaign.treatment)
-            ]
+                run_values = {
+                    "protocol": campaign.protocol,
+                    "dataset": "MVTec AD",
+                    "category": cell.category,
+                    "detector": campaign.detector,
+                    "selection_strategy": default_selection_strategy,
+                    "shots": cell.shots,
+                    "seed": cell.seed,
+                }
+                run_values.update(
+                    {field: value for field, value in bound_values.items() if field != "dataset"}
+                )
+                node_runs.append(
+                    ExperimentRun(
+                        plan_id=plan.id,
+                        hypothesis_id=round_hypothesis_id,
+                        protocol=run_values["protocol"],
+                        dataset=run_values["dataset"],
+                        category=run_values["category"],
+                        detector=run_values["detector"],
+                        selection_strategy=run_values["selection_strategy"],
+                        shots=run_values["shots"],
+                        seed=run_values["seed"],
+                        iteration=iteration,
+                        round_id=round_id,
+                        node_id=node_id,
+                        condition_id=condition.id,
+                        factor_values=values,
+                        phase=phase,
+                        status=RunStatus.QUEUED,
+                    )
+                )
             nodes.append(
                 ExperimentNodeRecord(
                     id=node_id,
@@ -1082,8 +1606,16 @@ class AdaptiveExperimentPlanner:
                     parent_id=parent_id,
                     phase=phase,
                     objective=(
-                        f"{cell.category} / K={cell.shots} / seed={cell.seed}："
-                        f"成对比较 {campaign.treatment} 与 {campaign.control}。"
+                        self._design_node_objective(
+                            runtime_design,
+                            cell=cell,
+                            condition_count=len(specs),
+                        )
+                        if design is not None
+                        else (
+                            f"{cell.category} / K={cell.shots} / seed={cell.seed}："
+                            f"成对比较 {campaign.treatment} 与 {campaign.control}。"
+                        )
                     ),
                     information_gain=priority_node.information_gain,
                     falsification_value=priority_node.falsification_value,
@@ -1102,14 +1634,164 @@ class AdaptiveExperimentPlanner:
             objective=objective,
             rationale=rationale,
             hypothesis_id=round_hypothesis_id,
-            treatment=contract.treatment,
-            control=contract.control,
+            design_id=design.id if design is not None else None,
+            presentation_spec=presentation_spec,
+            treatment=contract.treatment or "",
+            control=contract.control or "",
             metric=primary_metric,
             node_ids=[node.id for node in nodes],
             run_ids=[run.id for run in runs],
             efficiency={"planned_runs": len(runs)},
         )
         return experiment_round, nodes, runs
+
+    @staticmethod
+    def _explicit_design(
+        plan: Any, hypothesis_id: str
+    ) -> ExperimentDesignSpec | None:
+        if plan is None:
+            return None
+        exact = next(
+            (design for design in plan.designs if design.hypothesis_id == hypothesis_id),
+            None,
+        )
+        return exact or next(
+            (design for design in plan.designs if design.hypothesis_id is None),
+            None,
+        )
+
+    @staticmethod
+    def _design_objective(
+        design: ExperimentDesignSpec | None, condition_count: int
+    ) -> str:
+        if design is None:
+            return ""
+        factors = "、".join(factor.name for factor in design.factors)
+        return (
+            f"{design.question or '验证通用实验设计'}：因素为 {factors}，"
+            f"展开 {condition_count} 个条件，"
+            f"使用 {design.analysis.mode} 分析，主指标为 {design.analysis.primary_metric}。"
+        )
+
+    @staticmethod
+    def _design_rationale(
+        design: ExperimentDesignSpec | None,
+        condition_count: int,
+        detector: str,
+    ) -> str:
+        if design is None:
+            return ""
+        factors = "、".join(
+            f"{factor.name}={factor.levels}" for factor in design.factors
+        )
+        return (
+            f"{design.rationale or f'使用 {detector} 执行已注册设计'}，"
+            f"按 {factors} 展开 {condition_count} 个条件；"
+            f"结果采用 {design.analysis.mode} 汇总，"
+            f"以 {design.analysis.primary_metric} 作为主指标。"
+        )
+
+    @staticmethod
+    def _design_node_objective(
+        design: ExperimentDesignSpec,
+        *,
+        cell: ExperimentCell,
+        condition_count: int,
+    ) -> str:
+        factors = "、".join(factor.name for factor in design.factors)
+        return (
+            f"基础单元 {cell.category} / K={cell.shots} / seed={cell.seed}："
+            f"按因素 {factors} 展开 {condition_count} 个条件，分析模式 {design.analysis.mode}。"
+        )
+
+    def _condition_count(self, project: ResearchProject, hypothesis_id: str) -> int:
+        design = self._explicit_design(project.experiment_plan, hypothesis_id)
+        if design is None:
+            return 2
+        return len(
+            self._design_conditions(
+                project,
+                hypothesis_id=hypothesis_id,
+                categories=self._campaign_categories(project),
+            )
+        )
+
+    @staticmethod
+    def _outer_cells(
+        plan,
+        *,
+        hypothesis_id: str,
+        categories: list[str],
+        shots: list[int],
+        seeds: list[int],
+    ) -> list[ExperimentCell]:
+        design = AdaptiveExperimentPlanner._explicit_design(plan, hypothesis_id)
+        bound_fields = {
+            factor.field or factor.run_field
+            for factor in design.factors
+        } if design is not None else set()
+        axes = {
+            "category": ["__design_category__"] if "category" in bound_fields else categories,
+            "shots": [1] if "shots" in bound_fields else shots,
+            "seed": [0] if "seed" in bound_fields else seeds,
+        }
+        cells: list[ExperimentCell] = []
+        seen: set[tuple[str, int, int]] = set()
+        for category in axes["category"]:
+            for shot in axes["shots"]:
+                for seed in axes["seed"]:
+                    key = (category, shot, seed)
+                    if key not in seen:
+                        seen.add(key)
+                        cells.append(ExperimentCell(category=category, shots=shot, seed=seed))
+        return cells
+
+    def _design_conditions(
+        self,
+        project: ResearchProject,
+        *,
+        hypothesis_id: str,
+        categories: set[str],
+        budget: int | None = None,
+    ) -> list[ExperimentConditionSpec]:
+        plan = project.experiment_plan
+        if plan is None:
+            return []
+        design = self._explicit_design(plan, hypothesis_id)
+        if design is None:
+            return []
+        validate_design(
+            design,
+            plan,
+            budget=budget,
+            allowed_categories=categories,
+            allowed_detectors=self._approved_detectors(project),
+            allowed_strategies=self._approved_strategies(project),
+        )
+        return compile_design(
+            design,
+            plan=plan,
+            budget=budget,
+            allowed_categories=categories,
+            allowed_detectors=self._approved_detectors(project),
+            allowed_strategies=self._approved_strategies(project),
+        )
+
+    @staticmethod
+    def _campaign_categories(project: ResearchProject) -> set[str]:
+        campaign = project.experiment_campaign
+        plan = project.experiment_plan
+        if campaign is None or plan is None:
+            return set(plan.categories if plan is not None else [])
+        audit = next(
+            (item for item in project.dataset_audits if item.id == campaign.dataset_audit_id),
+            None,
+        )
+        return {
+            category
+            for category in plan.categories
+            if audit is None or category in audit.categories
+        }
 
     @staticmethod
     def _approved_strategies(project: ResearchProject) -> set[str]:
@@ -1128,9 +1810,32 @@ class AdaptiveExperimentPlanner:
         }
 
     @classmethod
-    def _contract_is_executable(cls, project: ResearchProject, contract) -> bool:
-        if contract.kind not in {"selection_main_effect", "query_adaptation"}:
+    def _contract_is_executable(
+        cls, project: ResearchProject, contract, *, hypothesis_id: str | None = None
+    ) -> bool:
+        if hypothesis_id and project.experiment_plan is not None:
+            design = cls._explicit_design(project.experiment_plan, hypothesis_id)
+            if design is not None:
+                try:
+                    validate_design(
+                        design,
+                        project.experiment_plan,
+                        allowed_categories=set(project.experiment_plan.categories),
+                        allowed_detectors=cls._approved_detectors(project),
+                        allowed_strategies=cls._approved_strategies(project),
+                    )
+                except ValueError:
+                    return False
+                return is_supported_primary_metric(design.analysis.primary_metric or "")
+        if contract.kind not in {
+            "selection_main_effect",
+            "detector_interaction",
+            "query_adaptation",
+        }:
             return False
+        if contract.kind == "detector_interaction":
+            approved = cls._approved_detectors(project)
+            return contract.treatment in approved and contract.control in approved
         approved = cls._approved_strategies(project)
         return contract.treatment in approved and contract.control in approved
 
@@ -1148,7 +1853,9 @@ class AdaptiveExperimentPlanner:
             hypothesis
             for hypothesis in project.hypotheses
             if hypothesis.analysis_contract is not None
-            and cls._contract_is_executable(project, hypothesis.analysis_contract)
+            and cls._contract_is_executable(
+                project, hypothesis.analysis_contract, hypothesis_id=hypothesis.id
+            )
             and hypothesis.id in approved_hypothesis_ids
             and hypothesis.id == hypothesis_id
         ]
@@ -1159,9 +1866,28 @@ class AdaptiveExperimentPlanner:
             )
         )
         if not eligible:
+            plan = project.experiment_plan
+            approved_ids = plan.hypothesis_ids if plan is not None else []
+            diagnostics = []
+            if plan is not None and plan.design_generation_status == "needs_correction":
+                diagnostics.append(
+                    "实验设计仍待修正："
+                    f"{plan.design_generation_fallback_reason or '未提供原因'}"
+                )
+            if plan is not None and hypothesis_id not in approved_ids:
+                diagnostics.append(
+                    "该创新点不在已批准的预注册计划内（计划保留："
+                    + (", ".join(approved_ids) if approved_ids else "无")
+                    + "）。可能是主指标或自定义方法未被当前执行器支持，"
+                    "请返回计划审批页重新生成实验计划"
+                )
+            if not diagnostics:
+                diagnostics.append(
+                    "该创新点的分析契约引用了尚未注册实现的自定义检测器或选样策略，"
+                    "请先调用对应的方法生成端点并获批后再执行"
+                )
             raise ValueError(
-                "The selected innovation is not approved or executable by the current toolchain "
-                "(random/k_center or an approved custom strategy)"
+                "所选创新点无法进入实验：" + "；".join(diagnostics)
             )
         return eligible[0]
 
@@ -1174,7 +1900,11 @@ class AdaptiveExperimentPlanner:
             for hypothesis_id in approved_ids
             if hypothesis_id in by_id
             and by_id[hypothesis_id].analysis_contract is not None
-            and cls._contract_is_executable(project, by_id[hypothesis_id].analysis_contract)
+            and cls._contract_is_executable(
+                project,
+                by_id[hypothesis_id].analysis_contract,
+                hypothesis_id=hypothesis_id,
+            )
         ]
 
     @staticmethod

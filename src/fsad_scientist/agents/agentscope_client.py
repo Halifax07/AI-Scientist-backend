@@ -12,6 +12,10 @@ class AgentScopeUnavailableError(RuntimeError):
     pass
 
 
+class AgentOutputValidationError(ValueError):
+    """The model responded, but its structured output cannot drive the workflow."""
+
+
 class AgentScopeJsonClient:
     """Thin adapter around AgentScope 2.x and Alibaba Cloud Model Studio.
 
@@ -64,28 +68,46 @@ class AgentScopeJsonClient:
             ),
             toolkit=Toolkit(),
         )
-        try:
-            reply = await agent.reply(
-                UserMsg(name="workflow", content=json.dumps(payload, ensure_ascii=False))
-            )
-        except APIStatusError as exc:
-            error_code = _api_error_code(exc)
-            if error_code == "Arrearage":
-                message = "DashScope 账户欠费或余额不足，请充值后重试。"
-            elif exc.status_code in {401, 403}:
-                message = "DashScope API Key 无效或没有当前模型的访问权限。"
-            else:
-                message = f"DashScope 请求失败（HTTP {exc.status_code}）。"
-            raise AgentScopeUnavailableError(message) from exc
-        except APIConnectionError as exc:
-            raise AgentScopeUnavailableError(
-                "无法连接 DashScope，请检查网络和服务地址。"
-            ) from exc
-        except HTTPError as exc:
-            raise AgentScopeUnavailableError(
-                "DashScope 流式响应中断，请稍后重试当前步骤。"
-            ) from exc
-        return _parse_json_object(reply.get_text_content())
+        request_content = json.dumps(payload, ensure_ascii=False)
+        parse_error: ValueError | None = None
+        for attempt in range(3):
+            content = request_content
+            if attempt:
+                content = (
+                    "上一条响应不是合法 JSON，无法用于工作流。请根据下面的原始请求重新回答，"
+                    "只返回一个可解析的 JSON 对象，不要使用 Markdown、注释或额外说明。\n"
+                    f"原始请求：{request_content}"
+                )
+            try:
+                reply = await agent.reply(UserMsg(name="workflow", content=content))
+            except APIStatusError as exc:
+                error_code = _api_error_code(exc)
+                if error_code == "Arrearage":
+                    message = "DashScope 账户欠费或余额不足，请充值后重试。"
+                elif exc.status_code in {401, 403}:
+                    message = "DashScope API Key 无效或没有当前模型的访问权限。"
+                else:
+                    message = f"DashScope 请求失败（HTTP {exc.status_code}）。"
+                detail = _api_error_message(exc)
+                if detail:
+                    message = f"{message} 原因：{detail}"
+                raise AgentScopeUnavailableError(message) from exc
+            except APIConnectionError as exc:
+                raise AgentScopeUnavailableError(
+                    "无法连接 DashScope，请检查网络和服务地址。"
+                ) from exc
+            except HTTPError as exc:
+                raise AgentScopeUnavailableError(
+                    "DashScope 流式响应中断，请稍后重试当前步骤。"
+                ) from exc
+            try:
+                return _parse_json_object(reply.get_text_content())
+            except ValueError as exc:
+                parse_error = exc
+
+        raise AgentOutputValidationError(
+            "Qwen 连续三次返回的内容都不是有效 JSON，请稍后重试。"
+        ) from parse_error
 
 
 def _api_error_code(exc: APIStatusError) -> str | None:
@@ -94,6 +116,22 @@ def _api_error_code(exc: APIStatusError) -> str | None:
         return None
     error = body.get("error", body)
     return str(error.get("code")) if isinstance(error, dict) and error.get("code") else None
+
+
+def _api_error_message(exc: APIStatusError) -> str | None:
+    """Extract a bounded provider explanation without retaining the full response."""
+
+    body = exc.body
+    if not isinstance(body, dict):
+        return None
+    for candidate in (body.get("error"), body):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("message", "detail", "error_message"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:500]
+    return None
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:

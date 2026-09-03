@@ -96,7 +96,16 @@ def test_generated_detector_scopes_plan_to_compatible_bound_hypothesis(
     planned = run(workflow.advance(project.id))
 
     assert planned.experiment_plan is not None
-    assert planned.experiment_plan.hypothesis_ids == [hypothesis.id]
+    assert hypothesis.id in planned.experiment_plan.hypothesis_ids
+    assert any(
+        design.hypothesis_id != hypothesis.id
+        and design.design_mode == "custom_design"
+        and all(
+            (factor.field or factor.run_field) != "detector"
+            for factor in design.factors
+        )
+        for design in planned.experiment_plan.designs
+    )
     assert planned.experiment_plan.detectors == [detector.name]
     assert planned.experiment_plan.hypothesis_contracts[hypothesis.id].metric in {
         "image_auroc",
@@ -1076,6 +1085,34 @@ def test_api_generate_replaces_builtin_strategy_endpoint(tmp_path: Path) -> None
     assert implementation["name"].startswith("ai_strategy_")
     assert updated_hypothesis["analysis_contract"]["treatment"] == implementation["name"]
     assert updated_hypothesis["analysis_contract"]["control"] == "random"
+
+
+def test_custom_design_method_endpoint_returns_structured_conflict(tmp_path: Path) -> None:
+    app = create_app(
+        settings=Settings(runtime="mock", artifact_root=str(tmp_path / "artifacts")),
+        storage_path=tmp_path / "api-ledger",
+        runtime=MockScientistRuntime(),
+    )
+    client = TestClient(app)
+    created = client.post("/api/v1/projects/demo").json()
+    project_id = created["id"]
+    project = created
+    while project["stage"] != "awaiting_experiment_approval":
+        project = client.post(f"/api/v1/projects/{project_id}/advance").json()
+    hypothesis = next(
+        item
+        for item in project["hypotheses"]
+        if item.get("analysis_contract", {}).get("design_mode") == "custom_design"
+    )
+
+    response = client.post(
+        f"/api/v1/projects/{project_id}/experiment-methods/generate",
+        json={"hypothesis_id": hypothesis["id"]},
+    )
+
+    assert response.status_code == 409
+    assert "custom_design" in response.json()["detail"]
+    assert "treatment/control" in response.json()["detail"]
 
 
 def test_api_generate_supports_two_non_builtin_strategies(tmp_path: Path) -> None:

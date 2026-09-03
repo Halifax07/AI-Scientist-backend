@@ -112,6 +112,19 @@ class TestResolveDetectorCommand:
         )
         assert command.method == "anomalydino"
 
+    def test_patchcore_declares_timm_dependency(self, tmp_path: Path) -> None:
+        project = ResearchProject(spec=ProjectSpec())
+        command = resolve_detector_command(
+            project,
+            _run(detector="patchcore"),
+            MethodRegistry(tmp_path),
+            dataset_view=tmp_path / "view",
+            output_dir=tmp_path / "output",
+            device="cpu",
+        )
+
+        assert command.required_modules == ["timm"]
+
     def test_generated_uses_approved_implementation(self, tmp_path: Path) -> None:
         script = tmp_path / "detector.py"
         script.write_text("pass\n")

@@ -73,12 +73,39 @@ def _iter_test_images(data_root, category):
         yield image_path.name, image, label
 
 
+def _roc_auc_score(labels, scores):
+    positives = [score for label, score in zip(labels, scores) if label]
+    negatives = [score for label, score in zip(labels, scores) if not label]
+    if not positives or not negatives:
+        return 0.5
+    wins = sum(
+        1.0 if positive > negative else 0.5 if positive == negative else 0.0
+        for positive in positives
+        for negative in negatives
+    )
+    return wins / (len(positives) * len(negatives))
+
+
+def _average_precision_score(labels, scores):
+    positive_count = sum(bool(label) for label in labels)
+    if not positive_count:
+        return 0.5
+    hits = 0
+    precision_sum = 0.0
+    for index, (_, label) in enumerate(
+        sorted(zip(scores, labels), key=lambda item: item[0], reverse=True),
+        start=1,
+    ):
+        if label:
+            hits += 1
+            precision_sum += hits / index
+    return precision_sum / positive_count
+
+
 def _main():
     import json
     import sys
     from pathlib import Path
-
-    from sklearn.metrics import roc_auc_score
 
     arguments = {}
     for index in range(1, len(sys.argv), 2):
@@ -105,13 +132,8 @@ def _main():
         image_auroc = 0.5
         image_ap = 0.5
     else:
-        image_auroc = float(roc_auc_score(labels, scores))
-        try:
-            from sklearn.metrics import average_precision_score
-
-            image_ap = float(average_precision_score(labels, scores))
-        except ImportError:
-            image_ap = image_auroc
+        image_auroc = float(_roc_auc_score(labels, scores))
+        image_ap = float(_average_precision_score(labels, scores))
     payload = {
         "image_auroc": round(image_auroc, 9),
         "image_ap": round(image_ap, 9),

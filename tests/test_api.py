@@ -1,13 +1,23 @@
 import asyncio
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from fsad_scientist.agents.agentscope_client import AgentScopeUnavailableError
+from fsad_scientist.agents.agentscope_client import (
+    AgentOutputValidationError,
+    AgentScopeUnavailableError,
+)
 from fsad_scientist.agents.mock_runtime import MockScientistRuntime
+from fsad_scientist.agents.qwen_runtime import QwenScientistRuntime
 from fsad_scientist.api.app import create_app
 from fsad_scientist.config import Settings
-from fsad_scientist.domain.enums import ResearchStage
-from fsad_scientist.domain.models import ComputeBudget, ProjectSpec
+from fsad_scientist.domain.enums import HypothesisStatus, ResearchStage
+from fsad_scientist.domain.models import (
+    AnalysisContract,
+    ComputeBudget,
+    Hypothesis,
+    ProjectSpec,
+)
 
 
 def run(coro):
@@ -76,6 +86,24 @@ def test_agent_runtime_failure_returns_readable_cors_error(tmp_path):
     assert response.status_code == 503
     assert response.json()["detail"] == "DashScope 账户欠费或余额不足，请充值后重试。"
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+
+def test_invalid_agent_output_returns_readable_validation_error(tmp_path):
+    class FailingRuntime(MockScientistRuntime):
+        async def formalize_scope(self, project):
+            raise AgentOutputValidationError("Qwen 返回的假设没有形成两个不同的实验条件。")
+
+    app = create_app(
+        settings=Settings(runtime="mock"),
+        storage_path=tmp_path / "invalid-output-ledger",
+        runtime=FailingRuntime(),
+    )
+    project = TestClient(app).post("/api/v1/projects/demo").json()
+
+    response = TestClient(app).post(f"/api/v1/projects/{project['id']}/advance")
+
+    assert response.status_code == 422
+    assert "两个不同的实验条件" in response.json()["detail"]
 
 
 def test_next_research_cycle_endpoint_requires_evidence_for_revision(tmp_path):

@@ -42,6 +42,7 @@ class PatchCoreAdapter(MethodAdapter):
             method=self.name,
             executable="python",
             cwd=self.repository_root,
+            required_modules=["timm"],
             environment={"PYTHONPATH": str(self.repository_root / "src")},
             args=[
                 "bin/run_patchcore.py",
@@ -75,6 +76,8 @@ class PatchCoreAdapter(MethodAdapter):
                 "0.1",
                 "approx_greedy_coreset",
                 "dataset",
+                "--num_workers",
+                "0",
                 "--resize",
                 "256",
                 "--imagesize",

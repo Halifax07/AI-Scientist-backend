@@ -1,6 +1,9 @@
 from pydantic import SecretStr
 
-from fsad_scientist.agents.agentscope_client import AgentScopeJsonClient
+from fsad_scientist.agents.agentscope_client import (
+    AgentScopeJsonClient,
+    _api_error_message,
+)
 from fsad_scientist.config import Settings
 
 
@@ -25,3 +28,10 @@ def test_explicit_dashscope_key_is_passed_to_agent_client() -> None:
     client = AgentScopeJsonClient(api_key="explicit-test-key")
 
     assert client._api_key == "explicit-test-key"
+
+
+def test_dashscope_error_message_preserves_provider_reason() -> None:
+    class Error:
+        body = {"error": {"code": "InvalidParameter", "message": "模型参数不合法"}}
+
+    assert _api_error_message(Error()) == "模型参数不合法"

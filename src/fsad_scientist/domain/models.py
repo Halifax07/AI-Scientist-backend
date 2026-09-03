@@ -4,7 +4,14 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from fsad_scientist.domain.enums import (
     EvidenceStatus,
@@ -41,6 +48,11 @@ def _execution_strategy(value: str) -> str | None:
     ):
         return "k_center"
     return None
+
+
+# Mirror of experiments.code_safety.BUILTIN_DETECTORS; kept local so the domain
+# layer stays import-free of the experiment executor. Keep both in sync.
+BUILTIN_DETECTOR_NAMES = frozenset({"anomalydino", "patchcore", "subspacead"})
 
 
 class DatasetSpec(BaseModel):
@@ -160,10 +172,458 @@ class HypothesisScore(BaseModel):
 class AnalysisContract(BaseModel):
     kind: Literal["selection_main_effect", "detector_interaction", "query_adaptation"]
     metric: str
-    treatment: str
-    control: str
+    # Kept optional so a custom design can describe factors without inventing
+    # treatment/control arms. Historical contracts default to paired mode.
+    treatment: str | None = None
+    control: str | None = None
+    design_mode: Literal["paired_comparison", "custom_design"] = "paired_comparison"
     alpha: float = Field(default=0.05, gt=0, lt=1)
     minimum_pairs: int = Field(default=6, ge=2)
+
+    @model_validator(mode="after")
+    def validate_design_mode(self) -> AnalysisContract:
+        if self.design_mode == "paired_comparison":
+            if not self.treatment or not self.control:
+                raise ValueError(
+                    "paired_comparison requires both treatment and control"
+                )
+        return self
+
+
+_EXPERIMENT_FACTOR_FIELDS = (
+    "selection_strategy",
+    "detector",
+    "category",
+    "shots",
+    "seed",
+    "protocol",
+)
+
+
+class ExperimentFactorSpec(BaseModel):
+    """A preregistered factor bound to one executable Run field."""
+
+    name: str
+    field: Literal[
+        "selection_strategy",
+        "detector",
+        "category",
+        "shots",
+        "seed",
+        "protocol",
+    ] | None = None
+    run_field: Literal[
+        "selection_strategy",
+        "detector",
+        "category",
+        "shots",
+        "seed",
+        "protocol",
+    ] | None = None
+    levels: list[Any] = Field(min_length=1)
+    description: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_field_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "name" not in normalized and "factor" in normalized:
+            normalized["name"] = normalized["factor"]
+        if "field" not in normalized and "run_field" in normalized:
+            normalized["field"] = normalized["run_field"]
+        if "run_field" not in normalized and "field" in normalized:
+            normalized["run_field"] = normalized["field"]
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> ExperimentFactorSpec:
+        if self.field is None and self.run_field is None:
+            if self.name not in _EXPERIMENT_FACTOR_FIELDS:
+                raise ValueError(
+                    "A factor must specify field/run_field when its name is not a Run field"
+                )
+            self.field = self.run_field = self.name  # type: ignore[assignment]
+        elif self.field is None:
+            self.field = self.run_field
+        elif self.run_field is None:
+            self.run_field = self.field
+        if self.field != self.run_field:
+            raise ValueError("field and run_field must identify the same Run field")
+        keys = [repr(level) for level in self.levels]
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"Factor levels must be unique: {self.name}")
+        return self
+
+
+class ExperimentConditionSpec(BaseModel):
+    """One executable condition in a design."""
+
+    id: str
+    label: str | None = None
+    factor_values: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_values_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "id" not in normalized and "condition_id" in normalized:
+            normalized["id"] = normalized["condition_id"]
+        if "factor_values" not in normalized:
+            normalized["factor_values"] = normalized.get(
+                "values", normalized.get("factors", {})
+            )
+        return normalized
+
+
+class ExperimentAnalysisSpec(BaseModel):
+    """Analysis contract for a general condition set."""
+
+    mode: str = "group_comparison"
+    primary_metric: str | None = None
+    metric: str | None = None
+    alpha: float = Field(default=0.05, gt=0, lt=1)
+    minimum_pairs: int = Field(default=2, ge=2)
+    ordered_factor: str | None = None
+    baseline_condition_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_analysis_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "mode" not in normalized and "analysis_mode" in normalized:
+            normalized["mode"] = normalized["analysis_mode"]
+        if "primary_metric" not in normalized and "metric" in normalized:
+            normalized["primary_metric"] = normalized["metric"]
+        return normalized
+
+    @model_validator(mode="after")
+    def normalize_metric_and_mode(self) -> ExperimentAnalysisSpec:
+        self.primary_metric = self.primary_metric or self.metric
+        if not self.primary_metric:
+            raise ValueError("An analysis primary_metric is required")
+        aliases = {
+            "group": "group_comparison",
+            "comparison": "group_comparison",
+            "factorial": "factor_effects",
+            "interaction_summary": "factor_effects",
+            "trend": "ordered_trend",
+            "distribution": "distribution_summary",
+        }
+        self.mode = aliases.get(self.mode, self.mode)
+        if self.mode not in {
+            "group_comparison",
+            "factor_effects",
+            "ordered_trend",
+            "distribution_summary",
+        }:
+            raise ValueError(f"Unsupported experiment analysis mode: {self.mode}")
+        return self
+
+
+class ExperimentCardBlockSpec(BaseModel):
+    """A safe, data-only block in a Round presentation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    kind: Literal[
+        "narrative",
+        "progress",
+        "metrics",
+        "chart",
+        "table",
+        "runs",
+        "evidence",
+        "decision",
+        "diagnostics",
+        "insight",
+        "callout",
+        "key_value",
+        "timeline",
+    ]
+    source: Literal[
+        "design",
+        "progress",
+        "condition_statistics",
+        "condition_effects",
+        "factor_effects",
+        "interaction_summary",
+        "ordered_trend",
+        "distribution_summary",
+        "runs",
+        "evidence",
+        "feedback",
+        "diagnostics",
+    ]
+    chart_mark: Literal["bar", "line", "point", "heatmap", "interval"] | None = None
+    span: Literal["full", "half", "third"] = "full"
+    title: str | None = None
+    content: str | None = Field(default=None, max_length=2000)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_chart_mark(self) -> ExperimentCardBlockSpec:
+        if self.kind == "chart" and self.chart_mark is None:
+            raise ValueError("chart blocks require chart_mark")
+        if self.kind != "chart" and self.chart_mark is not None:
+            raise ValueError("chart_mark is only valid for chart blocks")
+        return self
+
+
+class ExperimentCardPresentationSpec(BaseModel):
+    """A controlled Round-card layout with no executable presentation code."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2] = 2
+    layout: Literal["stack", "split", "grid", "sequence"] = "stack"
+    density: Literal["compact", "comfortable"] = "comfortable"
+    blocks: list[ExperimentCardBlockSpec] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_semantics(self) -> ExperimentCardPresentationSpec:
+        compatible_sources = {
+            "narrative": {"design"},
+            "progress": {"progress"},
+            "metrics": {"condition_statistics", "distribution_summary"},
+            "chart": {
+                "condition_statistics",
+                "condition_effects",
+                "factor_effects",
+                "interaction_summary",
+                "ordered_trend",
+                "distribution_summary",
+            },
+            "table": {
+                "condition_statistics",
+                "condition_effects",
+                "factor_effects",
+                "interaction_summary",
+                "ordered_trend",
+                "distribution_summary",
+            },
+            "runs": {"runs"},
+            "evidence": {"evidence"},
+            "decision": {"feedback"},
+            "diagnostics": {"diagnostics"},
+            "insight": {
+                "design",
+                "condition_statistics",
+                "condition_effects",
+                "factor_effects",
+                "interaction_summary",
+                "ordered_trend",
+                "distribution_summary",
+                "feedback",
+                "diagnostics",
+            },
+            "callout": {"design", "evidence", "feedback", "diagnostics"},
+            "key_value": {
+                "condition_statistics",
+                "factor_effects",
+                "distribution_summary",
+            },
+            "timeline": {"progress", "runs", "feedback"},
+        }
+        chart_marks = {
+            "ordered_trend": {"line", "point"},
+            "interaction_summary": {"heatmap"},
+            "distribution_summary": {"interval", "bar"},
+            "condition_statistics": {"bar", "point"},
+            "condition_effects": {"bar", "point"},
+            "factor_effects": {"bar", "point"},
+        }
+        for block in self.blocks:
+            allowed_sources = compatible_sources[block.kind]
+            if block.source not in allowed_sources:
+                raise ValueError(
+                    f"Presentation block {block.kind} cannot use source {block.source}"
+                )
+            if block.kind == "chart" and block.chart_mark not in chart_marks[block.source]:
+                raise ValueError(
+                    f"Chart source {block.source} does not support mark {block.chart_mark}"
+                )
+        required = {
+            ("narrative", "design"),
+            ("progress", "progress"),
+            ("evidence", "evidence"),
+        }
+        present = {(block.kind, block.source) for block in self.blocks}
+        missing = sorted(required - present)
+        if missing:
+            raise ValueError(f"Presentation spec is missing required blocks: {missing}")
+        result_kinds = {
+            "metrics",
+            "chart",
+            "table",
+            "runs",
+            "diagnostics",
+            "insight",
+            "key_value",
+            "timeline",
+        }
+        if not any(block.kind in result_kinds for block in self.blocks):
+            raise ValueError("Presentation spec must contain at least one result block")
+        return self
+
+
+class ExperimentDesignSpec(BaseModel):
+    """A small, explicit condition design compiled into existing Run fields."""
+
+    id: str
+    name: str = "general_experiment"
+    hypothesis_id: str | None = None
+    question: str | None = None
+    rationale: str | None = None
+    factors: list[ExperimentFactorSpec] = Field(default_factory=list)
+    conditions: list[ExperimentConditionSpec] = Field(default_factory=list)
+    analysis: ExperimentAnalysisSpec
+    presentation_spec: ExperimentCardPresentationSpec | None = None
+    design_type: Literal[
+        "paired_comparison",
+        "custom_design",
+        "custom",
+        "full_factorial",
+        "replication",
+        "reproduction",
+        "exploration",
+    ] = "custom"
+    design_mode: Literal["paired_comparison", "custom_design"] = "custom_design"
+    support_selection_strategy: str | None = None
+    default_selection_strategy: str | None = None
+    max_runs: int | None = Field(default=None, ge=1)
+    budget: int | None = Field(default=None, ge=1)
+    purpose: Literal["reproduction", "exploration", "main_study", "replication"] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_design_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "id" not in normalized and "design_id" in normalized:
+            normalized["id"] = normalized["design_id"]
+        if "design_type" not in normalized and "kind" in normalized:
+            normalized["design_type"] = normalized["kind"]
+        if "design_mode" not in normalized:
+            normalized["design_mode"] = (
+                "paired_comparison"
+                if normalized.get("design_type") == "paired_comparison"
+                else "custom_design"
+            )
+        if (
+            "support_selection_strategy" not in normalized
+            and "default_selection_strategy" in normalized
+        ):
+            normalized["support_selection_strategy"] = normalized[
+                "default_selection_strategy"
+            ]
+        if (
+            "default_selection_strategy" not in normalized
+            and "support_selection_strategy" in normalized
+        ):
+            normalized["default_selection_strategy"] = normalized[
+                "support_selection_strategy"
+            ]
+        normalized.setdefault("factors", normalized.get("factor_specs", []))
+        normalized.setdefault("conditions", normalized.get("condition_specs", []))
+        normalized.setdefault("analysis", normalized.get("analysis_spec"))
+        if "max_runs" not in normalized and "budget" in normalized:
+            normalized["max_runs"] = normalized["budget"]
+        return normalized
+
+
+class ExperimentConditionSummary(BaseModel):
+    condition_id: str
+    label: str | None = None
+    factor_values: dict[str, Any] = Field(default_factory=dict)
+    sample_size: int = Field(default=0, ge=0)
+    mean: float | None = None
+    standard_deviation: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    median: float | None = None
+    source_run_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentConditionEffectSummary(BaseModel):
+    condition_id: str
+    baseline_condition_id: str | None = None
+    effect: float
+    sample_size: int = Field(default=0, ge=0)
+    source_run_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentFactorEffectSummary(BaseModel):
+    factor: str
+    level_means: dict[str, float] = Field(default_factory=dict)
+    effect: float | None = None
+    sample_size: int = Field(default=0, ge=0)
+    source_run_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentInteractionSummary(BaseModel):
+    factor_a: str
+    factor_b: str
+    levels: dict[str, list[Any]] = Field(default_factory=dict)
+    cell_means: dict[str, float] = Field(default_factory=dict)
+    simple_effects: dict[str, float] = Field(default_factory=dict)
+    difference_in_differences: float | None = None
+    sample_size: int = Field(default=0, ge=0)
+    source_run_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentTrendPoint(BaseModel):
+    level: Any
+    mean: float | None = None
+    sample_size: int = Field(default=0, ge=0)
+    source_run_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentDistributionSummary(BaseModel):
+    sample_size: int = Field(default=0, ge=0)
+    mean: float | None = None
+    standard_deviation: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    median: float | None = None
+
+
+class ExperimentSummary(BaseModel):
+    """Stable minimum summary shared by every design analysis mode."""
+
+    analysis_mode: str
+    primary_metric: str
+    sample_size: int = Field(default=0, ge=0)
+    evidence_status: Literal["not_ready", "below_threshold", "sample_threshold_met"] = "not_ready"
+    inference_status: Literal["not_performed"] = "not_performed"
+    source_run_ids: list[str] = Field(default_factory=list)
+    condition_statistics: list[ExperimentConditionSummary] = Field(default_factory=list)
+    condition_effects: list[ExperimentConditionEffectSummary] = Field(default_factory=list)
+    factor_effects: list[ExperimentFactorEffectSummary] = Field(default_factory=list)
+    interaction_summary: list[ExperimentInteractionSummary] = Field(default_factory=list)
+    ordered_trend: list[ExperimentTrendPoint] = Field(default_factory=list)
+    distribution_summary: ExperimentDistributionSummary | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_evidence_status(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized["evidence_status"] = {
+            "insufficient": "not_ready",
+            "mixed": "below_threshold",
+            "sufficient": "sample_threshold_met",
+        }.get(normalized.get("evidence_status"), normalized.get("evidence_status", "not_ready"))
+        normalized.setdefault("inference_status", "not_performed")
+        return normalized
 
 
 class Hypothesis(BaseModel):
@@ -196,14 +656,32 @@ class Hypothesis(BaseModel):
     @property
     def execution_readiness(self) -> Literal["executable", "requires_implementation"]:
         contract = self.analysis_contract
+        if contract is not None and contract.design_mode == "custom_design":
+            return "executable"
         if (
             contract is not None
             and contract.kind == "selection_main_effect"
+            and contract.treatment is not None
+            and contract.control is not None
             and _execution_strategy(contract.treatment) in {"random", "k_center"}
             and _execution_strategy(contract.control) in {"random", "k_center"}
             and _execution_strategy(contract.treatment) != _execution_strategy(contract.control)
         ):
             return "executable"
+        if contract is not None and contract.kind == "detector_interaction":
+            treatment, control = contract.treatment, contract.control
+            if treatment is not None and control is not None and treatment != control:
+                strategy_arms = (
+                    _execution_strategy(treatment) in {"random", "k_center"}
+                    and _execution_strategy(control) in {"random", "k_center"}
+                    and _execution_strategy(treatment) != _execution_strategy(control)
+                )
+                detector_arms = (
+                    treatment in BUILTIN_DETECTOR_NAMES
+                    and control in BUILTIN_DETECTOR_NAMES
+                )
+                if strategy_arms or detector_arms:
+                    return "executable"
         return "requires_implementation"
 
     @computed_field
@@ -212,6 +690,12 @@ class Hypothesis(BaseModel):
         contract = self.analysis_contract
         if contract is None:
             return ["先补充自变量、对照组、主指标和最小样本量，再进入实验。"]
+        if contract.design_mode == "custom_design":
+            return [
+                f"围绕“{self.title}”由设计声明因素、条件和分析模式，不依赖 treatment/control。",
+                f"主指标为 {contract.metric}；执行前检查设计因素均绑定到可执行 Run 字段。",
+                "结果必须保留条件、因素、重复性或稳定性证据，并链接真实 Run ID。",
+            ]
         if self.execution_readiness == "executable":
             return [
                 f"围绕“{self.title}”独立建立实验活动，不与其他创新点混用结果。",
@@ -263,6 +747,12 @@ class ExperimentPlan(BaseModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
     method_implementation_digests: dict[str, str] = Field(default_factory=dict)
+    designs: list[ExperimentDesignSpec] = Field(default_factory=list)
+    design_generation_status: Literal["ai_selected", "fallback", "needs_correction"] = (
+        "fallback"
+    )
+    design_generation_fallback_reason: str | None = None
+    design_generation_errors: list[str] = Field(default_factory=list)
 
 
 class ExperimentRun(BaseModel):
@@ -279,6 +769,8 @@ class ExperimentRun(BaseModel):
     iteration: int = Field(default=1, ge=1, le=3)
     round_id: str | None = None
     node_id: str | None = None
+    condition_id: str | None = None
+    factor_values: dict[str, Any] = Field(default_factory=dict)
     phase: Literal[
         "feasibility",
         "sensitivity",
@@ -386,6 +878,7 @@ class ExpectedImprovement(BaseModel):
 
 class ExperimentFeedbackProposal(BaseModel):
     advisor: str
+    presentation_spec: ExperimentCardPresentationSpec | None = None
     decision: Literal[
         "expand",
         "replicate",
@@ -467,6 +960,8 @@ class ExperimentRound(BaseModel):
     objective: str
     rationale: str
     hypothesis_id: str = ""
+    design_id: str | None = None
+    presentation_spec: ExperimentCardPresentationSpec | None = None
     treatment: str = "k_center"
     control: str = "random"
     metric: str = "image_auroc"
@@ -484,6 +979,7 @@ class ExperimentRound(BaseModel):
         "failed",
     ] = "planned"
     result_summary: dict[str, Any] = Field(default_factory=dict)
+    summary: ExperimentSummary | None = None
     feedback: ExperimentFeedbackProposal | None = None
     efficiency: dict[str, float | int] = Field(default_factory=dict)
     started_at: datetime | None = None
@@ -494,6 +990,7 @@ class ExperimentCampaign(BaseModel):
     id: str = Field(default_factory=lambda: new_id("campaign"))
     hypothesis_id: str
     hypothesis_ids: list[str] = Field(default_factory=list)
+    design_id: str | None = None
     dataset_audit_id: str
     dataset_manifest_path: str
     dataset_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -520,6 +1017,7 @@ class ExperimentCampaign(BaseModel):
         "failed",
     ] = "active"
     termination_reason: str | None = None
+    summary: ExperimentSummary | None = None
     nodes: list[ExperimentNodeRecord] = Field(default_factory=list)
     rounds: list[ExperimentRound] = Field(default_factory=list)
     next_action: str = "execute_next_experiment"
