@@ -30,29 +30,11 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
 
-def _execution_strategy(value: str) -> str | None:
-    normalized = " ".join(value.casefold().replace("_", " ").replace("-", " ").split())
-    if normalized == "random" or "random" in normalized or "随机" in normalized:
-        return "random"
-    if any(
-        marker in normalized
-        for marker in (
-            "k center",
-            "diversity",
-            "representative",
-            "coverage",
-            "多样性",
-            "代表性",
-            "覆盖",
-        )
-    ):
-        return "k_center"
-    return None
-
-
-# Mirror of experiments.code_safety.BUILTIN_DETECTORS; kept local so the domain
-# layer stays import-free of the experiment executor. Keep both in sync.
+# Mirrors of experiments.code_safety.BUILTIN_DETECTORS / BUILTIN_STRATEGIES;
+# kept local so the domain layer stays import-free of the experiment executor.
+# Keep both in sync.
 BUILTIN_DETECTOR_NAMES = frozenset({"anomalydino", "patchcore", "subspacead"})
+BUILTIN_STRATEGY_NAMES = frozenset({"random", "k_center"})
 
 
 class DatasetSpec(BaseModel):
@@ -663,18 +645,22 @@ class Hypothesis(BaseModel):
             and contract.kind == "selection_main_effect"
             and contract.treatment is not None
             and contract.control is not None
-            and _execution_strategy(contract.treatment) in {"random", "k_center"}
-            and _execution_strategy(contract.control) in {"random", "k_center"}
-            and _execution_strategy(contract.treatment) != _execution_strategy(contract.control)
+            and contract.treatment in BUILTIN_STRATEGY_NAMES
+            and contract.control in BUILTIN_STRATEGY_NAMES
+            and contract.treatment != contract.control
         ):
             return "executable"
         if contract is not None and contract.kind == "detector_interaction":
             treatment, control = contract.treatment, contract.control
             if treatment is not None and control is not None and treatment != control:
+                # 臂必须逐字匹配内置检测器名或内置策略名（与 rank 网关和实验
+                # 执行器的精确名单一致）。禁止模糊子串提取：带检测器前缀的
+                # 拼接名（如 subspacead_kcenter / subspacead_random）不属于
+                # 任何名单，会在此被判为 requires_implementation，避免界面
+                # 显示"可执行"却在提交时被后端拒绝。
                 strategy_arms = (
-                    _execution_strategy(treatment) in {"random", "k_center"}
-                    and _execution_strategy(control) in {"random", "k_center"}
-                    and _execution_strategy(treatment) != _execution_strategy(control)
+                    treatment in BUILTIN_STRATEGY_NAMES
+                    and control in BUILTIN_STRATEGY_NAMES
                 )
                 detector_arms = (
                     treatment in BUILTIN_DETECTOR_NAMES
