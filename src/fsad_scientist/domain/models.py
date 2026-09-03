@@ -74,19 +74,35 @@ class ResearchConstraints(BaseModel):
 
 
 class ProjectSpec(BaseModel):
-    title: str = "少样本工业视觉异常检测自主研究"
-    domain: str = "少样本工业视觉异常检测"
-    application_context: str = "新产品上线时仅能获取极少量正常样本"
-    objective: str = "自主发现并验证具有科学价值的可证伪改进方向"
-    datasets: list[DatasetSpec] = Field(
-        default_factory=lambda: [
-            DatasetSpec(name="MVTec AD", role="primary"),
-            DatasetSpec(name="VisA", role="validation"),
-        ]
+    """Specification for a research project.
+
+    The ``preset`` field enables platform-embedded demo content for common
+    research domains:
+
+    - ``"machine_vision_anomaly_detection"`` (default) – 平台默认宽泛方向:
+      基于机器视觉的异常检测,涵盖工业外观、医学影像、视频监控、遥感等
+      场景;用户在 objective 与 user_guidance 中给出关键词。
+    - ``"fsad"`` – 少样本工业视觉异常检测 (MVTec AD) 演示场景,
+      用于快速验证流程。
+    - ``None`` – 通用模式,内容完全由用户输入驱动。
+    """
+
+    title: str = "基于机器视觉的异常检测自主研究"
+    domain: str = "基于机器视觉的异常检测"
+    application_context: str = (
+        "工业质检 / 医学影像 / 视频监控 / 遥感等机器视觉场景,"
+        "正常样本容易获得、异常样本稀缺或代价昂贵"
     )
+    objective: str = ""
+    datasets: list[DatasetSpec] = Field(default_factory=list)
     constraints: ResearchConstraints = Field(default_factory=ResearchConstraints)
     budget: ComputeBudget = Field(default_factory=ComputeBudget)
     user_guidance: list[str] = Field(default_factory=list)
+    # Optional preset identifier. Known values:
+    #   "machine_vision_anomaly_detection" – 平台默认宽泛方向
+    #   "fsad" – 少样本工业视觉异常检测演示
+    #   None    – 通用模式,内容完全由用户输入驱动
+    preset: str | None = "machine_vision_anomaly_detection"
 
 
 class ClaimVerification(BaseModel):

@@ -32,7 +32,10 @@ def build_workflow(tmp_path) -> ResearchWorkflow:
 
 
 def advance_to_approval(workflow: ResearchWorkflow):
-    project = workflow.create_project(ProjectSpec())
+    # Use preset="fsad" so that the helper continues to produce the full portfolio
+    # of paired_comparison + custom_design hypotheses; the generic mode generates
+    # only custom_design placeholders which the existing test assertions don't expect.
+    project = workflow.create_project(ProjectSpec(preset="fsad"))
     while project.stage != ResearchStage.AWAITING_EXPERIMENT_APPROVAL:
         project = run(workflow.advance(project.id))
     return project

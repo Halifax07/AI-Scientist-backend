@@ -24,6 +24,7 @@ from fsad_scientist.api.schemas import (
     ApprovalRequest,
     AutoStartExperimentRequest,
     ClaimVerifyRequest,
+    CreateDemoRequest,
     CreateProjectRequest,
     DatasetScanRequest,
     DatasetViewRequest,
@@ -53,6 +54,7 @@ from fsad_scientist.datasets.scanner import MvtecDatasetScanner
 from fsad_scientist.datasets.view import DatasetViewBuilder
 from fsad_scientist.domain.enums import ResearchStage, RunStatus
 from fsad_scientist.domain.models import (
+    DatasetSpec,
     EvidenceRecord,
     ExperimentRun,
     MethodImplementation,
@@ -179,11 +181,27 @@ def create_app(
         "/api/v1/projects/demo",
         response_model=ResearchProject,
         status_code=status.HTTP_201_CREATED,
+        summary="Create a pre-configured few-shot industrial anomaly detection demo project",
+        description=(
+            "Shorthand for creating a ProjectSpec with preset='fsad', which loads "
+            "platform-embedded evidence, gaps and hypotheses for the MVTec AD demo. "
+            "Use POST /api/v1/projects for custom research domains."
+        ),
     )
     async def create_demo_project(
         workflow: WorkflowDependency,
     ) -> ResearchProject:
-        return workflow.create_project(ProjectSpec())
+        demo_spec = ProjectSpec(
+            preset="fsad",
+            title="少样本工业视觉异常检测自主研究",
+            domain="少样本工业视觉异常检测",
+            application_context="新产品上线时仅能获取极少量正常样本",
+            datasets=[
+                DatasetSpec(name="MVTec AD", role="primary"),
+                DatasetSpec(name="VisA", role="validation"),
+            ],
+        )
+        return workflow.create_project(demo_spec)
 
     @app.get("/api/v1/projects/{project_id}", response_model=ResearchProject)
     async def get_project(
