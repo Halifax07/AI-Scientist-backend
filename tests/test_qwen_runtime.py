@@ -54,6 +54,50 @@ def test_hypothesis_payload_normalizes_model_container_drift() -> None:
     assert "status" not in normalized
 
 
+def test_qwen_review_hypotheses_normalizes_score_aliases_and_nested_values() -> None:
+    project, first = _build_project_and_hypothesis()
+    second = first.model_copy(deep=True)
+    second.id = "hypothesis_second"
+    second.title = "第二条假设"
+    project.hypotheses = [first, second]
+    runtime = QwenScientistRuntime()
+    runtime.client = _FakeClient(  # type: ignore[assignment]
+        response={
+            "scores": {
+                first.id: {
+                    "score": {
+                        "novelty": 1.2,
+                        "falsifiability": 0.8,
+                        "feasibility": 0.7,
+                        "scientific_value": 0.6,
+                        "evidence_strength": 0.4,
+                        "elo": 1240,
+                    },
+                    "status": "shortlisted",
+                },
+                second.id: {
+                    "novelty": 0.5,
+                    "falsifiability": 0.6,
+                    "feasibility": 0.7,
+                    "scientific_value": 0.8,
+                    "evidence_strength": 0.3,
+                    "elo": 1100,
+                },
+            }
+        }
+    )
+
+    reviewed = asyncio.run(runtime.review_hypotheses(project))
+
+    assert len(reviewed) == 2
+    by_id = {item.id: item for item in reviewed}
+    assert by_id[first.id].score is not None
+    assert by_id[first.id].score.novelty == 1.0
+    assert by_id[first.id].score.elo == 1240
+    assert by_id[second.id].score is not None
+    assert by_id[second.id].score.weighted_total == 0.605
+
+
 def _build_project_and_hypothesis() -> tuple[ResearchProject, Hypothesis]:
     project = ResearchProject(spec=ProjectSpec())
     hypothesis = Hypothesis(

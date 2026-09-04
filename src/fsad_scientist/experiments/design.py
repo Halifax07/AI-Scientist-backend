@@ -23,6 +23,135 @@ ANALYSIS_MODES = frozenset(
 )
 MAX_PRESENTATION_BLOCKS = 16
 
+# Mirrors ExperimentCardBlockSpec/ExperimentCardPresentationSpec so a model that
+# drifts toward display vocabulary (bar_chart, boxplot, ...) can be repaired to
+# the nearest supported block instead of discarding the whole AI design.
+_PRESENTATION_KINDS = frozenset(
+    {
+        "narrative",
+        "progress",
+        "metrics",
+        "chart",
+        "table",
+        "runs",
+        "evidence",
+        "decision",
+        "diagnostics",
+        "insight",
+        "callout",
+        "key_value",
+        "timeline",
+    }
+)
+_CHART_SOURCES = frozenset(
+    {
+        "condition_statistics",
+        "condition_effects",
+        "factor_effects",
+        "interaction_summary",
+        "ordered_trend",
+        "distribution_summary",
+    }
+)
+_KIND_DEFAULT_SOURCE = {
+    "narrative": "design",
+    "progress": "progress",
+    "metrics": "condition_statistics",
+    "chart": "condition_statistics",
+    "table": "condition_statistics",
+    "runs": "runs",
+    "evidence": "evidence",
+    "decision": "feedback",
+    "diagnostics": "diagnostics",
+    "insight": "design",
+    "callout": "design",
+    "key_value": "condition_statistics",
+    "timeline": "progress",
+}
+_KIND_SOURCE_COMPAT = {
+    "narrative": frozenset({"design"}),
+    "progress": frozenset({"progress"}),
+    "metrics": frozenset({"condition_statistics", "distribution_summary"}),
+    "chart": _CHART_SOURCES,
+    "table": frozenset(
+        {
+            "condition_statistics",
+            "condition_effects",
+            "factor_effects",
+            "interaction_summary",
+            "ordered_trend",
+            "distribution_summary",
+        }
+    ),
+    "runs": frozenset({"runs"}),
+    "evidence": frozenset({"evidence"}),
+    "decision": frozenset({"feedback"}),
+    "diagnostics": frozenset({"diagnostics"}),
+    "insight": frozenset(
+        {
+            "design",
+            "condition_statistics",
+            "condition_effects",
+            "factor_effects",
+            "interaction_summary",
+            "ordered_trend",
+            "distribution_summary",
+            "feedback",
+            "diagnostics",
+        }
+    ),
+    "callout": frozenset({"design", "evidence", "feedback", "diagnostics"}),
+    "key_value": frozenset(
+        {"condition_statistics", "factor_effects", "distribution_summary"}
+    ),
+    "timeline": frozenset({"progress", "runs", "feedback"}),
+}
+_KIND_ALIASES = {
+    "bar_chart": "chart",
+    "line_chart": "chart",
+    "box_plot": "chart",
+    "boxplot": "chart",
+    "histogram": "chart",
+    "scatter": "chart",
+    "scatter_plot": "chart",
+    "scatterplot": "chart",
+    "pie": "chart",
+    "donut": "chart",
+    "area": "chart",
+    "distribution_summary": "metrics",
+    "statistics": "metrics",
+    "stat_summary": "metrics",
+    "keyvalues": "key_value",
+}
+_CHART_MARKS = frozenset({"bar", "line", "point", "heatmap", "interval"})
+_CHART_MARK_ALIASES = {
+    "boxplot": "interval",
+    "box": "interval",
+    "histogram": "bar",
+    "scatter": "point",
+    "scatter_plot": "point",
+    "scatterplot": "point",
+    "pie": "bar",
+    "donut": "bar",
+    "area": "line",
+    "area_chart": "line",
+    "line_chart": "line",
+    "lineplot": "line",
+}
+_CHART_DEFAULT_MARK = {
+    "interaction_summary": "heatmap",
+    "ordered_trend": "line",
+    "distribution_summary": "interval",
+}
+_CHART_MARKS_BY_SOURCE = {
+    "ordered_trend": frozenset({"line", "point"}),
+    "interaction_summary": frozenset({"heatmap"}),
+    "distribution_summary": frozenset({"interval", "bar"}),
+    "condition_statistics": frozenset({"bar", "point"}),
+    "condition_effects": frozenset({"bar", "point"}),
+    "factor_effects": frozenset({"bar", "point"}),
+}
+
 
 def _canonical_metric(value: str) -> str:
     key = "".join(character for character in value.strip().casefold() if character.isalnum())
@@ -444,10 +573,11 @@ def normalize_presentation_spec_payload(
     *,
     analysis_mode: str,
 ) -> dict[str, Any]:
-    """Repair only additive omissions in an AI presentation-spec payload.
+    """Repair omissions and near-miss display vocabulary in an AI presentation spec.
 
     The returned mapping is still validated by ``ExperimentCardPresentationSpec``;
-    this helper does not discard invalid AI content or relax the DSL contract.
+    this helper only maps obvious synonyms (bar_chart -> chart, boxplot ->
+    interval, ...) and re-anchors incompatible sources, never fabricates data.
     """
 
     if not isinstance(raw_spec, dict):
@@ -465,13 +595,38 @@ def normalize_presentation_spec_payload(
     for block in blocks:
         if block.get("source") in {"group_comparison", "comparison"}:
             block["source"] = "condition_statistics"
-        if (
-            block.get("kind") == "chart"
-            and block.get("source") == "distribution_summary"
-            and block.get("chart_mark") == "point"
-        ):
-            # Keep the distribution-chart intent while using a supported mark.
-            block["chart_mark"] = "bar"
+        kind = block.get("kind")
+        if isinstance(kind, str) and kind not in _PRESENTATION_KINDS:
+            block["kind"] = _KIND_ALIASES.get(kind, "insight")
+        kind = block.get("kind")
+        if kind == "chart":
+            source = block.get("source")
+            if source not in _CHART_SOURCES:
+                # Charts render aggregated data only; never raw run/evidence feeds.
+                block["source"] = "condition_statistics"
+            mark = block.get("chart_mark")
+            allowed_marks = _CHART_MARKS_BY_SOURCE.get(
+                block["source"], _CHART_MARKS
+            )
+            if mark == "point" and block["source"] == "distribution_summary":
+                # Keep the distribution-chart intent while using a supported mark.
+                block["chart_mark"] = "bar"
+            elif isinstance(mark, str) and mark not in allowed_marks:
+                candidate = _CHART_MARK_ALIASES.get(mark)
+                block["chart_mark"] = (
+                    candidate
+                    if candidate in allowed_marks
+                    else _CHART_DEFAULT_MARK.get(block["source"], "bar")
+                )
+            if block.get("chart_mark") not in allowed_marks:
+                block["chart_mark"] = _CHART_DEFAULT_MARK.get(
+                    block["source"], "bar"
+                )
+        elif block.get("chart_mark") is not None:
+            # chart_mark is reserved for chart blocks.
+            block.pop("chart_mark", None)
+        if block.get("source") not in _KIND_SOURCE_COMPAT.get(kind, frozenset()):
+            block["source"] = _KIND_DEFAULT_SOURCE.get(kind, "condition_statistics")
     present = {
         (block.get("kind"), block.get("source"))
         for block in blocks

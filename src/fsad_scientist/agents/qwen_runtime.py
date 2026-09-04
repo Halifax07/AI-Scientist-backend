@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -288,7 +289,25 @@ class QwenScientistRuntime(MockScientistRuntime):
                 f"\n{self._project_context_block(project)}\n\n"
                 "每个假设必须包含零假设、"
                 "变量、预测方向和明确的证伪条件；从不同机制提出 3 至 6 个候选，"
-                "不要写成模糊的工程目标。analysis_contract.kind 可为 selection_main_effect、"
+                "不要写成模糊的工程目标。候选构成必须同时满足四条强制规则："
+                "(1) 至少 1 个候选使用 design_mode=custom_design，不提供 treatment/control，"
+                "检验现有 random/k_center 因素矩阵无法表达的机制变量；注意 kind 字段只能填"
+                "selection_main_effect、detector_interaction 或 query_adaptation 三者之一，"
+                "禁止在 kind 中填写 custom_design，custom_design 只允许出现在 design_mode 字段；"
+                "(2) 至少 1 个候选为 selection_main_effect 或 query_adaptation，且 treatment "
+                "必须是全新实现名（control 用 random），并在 rationale 中用不超过 3 句写明"
+                "该名称的确定性步骤（输入→操作→输出）；"
+                "(3) 其余候选可以使用已注册条件，但不得全部退回 random 对 k_center 的默认对照。"
+                "(4) 机制避让与多样性：全部候选不得把同一机制换名复述；当用户给出的上下文"
+                "自然引导到以下演示中已过度使用的机制族时，本轮一律搁置，改从其他因果轴提出假设："
+                "参考库/候选池压缩或修剪（含查询感知、预算感知的动态剪枝）；"
+                "类别广度与样本深度的总预算权衡；候选池规模扩大带来的边际递减或收益曲线；"
+                "K 与预训练表征饱和度的交互或饱和点。"
+                "可优先探索的支持集选取与检测机制轴（举例，不限于）：支持集内簇覆盖与冗余结构、"
+                "对最坏类别或高方差类别的优先保护、选取规则与检测器内部表征粒度是否匹配、"
+                "伪样本与噪声对边界的鲁棒性、采样稳定性与 seed 依赖等。"
+                "claim 的主语必须是待检验的因果机制与预测方向，不得把\"提出某方法\"当作 claim。"
+                "analysis_contract.kind 可为 selection_main_effect、"
                 "detector_interaction 或 query_adaptation；它只是兼容旧流程和安全边界，"
                 "不要要求所有假设固定两种 selection strategy，也不要固定 k_center/random。"
                 "treatment/control 可以描述方法、检测器或其他兼容字段；当前工具链可直接执行的"
@@ -309,8 +328,8 @@ class QwenScientistRuntime(MockScientistRuntime):
                 "selection_main_effect 并把 treatment/control 精确填为 random 与 "
                 "k_center，不要把策略名接到检测器名上。"
                 "selection_main_effect/query_adaptation 的 treatment/control 使用 "
-                "random、k_center 或已注册实现名；需要全新自定义策略时直接给出你的"
-                "方法名（如 vib_balanced），系统会在提交后自动生成并校验实现，"
+                "random、k_center 或已注册实现名；需要新条件时按上方强制规则 (2) "
+                "给出新实现名，系统会在提交后自动生成并校验实现，"
                 "但不要把它伪装成检测器名。"
                 "除论文标题和标准技术名词外，"
                 "所有自然语言字段使用简体中文。"
@@ -407,8 +426,22 @@ class QwenScientistRuntime(MockScientistRuntime):
             if normalized.get("gap_id") not in valid_gap_ids:
                 continue
             contract = normalized.get("analysis_contract")
-            if isinstance(contract, dict) and not _has_distinct_conditions(contract):
-                continue
+            if isinstance(contract, dict):
+                # kind only accepts the three causal axes; custom design is
+                # expressed through design_mode. Tolerate a model that wrote
+                # custom_design into kind or omitted kind on a custom card.
+                if contract.get("design_mode") == "custom_design":
+                    if contract.get("kind") not in (
+                        "selection_main_effect",
+                        "detector_interaction",
+                        "query_adaptation",
+                    ):
+                        contract["kind"] = "selection_main_effect"
+                elif contract.get("kind") == "custom_design":
+                    contract["design_mode"] = "custom_design"
+                    contract["kind"] = "selection_main_effect"
+                if not _has_distinct_conditions(contract):
+                    continue
             normalized["evidence_ids"] = [
                 evidence_id
                 for evidence_id in normalized["evidence_ids"]
@@ -459,29 +492,94 @@ class QwenScientistRuntime(MockScientistRuntime):
                 },
             },
         )
-        reviews = {item["id"]: item for item in response.get("reviews", [])}
+        # Models occasionally use the input-facing ``hypothesis_id`` name,
+        # return the reviews under ``scores``/``rankings``, or nest the actual
+        # dimensions below ``score``. Normalize those harmless schema variants
+        # before applying the durable score model.
+        raw_reviews: Any = (
+            response.get("reviews")
+            or response.get("hypothesis_reviews")
+            or response.get("scores")
+            or response.get("rankings")
+            or response.get("hypotheses")
+            or []
+        )
+        if isinstance(raw_reviews, dict):
+            raw_reviews = [
+                (
+                    {**value, "id": key}
+                    if isinstance(value, dict)
+                    else {"id": key, "elo": value}
+                )
+                for key, value in raw_reviews.items()
+            ]
+        reviews: dict[str, dict[str, Any]] = {}
+        if isinstance(raw_reviews, list):
+            for item in raw_reviews:
+                if not isinstance(item, dict):
+                    continue
+                hypothesis_id = (
+                    item.get("id")
+                    or item.get("hypothesis_id")
+                    or item.get("hypothesisId")
+                )
+                if hypothesis_id:
+                    reviews[str(hypothesis_id)] = item
         result: list[Hypothesis] = []
         shortlist_count = 0
+
+        # The reviewer may omit a hypothesis or echo a mismatched id.  Fill a
+        # neutral score so every candidate is rankable; never leave score None
+        # (the frontend renders an empty AI-score cell for None).
+        def _review_number(value: Any, fallback: float) -> float:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return number if math.isfinite(number) else fallback
+
+        def _bounded_review_number(value: Any, fallback: float) -> float:
+            return max(0.0, min(1.0, _review_number(value, fallback)))
+
         for hypothesis in project.hypotheses:
             updated = hypothesis.model_copy(deep=True)
             review: dict[str, Any] | None = reviews.get(hypothesis.id)
             if review:
+                score_payload = review.get("score")
+                if not isinstance(score_payload, dict):
+                    score_payload = review
                 updated.score = HypothesisScore(
-                    novelty=review["novelty"],
-                    falsifiability=review["falsifiability"],
-                    feasibility=review["feasibility"],
-                    scientific_value=review["scientific_value"],
+                    novelty=_bounded_review_number(score_payload.get("novelty"), 0.5),
+                    falsifiability=_bounded_review_number(
+                        score_payload.get("falsifiability"), 0.5
+                    ),
+                    feasibility=_bounded_review_number(score_payload.get("feasibility"), 0.5),
+                    scientific_value=_bounded_review_number(
+                        score_payload.get("scientific_value"), 0.5
+                    ),
                     evidence_strength=min(
-                        review["evidence_strength"],
+                        _bounded_review_number(score_payload.get("evidence_strength"), 0.5),
                         maximum_evidence_strength,
                     ),
-                    elo=review["elo"],
+                    elo=_review_number(score_payload.get("elo"), 1000.0),
                 )
                 if review.get("status") == "shortlisted" and shortlist_count < 2:
                     updated.status = HypothesisStatus.SHORTLISTED
                     shortlist_count += 1
                 else:
                     updated.status = HypothesisStatus.CANDIDATE
+            else:
+                # Reviewer did not return this hypothesis: keep it rankable as a
+                # neutral candidate instead of leaving score unset.
+                updated.score = updated.score or HypothesisScore(
+                    novelty=0.5,
+                    falsifiability=0.5,
+                    feasibility=0.5,
+                    scientific_value=0.5,
+                    evidence_strength=min(0.5, maximum_evidence_strength),
+                    elo=1000.0,
+                )
+                updated.status = HypothesisStatus.CANDIDATE
             result.append(updated)
 
         if shortlist_count == 0 and result:
@@ -511,7 +609,17 @@ class QwenScientistRuntime(MockScientistRuntime):
                     "distribution_summary；interaction_summary 将归一化为 factor_effects；"
                     "不要把设计限制为 k_center/random，所有值必须来自 allowed_values。"
                     "必须同时生成 question、rationale 和受控 presentation_spec；"
-                    "根据因素与分析模式选择可读布局，不局限于五种固定模板。"
+                    "布局可以在输出枚举内自由组合变化，但字段值必须逐字来自 output_schema："
+                    "block.kind 只能是 narrative、progress、metrics、chart、table、runs、"
+                    "evidence、decision、diagnostics、insight、callout、key_value、timeline "
+                    "之一，不存在 bar_chart、distribution_summary、box_plot、scatter、"
+                    "histogram 等块类型（analysis.mode 或 block.source 里的词不能当 kind 用）；"
+                    "chart_mark 只能取 bar、line、point、heatmap、interval 之一，"
+                    "其他图形词汇（boxplot、scatter、histogram、pie 等）一律不用；"
+                    "只有 kind=chart 的块才填 chart_mark；"
+                    "kind=chart 的块其 source 不得为 runs 或 evidence，"
+                    "图表必须基于汇总数据（condition_statistics、factor_effects、"
+                    "interaction_summary、ordered_trend 或 distribution_summary）。"
                     "除技术名词外，自然语言使用简体中文。"
                 ),
                 payload={
@@ -733,11 +841,23 @@ class QwenScientistRuntime(MockScientistRuntime):
     ) -> ExperimentFeedbackProposal:
         """Use Qwen as a scientific advisor inside a deterministic action boundary."""
 
-        if round_summary.get("design_id"):
+        legacy_design = None
+        if "design_mode" not in round_summary and round_summary.get("design_id"):
+            plan = project.experiment_plan
+            legacy_design = next(
+                (item for item in (plan.designs if plan is not None else [])
+                 if item.id == round_summary.get("design_id")),
+                None,
+            )
+        is_explicit_design = round_summary.get("design_mode") == "custom_design" or (
+            legacy_design is not None and legacy_design.design_mode == "custom_design"
+        )
+        if is_explicit_design:
             return await self._recommend_explicit_design_feedback(
                 project,
                 round_summary=round_summary,
                 allowed_cells=allowed_cells,
+                user_guidance=user_guidance,
             )
 
         try:
@@ -868,7 +988,9 @@ class QwenScientistRuntime(MockScientistRuntime):
             )
             response["advisor"] = self.name
             proposal = ExperimentFeedbackProposal.model_validate(response)
-            explicit_design = bool(round_summary.get("design_id"))
+            explicit_design = round_summary.get("design_mode") == "custom_design" or (
+                legacy_design is not None and legacy_design.design_mode == "custom_design"
+            )
             if proposal.stop:
                 if explicit_design:
                     evidence_ready = round_summary.get("evidence_status") in {
@@ -906,6 +1028,7 @@ class QwenScientistRuntime(MockScientistRuntime):
         *,
         round_summary: dict[str, Any],
         allowed_cells: list[ExperimentCell],
+        user_guidance: str | None = None,
     ) -> ExperimentFeedbackProposal:
         design_id = str(round_summary["design_id"])
         plan = project.experiment_plan
@@ -926,6 +1049,7 @@ class QwenScientistRuntime(MockScientistRuntime):
                     "若该课题不是少样本工业视觉异常检测，请不要沿用 FSAD 演示的"
                     "默认语境或硬编码工业视觉假设。\n"
                     f"{self._project_context_block(project)}\n\n"
+                    f"用户本轮指导：{user_guidance or '未提供'}\n\n"
                     "当前 Round 使用已批准的显式实验设计；只能在该设计的因素、条件和预算边界内"
                     "提出建议。\n"
                     "请依据 analysis_mode、condition_statistics、condition_effects、"
@@ -1024,6 +1148,7 @@ class QwenScientistRuntime(MockScientistRuntime):
                 project,
                 round_summary=round_summary,
                 allowed_cells=allowed_cells,
+                user_guidance=user_guidance,
             )
             fallback.advisor = f"{self.name}:deterministic-fallback"
             fallback.presentation_spec = fallback_spec

@@ -58,6 +58,32 @@ def test_review_registers_an_image_metric_core_before_method_generation(tmp_path
     )
 
 
+def test_hypothesis_review_api_backfills_partial_runtime_scores(tmp_path):
+    class PartialReviewRuntime(MockScientistRuntime):
+        async def review_hypotheses(self, project):
+            reviewed = await super().review_hypotheses(project)
+            # Simulate a runtime/provider response that omitted one candidate's
+            # review. The workflow must still return a total score contract.
+            reviewed[-1].score = None
+            return reviewed
+
+    workflow = ResearchWorkflow(
+        repository=JsonProjectRepository(tmp_path / "ledger"),
+        runtime=PartialReviewRuntime(),
+    )
+    project = workflow.create_project(ProjectSpec())
+    while project.stage != ResearchStage.HYPOTHESES_PROPOSED:
+        project = run(workflow.advance(project.id))
+
+    project = run(workflow.advance(project.id))
+
+    assert project.stage == ResearchStage.HYPOTHESES_REVIEWED
+    assert project.hypotheses
+    assert all(item.score is not None for item in project.hypotheses)
+    persisted = workflow.repository.get(project.id)
+    assert all(item.score is not None for item in persisted.hypotheses)
+
+
 def test_autonomous_discovery_reaches_human_gate(tmp_path):
     workflow = build_workflow(tmp_path)
     project = advance_to_approval(workflow)

@@ -29,6 +29,7 @@ from fsad_scientist.domain.models import (
     ExperimentRun,
     Hypothesis,
     HypothesisRanking,
+    HypothesisScore,
     MethodImplementation,
     ProjectSpec,
     ResearchProject,
@@ -248,7 +249,26 @@ class ResearchWorkflow:
 
         if project.hypotheses and all(item.score is not None for item in project.hypotheses):
             return project
-        project.hypotheses = await self.runtime.review_hypotheses(project)
+        reviewed = await self.runtime.review_hypotheses(project)
+        # Runtime implementations are replaceable and older persisted
+        # projects may contain partial review output. Keep the candidate set
+        # authoritative and make the API contract total: every candidate sent
+        # to the ranking UI has a serializable score.
+        by_id = {item.id: item for item in reviewed}
+        normalized: list[Hypothesis] = []
+        for candidate in project.hypotheses:
+            updated = by_id.get(candidate.id, candidate.model_copy(deep=True))
+            if updated.score is None:
+                updated.score = candidate.score or HypothesisScore(
+                    novelty=0.5,
+                    falsifiability=0.5,
+                    feasibility=0.5,
+                    scientific_value=0.5,
+                    evidence_strength=0.5,
+                    elo=1000.0,
+                )
+            normalized.append(updated)
+        project.hypotheses = normalized
         project.record_event(
             actor="skeptic_and_meta_review_agents",
             action="automatic_hypothesis_review",
@@ -752,7 +772,7 @@ class ResearchWorkflow:
             )
 
         elif project.stage == ResearchStage.HYPOTHESES_PROPOSED:
-            project.hypotheses = await self.runtime.review_hypotheses(project)
+            project = await self._ensure_hypothesis_review(project)
             # The review gate only scores and shortlists candidates.  A pool that
             # needs adapters is allowed to reach the human ranking screen; the
             # ranking request auto-generates those adapters for the innovations
@@ -2176,7 +2196,22 @@ class ResearchWorkflow:
             project,
             round_id=current.id,
         )
-        explicit_design = bool(current.design_id)
+        registered_design = next(
+            (
+                item
+                for item in (
+                    project.experiment_plan.designs
+                    if project.experiment_plan
+                    else []
+                )
+                if item.id == current.design_id
+            ),
+            None,
+        )
+        explicit_design = (
+            registered_design is not None
+            and registered_design.design_mode == "custom_design"
+        )
         allowed_cells = (
             self.experiment_planner.remaining_round_cells(
                 project,

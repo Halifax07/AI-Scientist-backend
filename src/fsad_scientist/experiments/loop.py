@@ -390,9 +390,25 @@ class AdaptiveExperimentPlanner:
             raise ValueError(f"Unknown experiment round: {round_id}")
         runs_by_id = {run.id: run for run in project.runs}
         runs = [runs_by_id[run_id] for run_id in current.run_ids if run_id in runs_by_id]
-        explicit_design = self._explicit_design(project.experiment_plan, current.hypothesis_id)
-        if explicit_design is not None and explicit_design.design_mode != "custom_design":
-            explicit_design = None
+        registered_design = self._explicit_design(
+            project.experiment_plan, current.hypothesis_id
+        )
+        explicit_design = (
+            registered_design
+            if registered_design is not None
+            and registered_design.design_mode == "custom_design"
+            else None
+        )
+        if registered_design is not None:
+            # Repair legacy rounds that predate persisted presentation metadata.
+            # Do not overwrite a result-aware card selected by later feedback.
+            if current.design_id is None:
+                current.design_id = registered_design.id
+            if current.presentation_spec is None:
+                current.presentation_spec = (
+                    registered_design.presentation_spec
+                    or default_presentation_spec(registered_design)
+                ).model_copy(deep=True)
         metric = normalize_primary_metric(
             explicit_design.analysis.primary_metric
             if explicit_design is not None
@@ -497,6 +513,8 @@ class AdaptiveExperimentPlanner:
             "completed_iterations": current.completed_iterations,
             "phase": current.phase,
             "metric": metric,
+            "design_mode": "paired_comparison",
+            "design_id": current.design_id,
             "planned_runs": len(runs),
             "terminal_runs": terminal_count,
             "successful_verified_runs": sum(
@@ -824,6 +842,7 @@ class AdaptiveExperimentPlanner:
             "phase": current.phase,
             "metric": metric,
             "analysis_mode": design.analysis.mode,
+            "design_mode": design.design_mode,
             "design_id": design.id,
             "planned_runs": len(runs),
             "terminal_runs": sum(
@@ -1492,11 +1511,17 @@ class AdaptiveExperimentPlanner:
             project, contract, hypothesis_id=round_hypothesis_id
         ):
             raise ValueError(f"Hypothesis is not executable: {round_hypothesis_id}")
-        design = self._explicit_design(plan, round_hypothesis_id)
-        if design is not None and design.design_mode != "custom_design":
-            design = None
+        registered_design = self._explicit_design(plan, round_hypothesis_id)
+        runtime_design = (
+            registered_design
+            if registered_design is not None
+            and registered_design.design_mode == "custom_design"
+            else None
+        )
         primary_metric = normalize_primary_metric(
-            design.analysis.primary_metric if design is not None else contract.metric
+            runtime_design.analysis.primary_metric
+            if runtime_design is not None
+            else contract.metric
         )
         if primary_metric not in SUPPORTED_PRIMARY_METRICS:
             raise ValueError(f"Unsupported primary metric: {primary_metric}")
@@ -1504,10 +1529,10 @@ class AdaptiveExperimentPlanner:
         campaign.treatment = contract.treatment or ""
         campaign.control = contract.control or ""
         campaign.metric = primary_metric
-        runtime_design = design
         presentation_spec = (
-            runtime_design.presentation_spec or default_presentation_spec(runtime_design)
-        ).model_copy(deep=True) if runtime_design is not None else None
+            registered_design.presentation_spec
+            or default_presentation_spec(registered_design)
+        ).model_copy(deep=True) if registered_design is not None else None
         condition_specs = (
             self._design_conditions(
                 project,
@@ -1519,8 +1544,8 @@ class AdaptiveExperimentPlanner:
         )
         if runtime_design is not None and not condition_specs:
             condition_specs = compile_design(runtime_design)
-        if design is not None:
-            campaign.design_id = design.id
+        if runtime_design is not None:
+            campaign.design_id = runtime_design.id
         round_id = new_id("round")
         nodes: list[ExperimentNodeRecord] = []
         runs: list[ExperimentRun] = []
@@ -1611,7 +1636,7 @@ class AdaptiveExperimentPlanner:
                             cell=cell,
                             condition_count=len(specs),
                         )
-                        if design is not None
+                        if runtime_design is not None
                         else (
                             f"{cell.category} / K={cell.shots} / seed={cell.seed}："
                             f"成对比较 {campaign.treatment} 与 {campaign.control}。"
@@ -1634,7 +1659,9 @@ class AdaptiveExperimentPlanner:
             objective=objective,
             rationale=rationale,
             hypothesis_id=round_hypothesis_id,
-            design_id=design.id if design is not None else None,
+            # ``design_id`` identifies the registered card design.  Runtime
+            # execution still uses ``runtime_design`` only for custom_design.
+            design_id=registered_design.id if registered_design is not None else None,
             presentation_spec=presentation_spec,
             treatment=contract.treatment or "",
             control=contract.control or "",

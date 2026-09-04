@@ -1453,6 +1453,39 @@ def test_presentation_normalizer_maps_comparison_source_to_condition_statistics(
     assert comparison_chart.chart_mark == "bar"
 
 
+def test_presentation_normalizer_rescues_hallucinated_chart_vocabulary() -> None:
+    # A design agent drifted toward display vocabulary that the DSL does not
+    # define (bar_chart kind, boxplot mark, runs-fed chart). Without repair the
+    # whole AI design is discarded and the Round card falls back to the generic
+    # deterministic skeleton.
+    normalized = normalize_presentation_spec_payload(
+        {
+            "schema_version": 2,
+            "blocks": [
+                {"kind": "narrative", "source": "design"},
+                {"kind": "progress", "source": "progress"},
+                {
+                    "kind": "bar_chart",
+                    "source": "runs",
+                    "chart_mark": "boxplot",
+                },
+                {"kind": "distribution_summary", "source": "distribution_summary"},
+                {"kind": "evidence", "source": "evidence"},
+            ],
+        },
+        analysis_mode="group_comparison",
+    )
+
+    spec = ExperimentCardPresentationSpec.model_validate(normalized)
+    charts = [block for block in spec.blocks if block.kind == "chart"]
+    assert len(charts) == 1
+    assert charts[0].source == "condition_statistics"
+    assert charts[0].chart_mark == "bar"
+    stats = [block for block in spec.blocks if block.kind == "metrics"]
+    assert len(stats) == 1
+    assert stats[0].source == "distribution_summary"
+
+
 def test_condition_normalizer_deduplicates_same_factor_assignments() -> None:
     conditions = normalize_design_conditions_payload(
         [
@@ -1526,3 +1559,67 @@ def test_round_deep_copies_design_presentation_and_old_plan_defaults() -> None:
     old_payload.pop("designs")
     parsed = ExperimentPlan.model_validate(old_payload)
     assert parsed.designs == []
+
+
+@pytest.mark.parametrize("with_presentation_spec", [False, True])
+def test_paired_round_keeps_display_design_without_changing_runtime_semantics(
+    with_presentation_spec: bool,
+) -> None:
+    presentation_spec = (
+        ExperimentCardPresentationSpec(
+            layout="split",
+            density="compact",
+            blocks=[
+                ExperimentCardBlockSpec(kind="narrative", source="design"),
+                ExperimentCardBlockSpec(kind="progress", source="progress"),
+                ExperimentCardBlockSpec(kind="runs", source="runs"),
+                ExperimentCardBlockSpec(kind="evidence", source="evidence"),
+            ],
+        )
+        if with_presentation_spec
+        else None
+    )
+    design = ExperimentDesignSpec(
+        id=f"paired_display_{with_presentation_spec}",
+        hypothesis_id="h1",
+        design_type="paired_comparison",
+        design_mode="paired_comparison",
+        factors=[
+            ExperimentFactorSpec(
+                name="strategy",
+                field="selection_strategy",
+                levels=["random", "k_center"],
+            )
+        ],
+        conditions=[
+            ExperimentConditionSpec(id="control", factor_values={"strategy": "random"}),
+            ExperimentConditionSpec(id="treatment", factor_values={"strategy": "k_center"}),
+        ],
+        analysis=ExperimentAnalysisSpec(primary_metric="image_auroc"),
+        presentation_spec=presentation_spec,
+    )
+
+    project = _campaign_project(design, 6)
+    experiment_round = project.experiment_campaign.rounds[0]
+
+    assert experiment_round.design_id == design.id
+    assert experiment_round.presentation_spec is not None
+    if with_presentation_spec:
+        assert experiment_round.presentation_spec.layout == "split"
+    else:
+        assert experiment_round.presentation_spec == default_presentation_spec(design)
+    assert {run.condition_id for run in project.runs} == {"control", "treatment"}
+
+    summary = AdaptiveExperimentPlanner().summarize_current_round(project)
+    assert summary["design_mode"] == "paired_comparison"
+    assert summary["design_id"] == design.id
+    assert "condition_statistics" not in summary
+    assert summary["pair_count"] == 0
+
+    # A legacy persisted Round may have been written before display metadata
+    # was bound. Summarization repairs the null fields from the plan.
+    experiment_round.design_id = None
+    experiment_round.presentation_spec = None
+    AdaptiveExperimentPlanner().summarize_current_round(project)
+    assert experiment_round.design_id == design.id
+    assert experiment_round.presentation_spec is not None
